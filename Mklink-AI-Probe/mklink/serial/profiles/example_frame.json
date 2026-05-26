@@ -1,0 +1,54 @@
+{
+  "name": "example-uart-frame",
+  "version": "1.0",
+  "frame": {
+    "header": "AA55",
+    "tail": "55AA",
+    "length_field": {
+      "offset": 2,
+      "size": 1,
+      "includes_header": false
+    },
+    "crc": {
+      "algorithm": "crc16_modbus",
+      "offset": -4,
+      "scope": "payload"
+    }
+  },
+  "fields": [
+    {
+      "name": "cmd",
+      "offset": 3,
+      "size": 1,
+      "type": "uint8",
+      "enum": {
+        "0x01": "READ",
+        "0x02": "WRITE",
+        "0x03": "ACK",
+        "0x80": "ERROR"
+      }
+    },
+    {
+      "name": "temperature",
+      "offset": 4,
+      "size": 2,
+      "type": "int16",
+      "scale": 0.1,
+      "unit": "℃"
+    },
+    {
+      "name": "fan_speed",
+      "offset": 6,
+      "size": 2,
+      "type": "uint16",
+      "unit": "RPM"
+    }
+  ],
+  "auto_reply": [
+    {
+      "match_hex": "AA550100",
+      "reply_hex": "AA55810000004DAA55AA",
+      "description": "ACK read command"
+    }
+  ]
+}

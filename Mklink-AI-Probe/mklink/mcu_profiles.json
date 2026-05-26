@@ -1,0 +1,108 @@
+{
+  "$schema": "mklink-mcu-profiles-v1",
+  "mcus": {
+    "stm32f1": {
+      "name": "STM32F10x (Medium Density)",
+      "idcode_pattern": "0x1BA01477",
+      "device_prefix": "STM32F10",
+      "flm_path": "FLM/STM32F10x_1024.FLM",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "page_size": 128,
+      "sector_size": 2048,
+      "flash_size": "1MB",
+      "swd_clock_default": 10000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        { "name": "flash", "start": "0x08000000", "size": "0x100000" },
+        { "name": "ram", "start": "0x20000000", "size": "0x10000" }
+      ]
+    },
+    "stm32f4": {
+      "name": "STM32F40x",
+      "idcode_pattern": "0x2BA01477",
+      "device_prefix": "STM32F40",
+      "flm_path": "FLM/STM32F40x.FLM",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "page_size": 256,
+      "sector_size": 16384,
+      "flash_size": "1MB",
+      "swd_clock_default": 10000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        { "name": "flash", "start": "0x08000000", "size": "0x100000" },
+        { "name": "ccm", "start": "0x10000000", "size": "0x10000" },
+        { "name": "ram", "start": "0x20000000", "size": "0x20000" }
+      ]
+    },
+    "n32g435": {
+      "name": "N32G435",
+      "idcode_pattern": "0x7BA01477",
+      "device_prefix": "N32G43",
+      "flm_path": "FLM/N32G43x.FLM",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "page_size": 128,
+      "sector_size": 2048,
+      "flash_size": "512KB",
+      "swd_clock_default": 10000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        { "name": "flash", "start": "0x08000000", "size": "0x80000" },
+        { "name": "ram", "start": "0x20000000", "size": "0x8000" }
+      ]
+    },
+    "hc32f4a0": {
+      "name": "HDSC HC32F4A0",
+      "idcode_pattern": "0x2BA01477",
+      "device_prefix": "HC32F4A0",
+      "flm_path": "FLM/HC32F4A0_2M.FLM",
+      "flash_base": "0x00000000",
+      "ram_base": "0x1FFE0000",
+      "page_size": 256,
+      "sector_size": 16384,
+      "flash_size": "2MB",
+      "swd_clock_default": 1000000,
+      "rtt_default": {
+        "addr": "0x1FFE0000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        { "name": "flash", "start": "0x00000000", "size": "0x200000" },
+        { "name": "ram", "start": "0x1FFE0000", "size": "0x80000" }
+      ]
+    },
+    "custom": {
+      "name": "Custom MCU",
+      "idcode_pattern": "",
+      "device_prefix": "",
+      "flm_path": "",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "page_size": 128,
+      "sector_size": 2048,
+      "flash_size": "",
+      "swd_clock_default": 10000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": []
+    }
+  }
+}

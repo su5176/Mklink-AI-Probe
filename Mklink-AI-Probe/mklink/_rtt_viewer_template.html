@@ -1,0 +1,338 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>__TITLE__</title>
+<link rel="stylesheet" href="/static/rtt_viewer.css">
+</head>
+<body>
+<header>
+  <h1>__TITLE__</h1>
+  <span id="mode-badge" class="badge badge-mode">__MODE__</span>
+  <span id="conn-status" class="badge badge-ok" data-i18n="live">live</span>
+  <span id="pts-count" class="badge badge-info">0 pts</span>
+  <span id="sample-rate-badge" class="badge badge-info">rate -- Hz</span>
+  <div class="header-actions">
+    <button id="btn-lang-toggle" class="panel-btn" title="中文/English">中/En</button>
+    <button id="btn-cursor-toggle" class="panel-btn" data-i18n-title="cursors_tip" data-i18n="cursors">Cursors</button>
+    <button id="btn-cursor-mode" class="panel-btn" style="display:none;" data-i18n-title="cursor_mode_tip">Time</button>
+    <button id="btn-save-project" class="panel-btn" data-i18n-title="save_project_tip" data-i18n="save">Save</button>
+    <button id="btn-load-project" class="panel-btn" data-i18n-title="load_project_tip" data-i18n="load">Load</button>
+    <button id="btn-thresholds" class="panel-btn" data-i18n-title="thresholds_tip" data-i18n="thresholds">Thresholds</button>
+    <button id="btn-export-csv" class="panel-btn" data-i18n-title="export_csv_tip">CSV</button>
+    <button id="btn-export-png" class="panel-btn" data-i18n-title="export_png_tip">PNG</button>
+    <button id="btn-help" class="panel-btn" data-i18n-title="help_tip">?</button>
+    <input id="project-load-input" class="hidden-file-input" type="file" accept="application/json,.json">
+  </div>
+</header>
+
+<div id="control-toolbar">
+  <button id="btn-start" class="ctrl-btn active" data-i18n="start" disabled>Start</button>
+  <button id="btn-pause" class="ctrl-btn" data-i18n="pause">Pause</button>
+  <button id="btn-stop" class="ctrl-btn danger" data-i18n="stop">Stop</button>
+  <span id="collection-status-badge" class="status-running" data-i18n="running">Running</span>
+  <div class="ctrl-sep"></div>
+  <label data-i18n="buffer">Buffer</label>
+  <input type="number" id="buffer-input" value="__MAX_POINTS__" min="2" max="200000" step="10">
+  <span class="buffer-unit">pts</span>
+  <button id="btn-apply-buffer" class="ctrl-btn" data-i18n="apply">Apply</button>
+  <div class="ctrl-sep"></div>
+  <div id="interval-group">
+    <label data-i18n="interval">Interval</label>
+    <input type="number" id="interval-input" value="0" step="0.001" min="0" max="60">
+    <span class="interval-unit">s</span>
+    <button id="btn-apply-interval" class="ctrl-btn" data-i18n="apply">Apply</button>
+  </div>
+</div>
+
+<div id="trigger-toolbar">
+  <button id="trigger-enable-btn" data-i18n="trigger">Trigger</button>
+  <span id="trigger-state-badge" class="trigger-state-idle" data-i18n="idle">Idle</span>
+  <div class="trigger-sep"></div>
+  <label data-i18n="source">Source</label>
+  <select id="trigger-source"><option value="">--</option></select>
+  <div class="trigger-sep"></div>
+  <label data-i18n="edge">Edge</label>
+  <select id="trigger-edge">
+    <option value="rising" data-i18n="rising">Rising</option>
+    <option value="falling" data-i18n="falling">Falling</option>
+    <option value="both" data-i18n="both">Both</option>
+  </select>
+  <div class="trigger-sep"></div>
+  <label data-i18n="level">Level</label>
+  <input type="number" id="trigger-level" value="0" step="0.1">
+  <div class="trigger-sep"></div>
+  <label data-i18n="mode">Mode</label>
+  <select id="trigger-mode">
+    <option value="auto" data-i18n="auto">Auto</option>
+    <option value="normal" data-i18n="normal">Normal</option>
+    <option value="single" data-i18n="single">Single</option>
+  </select>
+  <div class="trigger-sep"></div>
+  <label data-i18n="pretrig">Pre-trig</label>
+  <input type="number" id="trigger-pretrig" value="1000" min="10" max="50000" step="100">
+  <div class="trigger-sep"></div>
+  <button id="trigger-force-btn" data-i18n="force_trigger">Force Trigger</button>
+</div>
+
+<div id="var-selector"></div>
+
+<div id="superwatch-panel" aria-hidden="true">
+  <div id="sw-search-wrap" style="position:relative">
+    <input id="superwatch-search-input" data-i18n-placeholder="sw_search_placeholder" placeholder="Search or type variable name...">
+    <ul id="sw-search-dropdown"></ul>
+  </div>
+  <button id="superwatch-add-btn" class="panel-btn" data-i18n="add">Add</button>
+  <label data-i18n="time">Time</label>
+  <select id="time-unit-select">
+    <option value="us">us</option>
+    <option value="ms" selected>ms</option>
+    <option value="s">s</option>
+  </select>
+  <button id="superwatch-inspect-btn" class="panel-btn" data-i18n="inspect">Inspect</button>
+</div>
+
+<div id="view-tab-bar">
+  <button id="tab-chart" class="view-tab active" data-i18n="tab_chart">Chart</button>
+  <button id="tab-memory" class="view-tab" data-i18n="tab_memory">Memory</button>
+</div>
+
+<main id="debug-main">
+  <section id="chart-watch-wrap">
+    <div id="enum-tooltip"></div>
+    <div id="chart-wrap">
+      <canvas id="chart"></canvas>
+      <div id="tooltip"></div>
+      <div id="cursor-a" class="cursor-line" style="display:none;"></div>
+      <div id="cursor-b" class="cursor-line" style="display:none;"></div>
+      <div id="cursor-measure-panel" style="display:none;"></div>
+    </div>
+    <div id="watch-resizer"></div>
+    <div id="watch-panel">
+      <div class="panel-header">
+        <div class="panel-title">
+          <span class="panel-dot"></span>
+          <span data-i18n="watch">Watch</span>
+        </div>
+        <div class="panel-actions">
+          <span id="watch-count" class="panel-count">0 ch</span>
+          <button id="watch-columns-btn" class="panel-btn" data-i18n-title="columns_tip" data-i18n="columns">Columns</button>
+          <button id="watch-collapse" class="panel-btn panel-btn-close" data-i18n-title="collapse_watch" title="Collapse Watch">&#x2715;</button>
+        </div>
+      </div>
+      <div id="watch-columns-menu" class="columns-menu" aria-hidden="true"></div>
+      <div id="watch-table-wrap">
+        <table id="watch-table">
+          <thead>
+            <tr id="watch-table-head-row"></tr>
+          </thead>
+          <tbody id="watch-tbody"></tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <div id="minimap-wrap">
+    <canvas id="minimap-canvas"></canvas>
+    <div id="minimap-viewport"></div>
+    <div id="cursor-readout"></div>
+  </div>
+
+  <section id="memory-view-main" style="display:none;">
+    <div id="mem-window-tabs">
+      <button id="mem-win-btn-0" class="mem-win-tab active">Mem 1</button>
+      <button id="mem-win-btn-1" class="mem-win-tab">Mem 2</button>
+      <button id="mem-win-btn-2" class="mem-win-tab">Mem 3</button>
+      <button id="mem-win-btn-3" class="mem-win-tab">Mem 4</button>
+    </div>
+    <div id="mem-toolbar">
+      <label>Address:</label>
+      <input id="mem-addr-input" type="text" value="0x20000000" spellcheck="false">
+      <label>Size:</label>
+      <input id="mem-size-input" type="number" value="256" min="1" max="2048" step="16">
+      <label>Format:</label>
+      <select id="mem-format-select">
+        <option value="hex8">Hex Byte</option>
+        <option value="hex16">Hex Half-word</option>
+        <option value="hex32">Hex Word</option>
+        <option value="dec8">Unsigned Byte</option>
+        <option value="dec16s">Signed Int16</option>
+        <option value="float32">Float32</option>
+        <option value="double64">Double64</option>
+      </select>
+      <button id="mem-read-btn" class="panel-btn" data-i18n="mem_read">Read</button>
+      <div class="mem-sep"></div>
+      <label><input id="mem-auto-check" type="checkbox"> <span data-i18n="mem_auto">Auto</span></label>
+      <input id="mem-interval-input" type="number" value="500" min="100" max="10000" step="100">
+      <span>ms</span>
+    </div>
+    <div id="mem-symbol-bar">
+      <label>Symbol:</label>
+      <div id="mem-symbol-wrap" style="position:relative;">
+        <input id="mem-symbol-input" type="text" placeholder="Search variable..." spellcheck="false">
+        <ul id="mem-symbol-dropdown"></ul>
+      </div>
+    </div>
+    <div id="mem-grid-container-0" class="mem-grid-container">
+      <table class="mem-grid-table">
+        <thead class="mem-grid-thead"></thead>
+        <tbody class="mem-grid-tbody"></tbody>
+      </table>
+    </div>
+    <div id="mem-grid-container-1" class="mem-grid-container" style="display:none">
+      <table class="mem-grid-table">
+        <thead class="mem-grid-thead"></thead>
+        <tbody class="mem-grid-tbody"></tbody>
+      </table>
+    </div>
+    <div id="mem-grid-container-2" class="mem-grid-container" style="display:none">
+      <table class="mem-grid-table">
+        <thead class="mem-grid-thead"></thead>
+        <tbody class="mem-grid-tbody"></tbody>
+      </table>
+    </div>
+    <div id="mem-grid-container-3" class="mem-grid-container" style="display:none">
+      <table class="mem-grid-table">
+        <thead class="mem-grid-thead"></thead>
+        <tbody class="mem-grid-tbody"></tbody>
+      </table>
+    </div>
+    <div id="mem-status-bar">
+      <span id="mem-status-text"></span>
+    </div>
+  </section>
+
+  <section id="raw-log-panel" data-open="false">
+    <div class="panel-resizer" title="Drag to resize"></div>
+    <div class="panel-header">
+      <div class="panel-title">
+        <span class="panel-dot"></span>
+        <span data-i18n="raw_log">Raw Log</span>
+      </div>
+      <div class="panel-actions">
+        <span id="raw-log-count" class="panel-count">0 lines</span>
+        <button id="raw-log-clear" class="panel-btn" data-i18n-title="clear_log" data-i18n="clear">Clear</button>
+        <button id="raw-log-close" class="panel-btn panel-btn-close" data-i18n-title="close_panel" title="Close panel">&#x2715;</button>
+      </div>
+    </div>
+    <pre id="raw-log"></pre>
+  </section>
+  <section id="inspector-panel" aria-hidden="true"></section>
+</main>
+
+<footer id="stats-footer"></footer>
+<div id="threshold-overlay" class="config-overlay" aria-hidden="true">
+  <div class="config-dialog" role="dialog" aria-modal="true" aria-labelledby="threshold-title">
+    <h2 id="threshold-title" data-i18n="thresholds">Thresholds</h2>
+    <div class="config-grid">
+      <div class="config-field full">
+        <label for="threshold-channel" data-i18n="channel">Channel</label>
+        <select id="threshold-channel"></select>
+      </div>
+      <div class="config-field">
+        <label for="threshold-warn-low" data-i18n="warn_low">Warn low</label>
+        <input id="threshold-warn-low" type="number" step="0.1">
+      </div>
+      <div class="config-field">
+        <label for="threshold-warn-high" data-i18n="warn_high">Warn high</label>
+        <input id="threshold-warn-high" type="number" step="0.1">
+      </div>
+      <div class="config-field">
+        <label for="threshold-alarm-low" data-i18n="alarm_low">Alarm low</label>
+        <input id="threshold-alarm-low" type="number" step="0.1">
+      </div>
+      <div class="config-field">
+        <label for="threshold-alarm-high" data-i18n="alarm_high">Alarm high</label>
+        <input id="threshold-alarm-high" type="number" step="0.1">
+      </div>
+    </div>
+    <div class="config-actions">
+      <button id="threshold-clear" class="panel-btn" data-i18n="clear">Clear</button>
+      <button id="threshold-cancel" class="panel-btn" data-i18n="cancel">Cancel</button>
+      <button id="threshold-apply" class="panel-btn" data-i18n="apply">Apply</button>
+    </div>
+  </div>
+</div>
+<div id="shutdown-overlay">
+  <h2 data-i18n="server_shutdown">Server Shut Down</h2>
+  <p data-i18n="server_stopped_msg">The visualization server has been stopped.</p>
+  <p data-i18n="close_tab_msg">You can close this tab.</p>
+</div>
+
+<div id="help-overlay" aria-hidden="true">
+  <div id="help-modal" role="dialog" aria-modal="true" aria-labelledby="help-modal-title">
+    <div id="help-modal-header">
+      <h2 id="help-modal-title" data-i18n="help_title">使用说明</h2>
+      <button id="help-close-btn" data-i18n-title="close_esc" title="关闭 (Esc)">&times;</button>
+    </div>
+    <div id="help-modal-body">
+
+      <div class="help-section">
+        <h3 data-i18n="help_chart">图表交互</h3>
+        <ul id="help-chart-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_var_selector">变量选择器</h3>
+        <ul id="help-var-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_trigger_sys">触发系统</h3>
+        <ul id="help-trigger-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_watch_panel">Watch 面板</h3>
+        <ul id="help-watch-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_minimap">缩略图 (Minimap)</h3>
+        <ul id="help-minimap-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_cursors">测量光标 (Cursors)</h3>
+        <ul id="help-cursors-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_export">数据导出</h3>
+        <ul id="help-export-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_shortcuts">键盘快捷键</h3>
+        <table class="help-kbd-table" id="help-kbd-table"></table>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_rawlog">Raw Log 面板</h3>
+        <ul id="help-rawlog-list"></ul>
+      </div>
+
+      <div class="help-section">
+        <h3 data-i18n="help_pause_resume">暂停 / 恢复</h3>
+        <ul id="help-pause-list"></ul>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+
+<script>
+var CONFIG = {
+  maxPoints: __MAX_POINTS__,
+  title: "__TITLE__",
+  mode: "__MODE__",
+  lang: "__LANG__"
+};
+</script>
+<script src="/static/rtt_i18n.js"></script>
+<script src="/static/rtt_viewer.js"></script>
+<script src="/static/memory_view.js"></script>
+</body>
+</html>

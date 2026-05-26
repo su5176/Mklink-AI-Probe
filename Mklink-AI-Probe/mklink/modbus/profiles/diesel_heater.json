@@ -1,0 +1,217 @@
+{
+  "schema_version": 1,
+  "profile_id": "diesel-heater",
+  "name": "Diesel Heater Controller",
+  "slave": 1,
+  "baudrate": 57600,
+  "groups": [
+    {
+      "id": "runtime",
+      "name": "Runtime Data",
+      "poll_group": "fast",
+      "registers": [
+        {"addr": 0, "type": "uint16", "name": "battery_voltage", "label": "Battery Voltage", "unit": "V", "scale": 0.1, "access": "ro", "chart": true},
+        {"addr": 1, "type": "uint16", "name": "pressure", "label": "Pressure", "access": "ro"},
+        {"addr": 2, "type": "int16", "name": "ntc_temp", "label": "NTC Temperature", "unit": "C", "access": "ro", "chart": true},
+        {"addr": 3, "type": "uint16", "name": "altitude", "label": "Altitude", "access": "ro"},
+        {"addr": 5, "type": "uint16", "name": "aux_temp", "label": "Aux Temperature", "unit": "C", "access": "ro"},
+        {"addr": 20, "type": "int16", "name": "current_temp_setting", "label": "Temperature Setting", "unit": "C", "access": "ro"},
+        {"addr": 21, "type": "uint16", "name": "pump_output_percent", "label": "Pump Output", "unit": "%", "access": "ro", "chart": true},
+        {"addr": 22, "type": "uint16", "name": "aux_fan_output_percent", "label": "Aux Fan Output", "unit": "%", "access": "ro", "chart": true},
+        {"addr": 23, "type": "uint16", "name": "heat_exchanger_output_percent", "label": "Heat Exchanger Fan", "unit": "%", "access": "ro", "chart": true},
+        {"addr": 24, "type": "uint16", "name": "auto_mode_output_percent", "label": "Auto Mode Output", "unit": "%", "access": "ro", "chart": true},
+        {"addr": 25, "type": "uint16", "name": "start_countdown", "label": "Start Countdown", "unit": "s", "access": "ro"},
+        {"addr": 26, "type": "uint16", "name": "stop_countdown", "label": "Stop Countdown", "unit": "s", "access": "ro"},
+        {"addr": 28, "type": "int16", "name": "ntc_comp_offset", "label": "NTC Compensation Offset", "unit": "C", "access": "ro"},
+        {"addr": 40, "type": "uint16", "name": "aluminum_temp", "label": "Aluminum Temperature", "unit": "C", "access": "ro", "chart": true}
+      ]
+    },
+    {
+      "id": "control",
+      "name": "Control",
+      "poll_group": "fast",
+      "registers": [
+        {
+          "addr": 100,
+          "type": "uint16",
+          "name": "control_command",
+          "label": "Control Command",
+          "kind": "bitfield",
+          "access": "rw",
+          "bits": [
+            {"bit": 0, "name": "start_reset", "label": "Start/Reset"},
+            {"bit": 1, "name": "stop", "label": "Stop"},
+            {"bit": 2, "name": "auto_mode", "label": "Auto Mode"},
+            {"bit": 3, "name": "manual_mode", "label": "Manual Mode"},
+            {"bit": 4, "name": "level_up", "label": "Level Up"},
+            {"bit": 5, "name": "level_down", "label": "Level Down"},
+            {"bit": 6, "name": "debug_mode", "label": "Debug Mode"},
+            {"bit": 7, "name": "factory_mode", "label": "Factory Mode"},
+            {"bit": 8, "name": "debug_state_toggle", "label": "Debug State Toggle"}
+          ]
+        },
+        {
+          "addr": 101,
+          "type": "uint16",
+          "name": "alarm1",
+          "label": "Alarm Register 1",
+          "kind": "alarm",
+          "access": "ro",
+          "bits": [
+            {"bit": 0, "name": "E01", "label": "Heating rod fault", "severity": "stop"},
+            {"bit": 1, "name": "E02", "label": "Oil pump over-current", "severity": "stop"},
+            {"bit": 2, "name": "E03", "label": "Oil pump open circuit", "severity": "stop"},
+            {"bit": 3, "name": "E04", "label": "Aux fan fault", "severity": "stop"},
+            {"bit": 4, "name": "E05", "label": "Heating fail", "severity": "stop"},
+            {"bit": 5, "name": "E06", "label": "Thermocouple fault", "severity": "stop"},
+            {"bit": 6, "name": "E07", "label": "Pressure sensor fault", "severity": "stop"},
+            {"bit": 7, "name": "E08", "label": "Battery voltage low", "severity": "stop"},
+            {"bit": 8, "name": "E09", "label": "Battery voltage high", "severity": "stop"},
+            {"bit": 9, "name": "E10", "label": "NTC overheat", "severity": "stop"},
+            {"bit": 10, "name": "EF1", "label": "Heat exchanger fan 1 fault", "severity": "stop"},
+            {"bit": 11, "name": "EF2", "label": "Heat exchanger fan 2 fault", "severity": "stop"},
+            {"bit": 12, "name": "EF3", "label": "Heat exchanger fan 3 fault", "severity": "stop"},
+            {"bit": 13, "name": "EF4", "label": "Heat exchanger serious fault", "severity": "stop"},
+            {"bit": 14, "name": "E11", "label": "NTC fault", "severity": "stop"},
+            {"bit": 15, "name": "E12", "label": "Start fault", "severity": "stop"}
+          ]
+        },
+        {
+          "addr": 102,
+          "type": "uint16",
+          "name": "sys_status",
+          "label": "System Status",
+          "kind": "enum",
+          "access": "ro",
+          "values": {"0": "Idle", "1": "Preheating", "2": "Ignition", "3": "Running", "4": "Shutdown", "5": "Fault"}
+        },
+        {
+          "addr": 103,
+          "type": "uint16",
+          "name": "current_mode",
+          "label": "Current Mode",
+          "kind": "enum",
+          "access": "ro",
+          "values": {"0": "Manual", "1": "Auto"}
+        },
+        {"addr": 104, "type": "uint16", "name": "current_level", "label": "Current Level", "access": "ro"},
+        {"addr": 105, "type": "uint16", "name": "set_level", "label": "Set Level", "access": "ro"},
+        {"addr": 106, "type": "uint16", "name": "fault_stop_timeout", "label": "Fault Stop Timeout", "access": "ro"},
+        {"addr": 107, "type": "uint16", "name": "debug_mode_state", "label": "Debug Mode State", "access": "ro"},
+        {"addr": 108, "type": "uint16", "name": "runtime_hours", "label": "Runtime Hours", "unit": "h", "access": "ro"},
+        {"addr": 109, "type": "uint16", "name": "clear_hours", "label": "Clear Runtime Hours", "access": "rw", "min": 0, "max": 65535},
+        {"addr": 110, "type": "uint16", "name": "set_level_command", "label": "Set Level Command", "access": "rw", "min": 1, "max": 8},
+        {"addr": 111, "type": "uint16", "name": "trial_expired", "label": "Trial Expired", "access": "ro"},
+        {
+          "addr": 112,
+          "type": "uint16",
+          "name": "alarm2",
+          "label": "Alarm Register 2",
+          "kind": "alarm",
+          "access": "ro",
+          "bits": [
+            {"bit": 0, "name": "E13", "label": "Aluminum temperature sensor fault", "severity": "stop"},
+            {"bit": 1, "name": "E14", "label": "Aluminum temperature overheat", "severity": "stop"},
+            {"bit": 2, "name": "E15", "label": "Brushless fan fault", "severity": "stop"}
+          ]
+        },
+        {"addr": 113, "type": "uint16", "name": "stove_mode_enable", "label": "Stove Mode Enable", "access": "ro"}
+      ]
+    },
+    {
+      "id": "protection_params",
+      "name": "Protection Parameters",
+      "poll_group": "slow",
+      "writable": true,
+      "registers": [
+        {"addr": 200, "type": "uint16", "name": "batt_volt_min", "label": "Battery Voltage Min", "unit": "0.1V", "access": "rw", "min": 100, "max": 3000, "default": 1800, "persistent": true},
+        {"addr": 201, "type": "uint16", "name": "batt_volt_max", "label": "Battery Voltage Max", "unit": "0.1V", "access": "rw", "min": 100, "max": 3000, "default": 2800, "persistent": true},
+        {"addr": 202, "type": "uint16", "name": "batt_check_delay", "label": "Battery Check Delay", "unit": "s", "access": "rw", "min": 1, "max": 60, "default": 1, "persistent": true},
+        {"addr": 203, "type": "uint16", "name": "ntc_overheat_temp", "label": "NTC Overheat Temperature", "unit": "C", "access": "rw", "min": 40, "max": 100, "default": 50, "persistent": true},
+        {"addr": 204, "type": "uint16", "name": "trial_enable", "label": "Trial Enable", "access": "rw", "min": 0, "max": 1, "default": 0, "persistent": true}
+      ]
+    },
+    {
+      "id": "timing_params",
+      "name": "Timing Parameters",
+      "poll_group": "slow",
+      "writable": true,
+      "registers": [
+        {"addr": 205, "type": "uint16", "name": "heater_preheat_time", "label": "Preheat Time", "unit": "s", "access": "rw", "min": 5, "max": 600, "default": 25, "persistent": true},
+        {"addr": 206, "type": "uint16", "name": "heater_ignition_time", "label": "Ignition Time", "unit": "s", "access": "rw", "min": 5, "max": 600, "default": 45, "persistent": true},
+        {"addr": 207, "type": "uint16", "name": "aux_temp_ignition", "label": "Aux Ignition Temperature", "access": "rw", "min": 0, "max": 1000, "default": 0, "persistent": true},
+        {"addr": 208, "type": "uint16", "name": "preheat_percent", "label": "Preheat Percent", "unit": "%", "access": "rw", "min": 1, "max": 100, "default": 50, "persistent": true},
+        {"addr": 209, "type": "uint16", "name": "ignition_fail_temp", "label": "Ignition Fail Temperature", "unit": "C", "access": "rw", "min": 0, "max": 500, "default": 20, "persistent": true},
+        {"addr": 210, "type": "uint16", "name": "pump_ramping_time", "label": "Pump Ramping Time", "unit": "s", "access": "rw", "min": 1, "max": 600, "default": 30, "persistent": true},
+        {"addr": 215, "type": "uint16", "name": "trial_hours", "label": "Trial Hours", "unit": "h", "access": "rw", "min": 1, "max": 100, "default": 24, "persistent": true}
+      ]
+    },
+    {
+      "id": "level_params",
+      "name": "Level Parameters",
+      "poll_group": "slow",
+      "writable": true,
+      "registers": [
+        {"addr": 220, "type": "uint16", "name": "level1_pump_percent", "label": "Level 1 Pump Percent", "unit": "%", "access": "rw", "min": 0, "max": 100, "default": 25, "persistent": true},
+        {"addr": 221, "type": "uint16", "name": "level1_aux_fan_percent", "label": "Level 1 Aux Fan Percent", "unit": "%", "access": "rw", "min": 0, "max": 100, "default": 38, "persistent": true},
+        {"addr": 222, "type": "uint16", "name": "level1_heat_fan_percent", "label": "Level 1 Heat Fan Percent", "unit": "%", "access": "rw", "min": 0, "max": 100, "default": 28, "persistent": true},
+        {"addr": 223, "type": "uint16", "name": "level1_pump_trim", "label": "Level 1 Pump Trim", "access": "rw", "min": 0, "max": 200, "default": 100, "persistent": true},
+        {"addr": 224, "type": "uint16", "name": "level1_aux_fan_trim", "label": "Level 1 Aux Fan Trim", "access": "rw", "min": 0, "max": 200, "default": 100, "persistent": true}
+      ]
+    },
+    {
+      "id": "misc_params",
+      "name": "Misc Parameters",
+      "poll_group": "slow",
+      "writable": true,
+      "registers": [
+        {"addr": 260, "type": "uint16", "name": "auto_sleep_temp", "label": "Auto Sleep Temperature Delta", "unit": "C", "access": "rw", "min": 1, "max": 20, "default": 2, "persistent": true},
+        {"addr": 261, "type": "uint16", "name": "auto_sleep_confirm_time", "label": "Auto Sleep Confirm Time", "unit": "s", "access": "rw", "min": 1, "max": 600, "default": 10, "persistent": true},
+        {"addr": 262, "type": "uint16", "name": "auto_wakeup_temp", "label": "Auto Wakeup Temperature Delta", "unit": "C", "access": "rw", "min": 1, "max": 20, "default": 2, "persistent": true},
+        {"addr": 263, "type": "uint16", "name": "auto_wakeup_time", "label": "Auto Wakeup Time", "unit": "s", "access": "rw", "min": 1, "max": 600, "default": 10, "persistent": true},
+        {"addr": 264, "type": "uint16", "name": "auto_wakeup_enable", "label": "Auto Wakeup Enable", "access": "rw", "min": 0, "max": 1, "default": 1, "persistent": true},
+        {"addr": 270, "type": "uint16", "name": "aluminum_temp_start", "label": "Aluminum Fan Start Temperature", "unit": "C", "access": "rw", "min": 0, "max": 200, "default": 0, "persistent": true},
+        {"addr": 271, "type": "uint16", "name": "aluminum_temp_alarm", "label": "Aluminum Temperature Alarm", "unit": "C", "access": "rw", "min": 100, "max": 240, "default": 200, "persistent": true},
+        {"addr": 272, "type": "uint16", "name": "aluminum_temp_alarm_delay", "label": "Aluminum Alarm Delay", "unit": "s", "access": "rw", "min": 1, "max": 300, "default": 30, "persistent": true},
+        {"addr": 273, "type": "uint16", "name": "fan_enable", "label": "Fan Enable Mask", "access": "rw", "min": 0, "max": 15, "default": 15, "persistent": true},
+        {"addr": 274, "type": "uint16", "name": "pump_control_mode", "label": "Pump Control Mode", "kind": "enum", "access": "rw", "min": 1, "max": 2, "default": 1, "persistent": true, "values": {"1": "Liquid", "2": "Gas"}},
+        {"addr": 275, "type": "uint16", "name": "pump_pwm_freq", "label": "Pump PWM Frequency", "unit": "Hz", "access": "rw", "min": 10, "max": 200, "default": 50, "persistent": true},
+        {"addr": 276, "type": "uint16", "name": "pump_pwm_min_duty", "label": "Pump PWM Duty", "unit": "%", "access": "rw", "min": 0, "max": 100, "default": 50, "persistent": true},
+        {"addr": 277, "type": "uint16", "name": "stove_feature_exist", "label": "Stove Feature Exists", "access": "rw", "min": 0, "max": 1, "default": 1, "persistent": true},
+        {"addr": 278, "type": "int16", "name": "ntc_temp_offset", "label": "NTC Temperature Offset", "unit": "C", "access": "rw", "min": -10, "max": 10, "default": 0, "persistent": true},
+        {"addr": 299, "type": "uint16", "name": "param_validity", "label": "Parameter Validity", "access": "rw", "min": 0, "max": 65535, "default": 21930, "persistent": true}
+      ]
+    }
+  ],
+  "commands": [
+    {"action": "start", "label": "Start", "addr": 100, "bit": 0, "confirm_required": true},
+    {"action": "stop", "label": "Stop", "addr": 100, "bit": 1, "confirm_required": true},
+    {"action": "auto", "label": "Auto", "addr": 100, "bit": 2},
+    {"action": "manual", "label": "Manual", "addr": 100, "bit": 3},
+    {"action": "level_up", "label": "Level Up", "addr": 100, "bit": 4},
+    {"action": "level_down", "label": "Level Down", "addr": 100, "bit": 5},
+    {"action": "debug", "label": "Debug Mode", "addr": 100, "bit": 6},
+    {"action": "clear_hours", "label": "Clear Hours", "write_addr": 109, "write_value": 21930, "confirm_required": true},
+    {"action": "set_level", "label": "Set Level", "write_addr": 110, "write_value": 1, "params": [{"name": "level", "min": 1, "max": 8}]}
+  ],
+  "poll_groups": {
+    "fast": {"interval": 1.0, "ranges": [{"start": 0, "count": 41}, {"start": 100, "count": 14}]},
+    "slow": {"interval": 5.0, "ranges": [{"start": 200, "count": 100}]}
+  },
+  "dashboard": {
+    "title": "Diesel Heater Controller",
+    "overview_metrics": [
+      {"addr": 0, "label": "Battery", "unit": "V", "scale": 0.1, "color": "#4da6ff"},
+      {"addr": 2, "label": "NTC", "unit": "C", "color": "#00d4aa"},
+      {"addr": 40, "label": "Aluminum", "unit": "C", "color": "#ffd93d"},
+      {"addr": 21, "label": "Pump", "unit": "%", "color": "#ff9f43"}
+    ],
+    "status_display": {"state_register": 102, "mode_register": 103, "level_register": 104},
+    "control_buttons": [
+      {"action": "start", "label": "Start", "css_class": "start"},
+      {"action": "stop", "label": "Stop", "css_class": "stop"},
+      {"action": "auto", "label": "Auto", "css_class": ""},
+      {"action": "manual", "label": "Manual", "css_class": ""}
+    ]
+  }
+}

@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mklink"
+version = "0.1.0"
+description = "Mklink AI Probe - Embedded Debug Toolkit"
+requires-python = ">=3.8"
+dependencies = ["pyserial", "pymodbus>=3.0"]
+
+[project.optional-dependencies]
+gui = ["fastapi>=0.100", "uvicorn>=0.20", "websockets>=11.0"]
+test = ["pytest"]
+e2e = ["pytest", "playwright"]
+hil = ["pytest", "playwright", "requests"]
+
+[tool.pytest.ini_options]
+testpaths = ["_maintainer/testing/tests"]
+pythonpath = [".", "_maintainer/testing", "_maintainer/testing/tests"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mklink*"]
+
+[tool.setuptools.package-dir]
+"" = "."
+
+[tool.setuptools.package-data]
+"mklink" = ["*.json", "modbus/*.html", "modbus/profiles/*.json", "modbus/prompts/*.md"]

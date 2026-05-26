@@ -1,0 +1,7 @@
+interface:
+  display_name: "Mklink AI Probe"
+  short_description: "Flash, RTT, VOFA, HardFault, and Modbus debugging."
+  default_prompt: "Use $mklink-ai-probe to initialize an embedded project, flash firmware, inspect RTT/VOFA data, or build a Modbus point-table dashboard."
+
+policy:
+  allow_implicit_invocation: true
