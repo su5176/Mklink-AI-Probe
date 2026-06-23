@@ -25,6 +25,19 @@ from mklink.profiles import load_mcu_profiles
 from mklink.utils import parse_download_progress, parse_load_result
 from mklink._types import FLM_LOAD_TIMEOUT
 
+HPM_BOARD_FLASH_CFG = {
+    "hpm5e00evk": ("0xfcf90002U", "0x00000005U", "0x00001000U"),
+    "hpm6e00evk": ("0xfcf90001U", "0x00000005U", "0x00001000U"),
+    "hpm6p00evk": ("0xfcf90002U", "0x00000005U", "0x00001000U"),
+    "hpm5300evk": ("0xfcf90002U", "0x00000005U", "0x00001000U"),
+    "hpm5301evklite": ("0xfcf90002U", "0x00000005U", "0x00001000U"),
+    "hpm6200evk": ("0xfcf90001U", "0x00000005U", "0x00001000U"),
+    "hpm6300evk": ("0xfcf90001U", "0x00000005U", "0x00001000U"),
+    "hpm6750evk2": ("0xfcf90002U", "0x00000005U", "0x0000000EU"),
+    "hpm6750evkmini": ("0xfcf90002U", "0x00000005U", "0x0000000EU"),
+    "hpm6800evk": ("0xfcf90001U", "0x00000005U", "0x00001000U"),
+}
+
 
 # ---------------------------------------------------------------------------
 # 错误类
@@ -318,6 +331,63 @@ class MKLinkFlash:
             "response": resp,
         }
 
+    def burn_hpm_bin(
+        self,
+        bin_path: str,
+        addr: str,
+        board: str | None = None,
+        flash_cfg: tuple[str, str, str] | list[str] | None = None,
+        microkeen_filename: str | None = None,
+        progress_callback=None,
+    ) -> dict:
+        """Program an HPMicro BIN image with the HPM device-side API."""
+        filename = self._copy_to_microkeen(bin_path, microkeen_filename)
+        if not filename:
+            raise FlashError("无法将文件拷贝到 MICROKEEN 磁盘")
+
+        board_key = board.lower() if board else ""
+        commands: list[str] = []
+        if board_key:
+            commands.append(f'hpm.board("{board_key}")')
+        elif flash_cfg:
+            cfg = [str(v) for v in flash_cfg]
+            if len(cfg) != 3:
+                raise FlashError("HPM flash_cfg 需要 3 个参数")
+            commands.append(f"hpm.flash_cfg({cfg[0]},{cfg[1]},{cfg[2]})")
+
+        commands.append(f'hpm.program("{filename}",{addr})')
+
+        responses: list[str] = []
+        start = time.time()
+        for index, cmd in enumerate(commands):
+            timeout = FLM_LOAD_TIMEOUT if cmd.startswith("hpm.program") else 10.0
+            responses.append(self._bridge.send_command(cmd, timeout=timeout, echo=True))
+            if index < len(commands) - 1:
+                time.sleep(0.1)
+        time.sleep(0.5)
+
+        resp = "\n".join(responses)
+        elapsed_ms = int((time.time() - start) * 1000)
+        progress_list = parse_download_progress(resp)
+
+        if progress_callback and progress_list:
+            last_percent = 0
+            for p in progress_list:
+                if p["percent"] > last_percent:
+                    progress_callback(p["percent"])
+                    last_percent = p["percent"]
+
+        result = parse_load_result(resp)
+        return {
+            "success": result.get("success", False),
+            "filename": filename,
+            "addr": addr,
+            "board": board_key or None,
+            "progress": progress_list,
+            "time_ms": elapsed_ms,
+            "response": resp,
+        }
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
@@ -384,13 +454,13 @@ def burn_hex_file(
     progress_callback=None,
     project_root: str = ".",
 ) -> dict:
-    """一站式烧录 HEX 文件。
+    """一站式烧录固件文件。
 
     自动完成：连接 → 设置时钟 → 获取 IDCODE → 加载 FLM → 烧录
     load.hex() / load.bin() 内部按扇区边擦边写，无需单独擦除。
 
     Args:
-        hex_path: 本地 HEX 文件路径，None 则自动从 .mklink/keil_project.json 读取
+        hex_path: 本地固件文件路径，None 则自动从 .mklink/project_info.json 读取
         port: COM 端口，None 则自动查找
         mcu_key: MCU 配置键名（如 "n32g435"）
         flash_base: Flash 基地址
@@ -414,14 +484,15 @@ def burn_hex_file(
     config = load_config(project_root) or {}
     project_info = load_keil_project(project_root) or {}
 
-    # 如果 hex_path 为 None，自动从 .mklink/project_info.json 读取
+    # 如果未显式传入文件路径，优先读取 project_info.json 里的 bin_path，
+    # 其次兼容旧字段 hex_path。
     if hex_path is None:
         if project_info:
-            hex_path = project_info.get("hex_path")
+            hex_path = project_info.get("bin_path") or project_info.get("hex_path")
             if hex_path:
-                print(f"[AUTO] 从 project_info.json 自动获取 hex_path: {hex_path}")
+                print(f"[AUTO] 从 project_info.json 自动获取 firmware_path: {hex_path}")
         if not hex_path:
-            raise FlashError("hex_path 为空且无法从 .mklink/project_info.json 读取")
+            raise FlashError("firmware_path 为空且无法从 .mklink/project_info.json 读取")
 
     if not Path(hex_path).exists():
         raise FlashError(f"HEX 文件不存在: {hex_path}")
@@ -429,7 +500,7 @@ def burn_hex_file(
     # 检测 .bin 文件，自动路由到 burn_bin
     is_bin_file = hex_path.lower().endswith(".bin")
     if is_bin_file:
-        print("[WARN] 检测到 .bin 文件，将使用 burn_bin 模式（需要指定烧录地址）")
+        print("[WARN] 检测到 .bin 文件，将使用 burn_bin 模式")
 
     if mcu_key is None:
         mcu_key = config.get("mcu_key")
@@ -438,6 +509,19 @@ def burn_hex_file(
 
     if flash_base is None:
         flash_base = project_info.get("flash_base") or "0x08000000"
+    bin_base = (
+        project_info.get("bin_base")
+        or project_info.get("download_base")
+        or flash_base
+    )
+    board = project_info.get("board", "")
+    is_hpm_project = (
+        str(project_info.get("vendor", "")).lower() == "hpmicro"
+        or str(board).lower().startswith("hpm")
+    )
+    hpm_flash_cfg = project_info.get("hpm_flash_cfg")
+    if not hpm_flash_cfg and board:
+        hpm_flash_cfg = HPM_BOARD_FLASH_CFG.get(str(board).lower())
 
     flash = MKLinkFlash.connect(port)
     try:
@@ -454,33 +538,44 @@ def burn_hex_file(
         idcode = flash.get_idcode()
         print(f"[OK] IDCODE: 0x{idcode:08X}")
 
-        # 3. 加载 FLM
+        # 3. 加载 FLM。若 profile 没有配置 flm_path，则跳过下载算法，
+        # 直接依赖设备端通用烧录接口。
         profiles = load_mcu_profiles()
         mcu = profiles.get(mcu_key, {})
         if not mcu:
             raise FlashError(f"未知 MCU 配置: {mcu_key}，请检查 .mklink/config.json")
-        # flm_path 来自 profile，格式如 "FLM/N32G43x.FLM"，设备端需要 "/FLM/..." 格式
-        flm_path_from_profile = mcu.get("flm_path", "FLM/N32G43x.FLM")
-        if not flm_path_from_profile:
-            raise FlashError(f"MCU 配置缺少 flm_path: {mcu_key}")
-        # 确保路径以 / 开头（设备端绝对路径格式）
-        if not flm_path_from_profile.startswith("/"):
-            flm_path = "/" + flm_path_from_profile
+        flm_path_from_profile = mcu.get("flm_path", "")
+        if flm_path_from_profile:
+            # flm_path 来自 profile，格式如 "FLM/N32G43x.FLM"，设备端需要 "/FLM/..." 格式
+            if not flm_path_from_profile.startswith("/"):
+                flm_path = "/" + flm_path_from_profile
+            else:
+                flm_path = flm_path_from_profile
+            ram_base = mcu.get("ram_base", "0x20000000")
+
+            print(f"[*] 使用 FLM: {flm_path} (RAM={ram_base})")
+
+            if not flash.load_flm(flm_path, flash_base, ram_base):
+                raise FLMLoadError(f"FLM 加载失败: {flm_path}")
+
+            print(f"[OK] FLM 加载成功")
         else:
-            flm_path = flm_path_from_profile
-        ram_base = mcu.get("ram_base", "0x20000000")
-
-        print(f"[*] 使用 FLM: {flm_path} (RAM={ram_base})")
-
-        if not flash.load_flm(flm_path, flash_base, ram_base):
-            raise FLMLoadError(f"FLM 加载失败: {flm_path}")
-
-        print(f"[OK] FLM 加载成功")
+            print("[AUTO] MCU profile 未配置 flm_path，跳过 FLM 加载")
 
         # 4. 烧录（load.hex 内部自动按扇区擦写，无需单独擦除）
         if is_bin_file:
-            print(f"开始烧录 {Path(hex_path).name} (BIN 模式, 地址: {flash_base}) ...")
-            result = flash.burn_bin(hex_path, addr=flash_base, progress_callback=progress_callback)
+            print(f"开始烧录 {Path(hex_path).name} (BIN 模式, 地址: {bin_base}) ...")
+            if is_hpm_project:
+                print(f"[AUTO] HPM 工程使用 hpm.program 下载，板卡: {board or '未指定'}")
+                result = flash.burn_hpm_bin(
+                    hex_path,
+                    addr=bin_base,
+                    board=board if board else None,
+                    flash_cfg=hpm_flash_cfg,
+                    progress_callback=progress_callback,
+                )
+            else:
+                result = flash.burn_bin(hex_path, addr=bin_base, progress_callback=progress_callback)
         else:
             print(f"开始烧录 {Path(hex_path).name} ...")
             result = flash.burn_hex(hex_path, progress_callback=progress_callback)

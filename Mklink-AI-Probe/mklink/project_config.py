@@ -122,7 +122,7 @@ def lint_json_file(project_root: str, filename: str) -> str | None:
     if not p.exists():
         return f"{filename} 不存在"
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             json.load(f)
     except json.JSONDecodeError as e:
         return f"{filename} JSON 格式错误: 第 {e.lineno} 行第 {e.colno} 列: {e.msg}"
@@ -175,6 +175,12 @@ def lint_config_semantic(project_root: str) -> list[str]:
     # --- project_info.json ---
     project = load_project_info(project_root)
     if project:
+        bin_path = project.get("bin_path", "")
+        if bin_path and not bin_path.lower().endswith(".bin"):
+            warnings.append(
+                f"project_info.json: bin_path '{bin_path}' 后缀异常（应为 .bin）"
+            )
+
         hex_path = project.get("hex_path", "")
         if hex_path:
             if hex_path.lower().endswith(".bin"):
@@ -198,6 +204,13 @@ def lint_config_semantic(project_root: str) -> list[str]:
             warnings.append(
                 f"project_info.json: flash_base '{flash_base}' 格式异常（应为 0x 开头的十六进制地址）"
             )
+
+        for field in ("bin_base", "download_base"):
+            value = project.get(field, "")
+            if value and not _HEX_ADDR_RE.match(value):
+                warnings.append(
+                    f"project_info.json: {field} '{value}' 格式异常（应为 0x 开头的十六进制地址）"
+                )
 
     # --- rtt_config.json ---
     rtt = load_rtt_config(project_root)
@@ -305,7 +318,7 @@ def load_project_history() -> dict:
     if not p.exists():
         return {"last_project": None, "history": []}
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        return json.loads(p.read_text(encoding="utf-8-sig"))
     except (json.JSONDecodeError, OSError):
         return {"last_project": None, "history": []}
 
@@ -372,7 +385,7 @@ def _load_json(project_root: str, filename: str) -> dict | None:
     if not p.exists():
         return None
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8-sig") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError, UnicodeDecodeError):
         return None

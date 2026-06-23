@@ -86,6 +86,73 @@ def _cli_iar_parse(project_root: str):
     print(json.dumps(display, indent=2, ensure_ascii=False))
 
 
+def _detect_hpm_segger_project(project_root: str) -> dict | None:
+    """Detect the HPM Segger Embedded Studio output layout."""
+    from pathlib import Path
+    import json
+
+    hpm_flash_cfg_by_board = {
+        "hpm5e00evk": ["0xfcf90002U", "0x00000005U", "0x00001000U"],
+        "hpm6e00evk": ["0xfcf90001U", "0x00000005U", "0x00001000U"],
+        "hpm6p00evk": ["0xfcf90002U", "0x00000005U", "0x00001000U"],
+        "hpm5300evk": ["0xfcf90002U", "0x00000005U", "0x00001000U"],
+        "hpm5301evklite": ["0xfcf90002U", "0x00000005U", "0x00001000U"],
+        "hpm6200evk": ["0xfcf90001U", "0x00000005U", "0x00001000U"],
+        "hpm6300evk": ["0xfcf90001U", "0x00000005U", "0x00001000U"],
+        "hpm6750evk2": ["0xfcf90002U", "0x00000005U", "0x0000000EU"],
+        "hpm6750evkmini": ["0xfcf90002U", "0x00000005U", "0x0000000EU"],
+        "hpm6800evk": ["0xfcf90001U", "0x00000005U", "0x00001000U"],
+    }
+
+    root = Path(project_root)
+    for ses_dir in root.glob("**/segger_embedded_studio"):
+        exe_dir = ses_dir / "Output" / "Debug" / "Exe"
+        if not exe_dir.is_dir():
+            continue
+
+        bin_files = sorted(exe_dir.glob("*.bin"))
+        map_files = sorted(exe_dir.glob("*.map"))
+        elf_files = sorted(exe_dir.glob("*.elf"))
+        if not (bin_files and map_files and elf_files):
+            continue
+
+        target = {}
+        json_files = sorted(ses_dir.glob("*.json"))
+        if json_files:
+            try:
+                data = json.loads(json_files[0].read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    maybe_target = data.get("target")
+                    target = maybe_target if isinstance(maybe_target, dict) else data
+                    if not isinstance(target, dict):
+                        target = {}
+            except Exception:
+                target = {}
+
+        board = target.get("board", "hpm5301evklite")
+        return {
+            "ide_type": "SEGGER Embedded Studio",
+            "project_name": target.get("name", root.name),
+            "device": target.get("target_device_name", "HPM5301xEGx"),
+            "vendor": "HPMicro",
+            "compiler": "gcc",
+            "board": board,
+            "soc": target.get("soc", "HPM5301"),
+            "flash_base": "0x80003000",
+            "bin_base": "0x80000400",
+            "hpm_flash_cfg": hpm_flash_cfg_by_board.get(str(board).lower()),
+            "ram_base": "0x00080300",
+            "flash_size": 0x100000,
+            "ram_size": 130304,
+            "bin_path": str(bin_files[0].resolve()),
+            "map_path": str(map_files[0].resolve()),
+            "axf_path": str(elf_files[0].resolve()),
+            "out_path": str(elf_files[0].resolve()),
+        }
+
+    return None
+
+
 def _cli_project_init(project_root: str):
     """初始化项目配置：自动检测 IAR/Keil → 解析工程 → 匹配 MCU → 保存配置。"""
     from pathlib import Path
@@ -103,14 +170,19 @@ def _cli_project_init(project_root: str):
     if is_configured(project_root):
         print("[*] 项目已配置，将更新配置...")
 
-    # 1. 自动检测工程类型（IAR vs Keil）
+    # 1. 自动检测工程类型（HPM SES / IAR / Keil）
+    hpm = _detect_hpm_segger_project(project_root)
     uvp = find_uvprojx(project_root)
     ewp = find_ewp(project_root)
 
     ide_type = None
     project_info = None
 
-    if ewp and not uvp:
+    if hpm:
+        ide_type = "SEGGER Embedded Studio"
+        print(f"[OK] 找到 HPM SES 输出目录: {hpm['bin_path']}")
+        project_info = hpm
+    elif ewp and not uvp:
         # IAR 项目
         ide_type = "IAR"
         print(f"[OK] 找到 IAR 工程文件: {ewp}")
@@ -143,7 +215,10 @@ def _cli_project_init(project_root: str):
     flm_on_microkeen = None
     flm_copied = False
 
-    if ide_type == "Keil" and flm_name:
+    if ide_type == "SEGGER Embedded Studio":
+        print("[AUTO] HPM SES 工程仅保存 bin/map/elf 路径，跳过 FLM")
+        flm_name = ""
+    elif ide_type == "Keil" and flm_name:
         # flm_name 已经是纯文件名（如 "N32G43x"），自动加上 .FLM 扩展名
         if not flm_name.upper().endswith(".FLM"):
             flm_name_with_ext = flm_name + ".FLM"
@@ -213,7 +288,11 @@ def _cli_project_init(project_root: str):
     print(f"  设备:     {device_name} ({project_info.get('vendor', '?')})")
     print(f"  编译器:   {project_info.get('compiler', '?').upper()}")
     print(f"  Flash:    {project_info.get('flash_base', '?')} ({project_info.get('flash_size', 0)} bytes)")
+    if project_info.get("bin_base"):
+        print(f"  Bin base: {project_info.get('bin_base')}")
     print(f"  RAM:      {project_info.get('ram_base', '?')} ({project_info.get('ram_size', 0)} bytes)")
+    if project_info.get("bin_path"):
+        print(f"  BIN:      {project_info.get('bin_path')}")
     print(f"  HEX:      {project_info.get('hex_path', '?')}")
     print(f"  MAP:      {project_info.get('map_path', '?')}")
 
@@ -365,15 +444,15 @@ def _cli_flash(project_root: str, port: str | None, hex_path: str | None):
                     resolved_port = detected
 
     # BIN 文件安全检查
-    resolved_hex = hex_path or project.get("hex_path", "")
-    if resolved_hex and resolved_hex.lower().endswith(".bin"):
-        print("[WARN] 指定的文件是 .bin 格式。BIN 文件不包含地址信息，烧录有风险。")
-        print("       建议使用 .hex 文件（包含完整地址映射）。")
+    resolved_firmware = hex_path or project.get("bin_path") or project.get("hex_path", "")
+    if resolved_firmware and resolved_firmware.lower().endswith(".bin"):
+        bin_base = project.get("bin_base") or project.get("download_base") or project.get("flash_base")
+        print(f"[AUTO] 使用 .bin 固件，下载地址: {bin_base}")
         print()
 
     try:
         result = burn_hex_file(
-            hex_path=hex_path,
+            hex_path=hex_path or project.get("bin_path") or project.get("hex_path"),
             port=resolved_port,
             mcu_key=config.get("mcu_key"),
             flash_base=project.get("flash_base") or "0x08000000",
@@ -661,8 +740,15 @@ def _cli_project_info(project_root: str):
         elif ide_type == "IAR":
             print(f"  Flash Loader: {project.get('flash_loader_path', '?')}")
             print(f"  CPU: {project.get('cpu', '?')}")
+        print(f"  Flash: {project.get('flash_base', '?')}")
+        if project.get("bin_base"):
+            print(f"  Bin base: {project.get('bin_base')}")
+        if project.get("bin_path"):
+            print(f"  BIN: {project.get('bin_path')}")
         print(f"  HEX: {project.get('hex_path', '?')}")
         print(f"  MAP: {project.get('map_path', '?')}")
+        if project.get("axf_path"):
+            print(f"  ELF/AXF: {project.get('axf_path')}")
 
         # 检查 MICROKEEN 磁盘上的 FLM（仅 Keil）
         if ide_type == "Keil":
