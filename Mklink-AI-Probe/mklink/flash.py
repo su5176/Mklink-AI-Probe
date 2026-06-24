@@ -39,6 +39,30 @@ HPM_BOARD_FLASH_CFG = {
 }
 
 
+def parse_hpm_program_result(output: str) -> dict:
+    """Parse hpm.program output.
+
+    HPM programming is successful only when the device reports a final program
+    marker. A standalone "0" can also come from setup commands such as
+    hpm.board(), so it is not enough to prove that the BIN was downloaded.
+    """
+    progress = parse_download_progress(output)
+    lower = output.lower()
+    has_failure = (
+        "error" in lower
+        or "failed" in lower
+        or ("open filename" in lower and "fail" in lower)
+    )
+    has_loaded_success = "loaded successfully" in lower
+    has_100_percent = any(p["percent"] == 100 for p in progress)
+    return {
+        "success": (has_loaded_success or has_100_percent) and not has_failure,
+        "progress": progress,
+        "loaded_successfully": has_loaded_success,
+        "download_100_percent": has_100_percent,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 错误类
 # ---------------------------------------------------------------------------
@@ -377,13 +401,15 @@ class MKLinkFlash:
                     progress_callback(p["percent"])
                     last_percent = p["percent"]
 
-        result = parse_load_result(resp)
+        result = parse_hpm_program_result(resp)
         return {
             "success": result.get("success", False),
             "filename": filename,
             "addr": addr,
             "board": board_key or None,
             "progress": progress_list,
+            "loaded_successfully": result.get("loaded_successfully", False),
+            "download_100_percent": result.get("download_100_percent", False),
             "time_ms": elapsed_ms,
             "response": resp,
         }
