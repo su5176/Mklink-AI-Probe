@@ -461,6 +461,15 @@ class Device:
             self._rtt_session.stop()
             self._rtt_session = None
 
+        cpu_freq_hint = 0
+        if self._dwarf_info:
+            try:
+                freq = self.read_variable("SystemCoreClock")
+                if isinstance(freq, int) and freq > 0:
+                    cpu_freq_hint = freq
+            except Exception:
+                pass
+
         from mklink.systemview import SystemViewSession
         from mklink.systemview_parser import SystemViewParser
         self._systemview_session = SystemViewSession(self._bridge, channel=channel)
@@ -478,16 +487,11 @@ class Device:
         # 会覆盖为同值。非 STM32 工程可后续从 MCU profile 取 ram base。
         self._systemview_parser._ram_base = 0x20000000
         self._systemview_parser._id_shift = 2
-        # 尝试读 SystemCoreClock 作为 cpu_freq（与 SEGGER 的 SYSVIEW_CPU_FREQ 同源），
-        # 用于把 DWT 周期时间戳换算成 µs/秒率。需 axf 符号；无则保持 0（ticks 模式）。
-        if self._dwarf_info:
-            try:
-                freq = self.read_variable("SystemCoreClock")
-                if isinstance(freq, int) and freq > 0:
-                    self._systemview_parser._cpu_freq = freq
-                    result.setdefault("cpu_freq_hint", freq)
-            except Exception:
-                pass
+        # SystemCoreClock must be read before SystemView switches the bridge
+        # into binary stream mode; command/variable reads are unavailable there.
+        if cpu_freq_hint:
+            self._systemview_parser._cpu_freq = cpu_freq_hint
+            result.setdefault("cpu_freq_hint", cpu_freq_hint)
         return result
 
     def systemview_read_bytes(

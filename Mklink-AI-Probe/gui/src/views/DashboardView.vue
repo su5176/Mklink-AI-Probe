@@ -193,6 +193,7 @@ async function doResume() { try { await resumeDevice(); toast.success('CPU Â∑≤ÊÅ
   max-height: 100%;
   overflow-y: auto;
   overflow-x: hidden;
+  scrollbar-gutter: stable;
   padding-bottom: 16px;
 }
 .card-systemview :deep(.sv-tab) {

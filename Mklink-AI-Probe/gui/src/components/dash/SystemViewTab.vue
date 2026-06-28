@@ -687,7 +687,7 @@ async function onStop() {
 
 /* 甘特 */
 .sv-gantt-section { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
-.sv-legend { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
+.sv-legend { display: flex; gap: 6px; flex-wrap: wrap; align-content: flex-start; height: 28px; overflow-y: auto; scrollbar-gutter: stable; margin: 4px 0; }
 .sv-legend :deep(.sv-lg) { display: inline-flex; align-items: center; gap: 4px; background: #fbfaf5; color: #374151; border: 1px solid #ddd8ca; border-radius: 12px; padding: 2px 9px; font-size: 11px; cursor: pointer; user-select: none; box-shadow: inset 0 -1px 0 rgba(0,0,0,.03); }
 .sv-legend :deep(.sv-lg i) { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .sv-legend :deep(.sv-lg em) { color: #6b7280; font-style: normal; }
@@ -696,7 +696,7 @@ async function onStop() {
 .sv-canvas-wrap :deep(canvas) { display: block; width: 100%; cursor: crosshair; }
 .sv-tip { position: fixed; display: none; background: #1c2128; border: 1px solid #444c56; border-radius: 6px; padding: 6px 10px; font-size: 11px; color: #f0f6fc; pointer-events: none; z-index: 99; font-family: var(--font-mono, monospace); white-space: nowrap; }
 .sv-vcpu-title { font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-.sv-vcpu { display: flex; flex-direction: column; gap: 1px; }
+.sv-vcpu { display: flex; flex-direction: column; gap: 1px; height: 96px; overflow-y: auto; scrollbar-gutter: stable; padding-right: 2px; }
 .sv-vcpu :deep(.sv-vcpu-row) { display: flex; align-items: center; gap: 8px; font-size: 11px; margin: 1px 0; }
 .sv-vcpu :deep(.sv-vcpu-n) { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
 .sv-vcpu :deep(.sv-vcpu-bg) { flex: 1; height: 11px; background: #e7e2d6; border-radius: 6px; overflow: hidden; }

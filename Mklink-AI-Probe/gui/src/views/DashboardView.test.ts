@@ -71,6 +71,7 @@ describe('DashboardView layout classes', () => {
     expect(source).toMatch(/\.card-systemview\s*\{[^}]*min-height:\s*0/s)
     expect(source).toMatch(/\.card-systemview\s*\{[^}]*max-height:\s*100%/s)
     expect(source).toMatch(/\.card-systemview\s*\{[^}]*overflow-y:\s*auto/s)
+    expect(source).toMatch(/\.card-systemview\s*\{[^}]*scrollbar-gutter:\s*stable/s)
     expect(source).not.toMatch(/\.card-systemview\s*\{[^}]*calc\(100vh/s)
   })
 
@@ -85,5 +86,14 @@ describe('DashboardView layout classes', () => {
     const source = readFileSync('src/components/dash/SystemViewTab.vue', 'utf8')
 
     expect(source).toMatch(/\.sv-gantt-section\s*\{[^}]*flex:\s*0\s+0\s+auto/s)
+  })
+
+  it('keeps live SystemView legend and CPU rows from changing the page height', () => {
+    const source = readFileSync('src/components/dash/SystemViewTab.vue', 'utf8')
+
+    expect(source).toMatch(/\.sv-legend\s*\{[^}]*height:\s*28px/s)
+    expect(source).toMatch(/\.sv-legend\s*\{[^}]*overflow-y:\s*auto/s)
+    expect(source).toMatch(/\.sv-vcpu\s*\{[^}]*height:\s*96px/s)
+    expect(source).toMatch(/\.sv-vcpu\s*\{[^}]*overflow-y:\s*auto/s)
   })
 })

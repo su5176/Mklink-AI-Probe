@@ -406,7 +406,9 @@ export class SvTimeline {
   }
 
   _bind() {
-    this.canvas.addEventListener('wheel', (e) => {
+    if (this._listenersBound) return;
+
+    this._onWheel = (e) => {
       if (!this._shouldZoomWheel(e)) return;
       e.preventDefault();
       this.setFollowMode(false);
@@ -421,14 +423,15 @@ export class SvTimeline {
       this.viewStart = Math.max(this.tMin, ns);
       this.viewEnd = Math.min(this.tMax, ne);
       this._draw(); this._updateStatus();
-    }, { passive: false });
+    };
 
-    this.canvas.addEventListener('mousedown', (e) => {
+    this._onMouseDown = (e) => {
       this.setFollowMode(false);
       this.dragging = true; this.dragX0 = e.clientX; this.dragView0 = [this.viewStart, this.viewEnd];
       this.canvas.style.cursor = 'grabbing';
-    });
-    window.addEventListener('mousemove', (e) => {
+    };
+
+    this._onMouseMove = (e) => {
       const rect = this.canvas.getBoundingClientRect();
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       if (this.dragging) {
@@ -446,10 +449,18 @@ export class SvTimeline {
         if (hit) this._showTip(e.clientX, e.clientY, hit); else this._hideTip();
         this._draw();
       }
-    });
-    window.addEventListener('mouseup', () => { this.dragging = false; this.canvas.style.cursor = 'crosshair'; });
-    this.canvas.addEventListener('mouseleave', () => { this.hover = null; this._hideTip(); this._draw(); });
+    };
+
+    this._onMouseUp = () => { this.dragging = false; this.canvas.style.cursor = 'crosshair'; };
+    this._onMouseLeave = () => { this.hover = null; this._hideTip(); this._draw(); };
+
+    this.canvas.addEventListener('wheel', this._onWheel, { passive: false });
+    this.canvas.addEventListener('mousedown', this._onMouseDown);
+    window.addEventListener('mousemove', this._onMouseMove);
+    window.addEventListener('mouseup', this._onMouseUp);
+    this.canvas.addEventListener('mouseleave', this._onMouseLeave);
     if (this.roots.resetBtn) this.roots.resetBtn.onclick = () => this.reset();
+    this._listenersBound = true;
   }
 
   _shouldZoomWheel(e) {
@@ -486,7 +497,7 @@ export class SvTimeline {
     }
     const total = [...run.values()].reduce((a, b) => a + b, 0) || 1;
     const items = this.tasks.map(t => ({ ...t, pct: ((run.get(t.tid) || 0) / total * 100) }))
-      .filter(t => t.pct > 0.001).sort((a, b) => b.pct - a.pct);
+      .filter(t => t.pct > 0.001);
     // 图例
     if (this.roots.legend) {
       this.roots.legend.innerHTML = items.map(t =>
@@ -526,6 +537,16 @@ export class SvTimeline {
       this._followRaf = 0;
     }
     window.removeEventListener('resize', this._resize);
+    if (this._listenersBound) {
+      this.canvas.removeEventListener('wheel', this._onWheel);
+      this.canvas.removeEventListener('mousedown', this._onMouseDown);
+      window.removeEventListener('mousemove', this._onMouseMove);
+      window.removeEventListener('mouseup', this._onMouseUp);
+      this.canvas.removeEventListener('mouseleave', this._onMouseLeave);
+      if (this.roots.resetBtn) this.roots.resetBtn.onclick = null;
+      this._listenersBound = false;
+    }
+    this._hideTip();
     // （其它监听挂在 window/canvas，组件卸载时随 DOM 释放；简单场景可接受）
   }
 }
