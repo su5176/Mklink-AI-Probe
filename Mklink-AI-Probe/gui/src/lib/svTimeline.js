@@ -43,6 +43,8 @@ export class SvTimeline {
     this.viewStart = null;
     this.viewEnd = null;
     this._hadIntervals = false;
+    this._taskOrder = [];
+    this._taskMeta = new Map();
     this.follow = (data && data.follow) !== false;
     this.windowSize = Number((data && data.windowSize) || 0);
     this.followEase = 0.22;
@@ -66,10 +68,7 @@ export class SvTimeline {
       run.set(it.tid, (run.get(it.tid) || 0) + (it.end - it.start));
       names.set(it.tid, it.name);
     }
-    this.tasks = [...run.entries()]
-      .sort((a, b) => b[1] - a[1]).slice(0, 12)
-      .map(([tid], i) => ({ tid, name: names.get(tid) || ('0x' + (tid >>> 0).toString(16).toUpperCase()),
-        color: this.PALETTE[i % this.PALETTE.length] }));
+    this.tasks = this._mergeTasks(run, names);
     this.taskOf = new Map(this.tasks.map(t => [t.tid, t]));
     // 时间范围
     if (this.intervals.length) {
@@ -104,6 +103,41 @@ export class SvTimeline {
     this._draw();
     this._updateStatus();
     if (shouldFollow && !viewInvalid && hadIntervalsBefore) this._scheduleFollow();
+  }
+
+  _mergeTasks(run, names) {
+    if (!this._taskOrder) this._taskOrder = [];
+    if (!this._taskMeta) this._taskMeta = new Map();
+
+    const ranked = [...run.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 12)
+      .map(([tid]) => tid);
+    const active = new Set(ranked);
+
+    for (const tid of ranked) {
+      const name = names.get(tid) || ('0x' + (tid >>> 0).toString(16).toUpperCase());
+      if (!this._taskMeta.has(tid)) {
+        this._taskMeta.set(tid, {
+          tid,
+          name,
+          color: this.PALETTE[this._taskMeta.size % this.PALETTE.length],
+        });
+      } else if (name) {
+        this._taskMeta.get(tid).name = name;
+      }
+      if (!this._taskOrder.includes(tid)) this._taskOrder.push(tid);
+    }
+
+    this._taskOrder = this._taskOrder.filter(tid => active.has(tid));
+    for (const tid of ranked) {
+      if (!this._taskOrder.includes(tid)) this._taskOrder.push(tid);
+    }
+
+    return this._taskOrder
+      .map(tid => this._taskMeta.get(tid))
+      .filter(Boolean)
+      .slice(0, 12);
   }
 
   setWindowSize(windowSize) {
@@ -177,15 +211,30 @@ export class SvTimeline {
   _filterContinuous(intervals) {
     if (intervals.length < 8) return intervals;
     let maxGap = 0, maxIdx = 0;
+    let tMin = Infinity, tMax = -Infinity;
     for (let i = 0; i < intervals.length - 1; i++) {
       const g = intervals[i + 1].start - intervals[i].end;
       if (g > maxGap) { maxGap = g; maxIdx = i; }
+      if (intervals[i].start < tMin) tMin = intervals[i].start;
+      if (intervals[i].end > tMax) tMax = intervals[i].end;
     }
+    const last = intervals[intervals.length - 1];
+    if (last.start < tMin) tMin = last.start;
+    if (last.end > tMax) tMax = last.end;
     const durs = intervals.map(it => it.end - it.start).sort((a, b) => a - b);
     const med = durs[Math.floor(durs.length / 2)] || 1;
+    if (maxGap <= this._largeGapThreshold(Math.max(0, tMax - tMin), med)) return intervals;
     if (maxGap <= med * 200) return intervals; // 无离群缺口
     const left = intervals.slice(0, maxIdx + 1), right = intervals.slice(maxIdx + 1);
     return this._filterContinuous(left.length >= right.length ? left : right);
+  }
+
+  _largeGapThreshold(span, medianDuration) {
+    const oneSecond = this.unit === 'us'
+      ? 1_000_000
+      : (this.tickHz > 0 ? this.tickHz : 1_000_000);
+    const windowThreshold = this.windowSize > 0 ? this.windowSize * 2 : span * 0.2;
+    return Math.max(medianDuration * 200, oneSecond * 2, windowThreshold);
   }
 
   _t2x(t) { return this.plotX0 + (t - this.viewStart) / (this.viewEnd - this.viewStart) * this.plotW; }
@@ -358,6 +407,7 @@ export class SvTimeline {
 
   _bind() {
     this.canvas.addEventListener('wheel', (e) => {
+      if (!this._shouldZoomWheel(e)) return;
       e.preventDefault();
       this.setFollowMode(false);
       const rect = this.canvas.getBoundingClientRect();
@@ -400,6 +450,10 @@ export class SvTimeline {
     window.addEventListener('mouseup', () => { this.dragging = false; this.canvas.style.cursor = 'crosshair'; });
     this.canvas.addEventListener('mouseleave', () => { this.hover = null; this._hideTip(); this._draw(); });
     if (this.roots.resetBtn) this.roots.resetBtn.onclick = () => this.reset();
+  }
+
+  _shouldZoomWheel(e) {
+    return !!(e.ctrlKey || e.shiftKey);
   }
 
   _escapeHtml(value) {

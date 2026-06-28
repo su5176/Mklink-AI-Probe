@@ -3,8 +3,9 @@
     <div
       class="card"
       :class="{
-        'card-full': tab === 'rtt' || tab === 'superwatch' || tab === 'vofa' || tab === 'systemview',
+        'card-full': tab === 'rtt' || tab === 'superwatch' || tab === 'vofa',
         'card-rtt': tab === 'rtt',
+        'card-systemview': tab === 'systemview',
       }"
     >
       <div class="card-title-row">
@@ -162,6 +163,7 @@ async function doResume() { try { await resumeDevice(); toast.success('CPU Â∑≤ÊÅ
 <style scoped>
 .dash-root {
   height: 100%;
+  min-height: 0;
   display: flex;
   flex-direction: column;
 }
@@ -184,6 +186,18 @@ async function doResume() { try { await resumeDevice(); toast.success('CPU Â∑≤ÊÅ
 }
 .card-rtt {
   padding-bottom: 16px;
+}
+.card-systemview {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-bottom: 16px;
+}
+.card-systemview :deep(.sv-tab) {
+  height: auto;
+  min-height: 0;
 }
 .card-title-row {
   display: flex;

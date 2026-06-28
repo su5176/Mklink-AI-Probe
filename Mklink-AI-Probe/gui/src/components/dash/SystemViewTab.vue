@@ -12,7 +12,6 @@
     </div>
     <div v-if="!deviceConnected && !offlineMode" class="alert alert-warn">请先连接设备。</div>
     <template v-if="deviceConnected || offlineMode">
-      <!-- 工具栏 + 实时统计 -->
       <div class="sv-toolbar">
         <ControlToolbar
           v-if="!offlineMode"
@@ -28,21 +27,6 @@
         <button class="btn-clear sv-tool-btn" @click="triggerImport">导入JSONL</button>
         <button class="btn-clear sv-tool-btn" :disabled="!currentJsonlPath" @click="exportLog(currentJsonlPath)">导出JSONL</button>
         <button class="btn-clear sv-tool-btn" :disabled="!currentSummaryPath" @click="exportLog(currentSummaryPath)">导出摘要</button>
-        <span v-if="offlineMode" class="sv-stat" :title="offlineFileName">离线 <b>{{ offlineFileName }}</b></span>
-        <span class="sv-stat">事件 <b>{{ eventCount }}</b></span>
-        <span class="sv-stat">任务 <b>{{ taskCount }}</b></span>
-        <span class="sv-stat" :class="{ warn: meta.dropped > 0 }">
-          丢包 <b>{{ meta.dropped }}</b>
-        </span>
-        <span v-if="!meta.synced && dash.state.value === 'running'" class="sv-stat warn">未同步</span>
-        <span v-if="meta.cpuFreq" class="sv-stat" :title="meta.cpuFreqSource || 'cpu_freq'">
-          CPU <b>{{ fmtCpuFreq(meta.cpuFreq) }}</b>
-        </span>
-        <span v-if="analysisBufferCount" class="sv-stat">
-          buffer <b>{{ analysisBufferCount }}</b>
-        </span>
-        <span v-if="importStatus" class="sv-stat" :class="{ warn: importError }">{{ importStatus }}</span>
-        <span v-if="meta.recordingError" class="sv-stat warn">{{ meta.recordingError }}</span>
         <label class="sv-window">
           窗口
           <select v-model.number="windowUs">
@@ -54,28 +38,83 @@
         </label>
       </div>
 
-      <!-- CPU 占用条 -->
-      <div class="sv-section">
-        <div class="sv-section-title">CPU 占用（按运行时间排序）</div>
-        <div class="sv-cpu-list">
-          <div v-for="t in tasksSorted" :key="t.id" class="sv-cpu-row">
-            <span class="sv-cpu-name" :title="t.name || hexId(t.id)">{{ t.name || hexId(t.id) }}</span>
-            <div class="sv-cpu-bar-bg">
-              <div class="sv-cpu-bar" :style="{ width: clamp(t.pct) + '%', background: t.color }"></div>
-            </div>
-            <span class="sv-cpu-pct">{{ t.pct.toFixed(1) }}%</span>
-            <span class="sv-cpu-switches" title="task_start_exec count">{{ formatScheduleCount(t.switches) }}</span>
-          </div>
-          <div v-if="tasksSorted.length === 0" class="sv-empty">等待事件…（点 ▶ 开始采集）</div>
+      <div class="sv-health-grid">
+        <div class="sv-health-card">
+          <span>Events</span>
+          <b>{{ eventCount.toLocaleString() }}</b>
+        </div>
+        <div class="sv-health-card">
+          <span>Tasks</span>
+          <b>{{ taskCount }}</b>
+        </div>
+        <div class="sv-health-card" :class="{ warn: meta.dropped > 0 }">
+          <span>Runtime Drop</span>
+          <b :title="meta.sessionDropped ? `session dropped: ${meta.sessionDropped}` : 'runtime dropped'">{{ meta.dropped.toLocaleString() }}</b>
+        </div>
+        <div class="sv-health-card" :class="{ warn: !meta.cpuFreq }">
+          <span>CPU Clock</span>
+          <b :title="meta.cpuFreqSource || 'cpu_freq'">{{ meta.cpuFreq ? fmtCpuFreq(meta.cpuFreq) : 'Unknown' }}</b>
+        </div>
+        <div class="sv-health-card" :class="{ warn: !meta.synced && dash.state.value === 'running' }">
+          <span>Sync</span>
+          <b>{{ meta.synced || dash.state.value !== 'running' ? 'Ready' : 'Unsynced' }}</b>
+        </div>
+        <div v-if="analysisBufferCount" class="sv-health-card">
+          <span>Analysis Buffer</span>
+          <b>{{ analysisBufferCount.toLocaleString() }}</b>
+        </div>
+        <div v-if="offlineMode || importStatus || meta.recordingError" class="sv-health-card sv-health-wide" :class="{ warn: importError || !!meta.recordingError }">
+          <span>{{ offlineMode ? 'Offline Log' : 'Status' }}</span>
+          <b :title="offlineFileName || importStatus || meta.recordingError">{{ offlineFileName || importStatus || meta.recordingError }}</b>
         </div>
       </div>
 
-      <!-- 甘特时间轴（交互式 canvas：滚轮缩放 · 拖拽平移 · hover · 图例隐藏 · 可见CPU%） -->
+      <div class="sv-section sv-events-section" :class="{ collapsed: !showEventStream }">
+        <div class="sv-section-title">
+          <span>Events List</span>
+          <span class="sv-section-subtitle">最近 {{ eventRows.length }} 条</span>
+          <span class="sv-section-actions">
+            <button v-if="eventList.length > 0" class="btn-clear" @click="clearAll">清除</button>
+            <button class="btn-clear" @click="showEventStream = !showEventStream">
+              {{ showEventStream ? '折叠' : '展开' }}
+            </button>
+          </span>
+        </div>
+        <div v-if="showEventStream" class="sv-table-wrap sv-events-table-wrap">
+          <table class="sv-table sv-events-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Time</th>
+                <th>Context</th>
+                <th>Event</th>
+                <th>Resource</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in eventRows" :key="row.index" :class="evtColor(row.kind)">
+                <td>{{ row.index }}</td>
+                <td>{{ row.time }}</td>
+                <td>{{ row.context }}</td>
+                <td>{{ row.event }}</td>
+                <td>{{ row.resource }}</td>
+                <td>{{ row.detail }}</td>
+              </tr>
+              <tr v-if="eventRows.length === 0">
+                <td colspan="6" class="sv-empty-cell">等待 SystemView 事件。</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- 甘特时间轴（交互式 canvas：Ctrl/Shift+滚轮缩放 · 拖拽平移 · hover · 图例隐藏 · 可见CPU%） -->
       <div class="sv-section sv-gantt-section">
         <div class="sv-section-title">
-          任务切换时间轴
-          <span style="font-weight:400;color:var(--dim);font-size:11px">滚轮缩放 · 拖拽平移 · hover 详情 · 点图例隐藏</span>
-          <button class="btn-clear" @click="tlReset">⟲ 全览</button>
+          <span>Timeline</span>
+          <span class="sv-section-subtitle">Ctrl/Shift+滚轮缩放 · 拖拽平移 · hover 详情 · 点图例隐藏</span>
+          <button class="btn-clear" @click="tlReset">全览</button>
         </div>
         <div class="sv-legend" ref="tlLegend"></div>
         <div class="sv-canvas-wrap"><canvas ref="tlCanvas"></canvas></div>
@@ -84,22 +123,82 @@
         <div class="sv-vcpu" ref="tlVcpu"></div>
       </div>
 
-      <!-- 事件列表 -->
-      <div class="sv-section sv-events-section" :class="{ collapsed: !showEventStream }">
-        <div class="sv-section-title">
-          事件流（最近 {{ recentEvents.length }} 条）
-          <span class="sv-section-actions">
-            <button v-if="recentEvents.length > 0" class="btn-clear" @click="clearAll">清除</button>
-            <button class="btn-clear" @click="showEventStream = !showEventStream">
-              {{ showEventStream ? '折叠' : '展开' }}
-            </button>
-          </span>
+      <div class="sv-bottom-grid">
+        <div class="sv-section sv-runtime-section">
+          <div class="sv-section-title">
+            <span>Runtime</span>
+            <span class="sv-section-subtitle">单次运行片段分布</span>
+          </div>
+          <div class="sv-table-wrap">
+            <table class="sv-table sv-runtime-table">
+              <thead>
+                <tr>
+                  <th>Task</th>
+                  <th>Count</th>
+                  <th>Min</th>
+                  <th>25%</th>
+                  <th>50%</th>
+                  <th>75%</th>
+                  <th>Max</th>
+                  <th>CPU</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in runtimeRows" :key="row.id">
+                  <td class="sv-name-cell"><i :style="{ background: row.color }"></i>{{ row.name || hexId(row.id) }}</td>
+                  <td>{{ formatScheduleCount(row.count) }}</td>
+                  <td>{{ fmtDurationUs(row.minUs) }}</td>
+                  <td>{{ fmtDurationUs(row.p25Us) }}</td>
+                  <td>{{ fmtDurationUs(row.p50Us) }}</td>
+                  <td>{{ fmtDurationUs(row.p75Us) }}</td>
+                  <td>{{ fmtDurationUs(row.maxUs) }}</td>
+                  <td class="sv-meter-cell">
+                    <div class="sv-inline-meter"><span :style="{ width: clamp(row.pct) + '%', background: row.color }"></span></div>
+                    <em>{{ row.pct.toFixed(1) }}%</em>
+                  </td>
+                </tr>
+                <tr v-if="runtimeRows.length === 0">
+                  <td colspan="8" class="sv-empty-cell">还没有运行片段。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
-        <div v-if="showEventStream" class="sv-events">
-          <div v-for="(e, i) in recentEvents" :key="i" class="sv-evt" :class="e.kind">
-            <span class="sv-evt-t">{{ fmtTime(e.t) }}</span>
-            <span class="sv-evt-kind" :class="evtColor(e.kind)">{{ e.kind }}</span>
-            <span class="sv-evt-detail">{{ evtDetail(e) }}</span>
+
+        <div class="sv-section sv-context-section">
+          <div class="sv-section-title">
+            <span>Context</span>
+            <span class="sv-section-subtitle">任务活动概览</span>
+          </div>
+          <div class="sv-table-wrap">
+            <table class="sv-table sv-context-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Type</th>
+                  <th>Prio</th>
+                  <th>Activations</th>
+                  <th>Total Run</th>
+                  <th>CPU Load</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="row in contextRows" :key="row.id">
+                  <td class="sv-name-cell"><i :style="{ background: row.color }"></i>{{ row.name || hexId(row.id) }}</td>
+                  <td>{{ row.type }}</td>
+                  <td>{{ row.priority ?? '-' }}</td>
+                  <td>{{ formatScheduleCount(row.activations) }}</td>
+                  <td>{{ fmtDurationUs(row.totalRunUs) }}</td>
+                  <td class="sv-meter-cell">
+                    <div class="sv-inline-meter"><span :style="{ width: clamp(row.cpuLoad) + '%', background: row.color }"></span></div>
+                    <em>{{ row.cpuLoad.toFixed(1) }}%</em>
+                  </td>
+                </tr>
+                <tr v-if="contextRows.length === 0">
+                  <td colspan="6" class="sv-empty-cell">还没有任务上下文。</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
       </div>
@@ -115,7 +214,8 @@ import { useResourceStatus } from '../../composables/useResourceStatus'
 import { SvTimeline } from '../../lib/svTimeline'
 import { appendManyToLast } from '../../lib/boundedBuffer'
 import { takeNewStreamPoints } from '../../lib/streamCursor'
-import { computeTaskRows } from '../../lib/systemViewMetrics'
+import { ingestSystemViewIntervals, type SystemViewIntervalState } from '../../lib/systemViewIntervals'
+import { buildSystemViewEventRows, computeContextRows, computeRuntimeRows } from '../../lib/systemViewMetrics'
 import { appendAndTrimEventsByTime, appendAndTrimRanges, filterRangesByWindow } from '../../lib/systemViewTimeBuffer'
 import { formatScheduleCount } from '../../lib/systemViewLabels'
 import { importSystemViewJsonl } from '../../lib/systemViewImport'
@@ -132,7 +232,6 @@ const { checkConflict } = useResourceStatus()
 // ---- 状态 ----
 interface TaskStat { id: number; name: string; color: string; runUs: number; switches: number; prio?: number }
 interface TaskInterval { taskId: number; start: number; end: number; startTk?: number; endTk?: number }
-interface PendingStart { time: number; tick?: number }
 interface SystemViewLogItem { path: string; summary_path?: string }
 
 const PALETTE = ['#5b8cff', '#21c7a8', '#f5a623', '#e056fd', '#ff7675', '#fdcb6e',
@@ -142,14 +241,15 @@ const eventList = shallowRef<any[]>([])
 let analysisEvents: any[] = []
 const analysisBufferCount = ref(0)
 const taskStats = reactive<Record<number, TaskStat>>({})
-const pendingStart = reactive<Record<number, PendingStart>>({})
 const intervals = shallowRef<TaskInterval[]>([])
+let intervalState: SystemViewIntervalState = { currentTaskId: null, currentStart: null }
 const idleUs = ref(0)
 let firstT = 0
 let lastT = 0
 const meta = reactive({
   synced: false,
   dropped: 0,
+  sessionDropped: 0,
   cpuFreq: 0,
   cpuFreqSource: '',
   taskNames: {} as Record<number, string>,
@@ -160,7 +260,7 @@ const meta = reactive({
 let lastStreamSeq = 0
 const totalEventCount = ref(0)
 const windowUs = ref(2_000_000)
-const showEventStream = ref(false)
+const showEventStream = ref(true)
 const offlineMode = ref(false)
 const offlineFileName = ref('')
 const importStatus = ref('')
@@ -288,35 +388,28 @@ function tickOf(e: any): number | undefined {
 
 function ingestEvents(events: any[], countEvents = true) {
   const normalizedEvents = events.map(e => ({ ...e, t: tOf(e), tk: tickOf(e) }))
-  const newIntervals: TaskInterval[] = []
 
   for (const e of normalizedEvents) {
     const t = e.t
-    const tk = e.tk
     if (t > 0) {
       if (firstT === 0) firstT = t
       if (t > lastT) lastT = t
     }
     const k = e.kind
-    if (k === 'task_start_exec' && typeof e.task_id === 'number') {
-      ensureTask(e.task_id, e.task_name)
-      pendingStart[e.task_id] = { time: t, tick: tk }
-      taskStats[e.task_id].switches++
-    } else if (k === 'task_stop_exec' && typeof e.task_id === 'number') {
-      const st = pendingStart[e.task_id]
-      if (st !== undefined && t >= st.time) {
-        newIntervals.push({ taskId: e.task_id, start: st.time, end: t, startTk: st.tick, endTk: tk })
-        taskStats[e.task_id].runUs += (t - st.time)
-        delete pendingStart[e.task_id]
-      }
-    } else if (k === 'task_info' && typeof e.task_id === 'number') {
-      ensureTask(e.task_id, e.name)
-      if (e.prio !== undefined) taskStats[e.task_id].prio = e.prio
-    } else if (k === 'idle') {
+    if (k === 'idle') {
       // idle 周期：用 delta 累计（粗略）
       if (typeof e.cpu_delta_us === 'number') idleUs.value += e.cpu_delta_us
     }
   }
+
+  const newIntervals = ingestSystemViewIntervals(normalizedEvents, intervalState, {
+    ensureTask: (id, name) => ensureTask(id, name),
+    addRunTime: (id, duration) => { ensureTask(id).runUs += duration },
+    addSwitch: id => { ensureTask(id).switches++ },
+    applyTaskInfo: (id, event) => {
+      if (event.prio !== undefined) ensureTask(id).prio = event.prio
+    },
+  })
 
   if (countEvents) totalEventCount.value += events.length
   if (normalizedEvents.length) {
@@ -348,7 +441,10 @@ watch(data, (nw) => {
   for (const dp of fresh.points as any[]) {
     const evt = dp.event || dp._event
     if (dp.synced !== undefined) meta.synced = !!dp.synced
-    if (dp.dropped_bytes !== undefined) meta.dropped = dp.dropped_bytes + (dp.dropped_packets || 0)
+    if (dp.dropped_bytes !== undefined) meta.sessionDropped = dp.dropped_bytes + (dp.dropped_packets || 0)
+    if (dp.runtime_dropped_bytes !== undefined || dp.dropped_bytes !== undefined) {
+      meta.dropped = (dp.runtime_dropped_bytes ?? dp.dropped_bytes ?? 0) + (dp.dropped_packets || 0)
+    }
     if (dp.cpu_freq !== undefined) meta.cpuFreq = dp.cpu_freq
     if (dp.cpu_freq_source !== undefined) meta.cpuFreqSource = dp.cpu_freq_source || ''
     if (dp.recording_path !== undefined) meta.recordingPath = dp.recording_path || meta.recordingPath
@@ -370,11 +466,13 @@ watch(data, (nw) => {
 const eventCount = computed(() => totalEventCount.value)
 const taskCount = computed(() => Object.keys(taskStats).length)
 
-const tasksSorted = computed(() =>
-  computeTaskRows(Object.values(taskStats))
-)
-
-const recentEvents = computed(() => eventList.value.slice(-50).reverse())
+const tableEvents = computed(() => eventList.value.slice(-120))
+const eventRows = computed(() => buildSystemViewEventRows(tableEvents.value, {
+  firstIndex: Math.max(1, totalEventCount.value - tableEvents.value.length + 1),
+  formatTime: value => fmtTime(value),
+}))
+const runtimeRows = computed(() => computeRuntimeRows(Object.values(taskStats), intervals.value))
+const contextRows = computed(() => computeContextRows(Object.values(taskStats)))
 const currentJsonlPath = computed(() => meta.recordingPath || latestLog.value?.path || '')
 const currentSummaryPath = computed(() => meta.recordingSummaryPath || latestLog.value?.summary_path || '')
 
@@ -389,6 +487,12 @@ function fmtTime(t: any) {
   if (typeof t === 'number') return Math.round(t).toLocaleString() + ' tk'
   return ''
 }
+function fmtDurationUs(value: number) {
+  if (!Number.isFinite(value) || value <= 0) return '-'
+  if (value >= 1_000_000) return (value / 1_000_000).toFixed(3) + 's'
+  if (value >= 1_000) return (value / 1_000).toFixed(2) + 'ms'
+  return Math.round(value).toLocaleString() + 'us'
+}
 function evtColor(k: string) {
   if (k.startsWith('task_start')) return 'c-start'
   if (k.startsWith('task_stop')) return 'c-stop'
@@ -396,27 +500,18 @@ function evtColor(k: string) {
   if (k === 'idle') return 'c-idle'
   return ''
 }
-function evtDetail(e: any) {
-  const parts: string[] = []
-  if (e.task_name) parts.push(e.task_name)
-  else if (e.task_id !== undefined) parts.push(hexId(e.task_id))
-  if (e.isr_name) parts.push(e.isr_name)
-  else if (e.isr_id !== undefined) parts.push('#' + e.isr_id)
-  if (e.cause !== undefined) parts.push('cause=' + e.cause)
-  if (e.cpu_delta_us !== undefined) parts.push(e.cpu_delta_us.toFixed(0) + 'us')
-  return parts.join(' ')
-}
 function clearAll() {
   eventList.value = []
   analysisEvents = []
   analysisBufferCount.value = 0
   intervals.value = []
   Object.keys(taskStats).forEach(k => delete taskStats[Number(k)])
-  Object.keys(pendingStart).forEach(k => delete pendingStart[Number(k)])
+  intervalState = { currentTaskId: null, currentStart: null }
   totalEventCount.value = 0
   idleUs.value = 0; firstT = 0; lastT = 0; lastStreamSeq = 0
   meta.synced = false
   meta.dropped = 0
+  meta.sessionDropped = 0
   meta.cpuFreq = 0
   meta.cpuFreqSource = ''
   meta.taskNames = {}
@@ -505,7 +600,9 @@ function applyImportedMeta(record: Record<string, unknown>) {
   const droppedBytes = Number(record.dropped_bytes)
   const droppedPackets = Number(record.dropped_packets)
   if (Number.isFinite(droppedBytes) || Number.isFinite(droppedPackets)) {
-    meta.dropped = Math.max(0, droppedBytes || 0) + Math.max(0, droppedPackets || 0)
+    const runtimeDropped = Number(record.runtime_dropped_bytes)
+    meta.sessionDropped = Math.max(0, droppedBytes || 0) + Math.max(0, droppedPackets || 0)
+    meta.dropped = Math.max(0, Number.isFinite(runtimeDropped) ? runtimeDropped : droppedBytes || 0) + Math.max(0, droppedPackets || 0)
   }
   if (record.task_names && typeof record.task_names === 'object' && !Array.isArray(record.task_names)) {
     applyTaskNames(record.task_names as Record<number, string>)
@@ -569,6 +666,8 @@ async function onStop() {
 .sv-window select { background: #fbfaf5; color: var(--fg); border: 1px solid #d8d2c3; border-radius: 4px; padding: 2px 4px; }
 .sv-section { border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; }
 .sv-section-title { font-size: 12px; color: var(--muted); margin-bottom: 6px; display: flex; align-items: center; gap: 8px; }
+.sv-section-title > span:first-child { color: var(--fg); font-weight: 650; }
+.sv-section-subtitle { color: var(--dim); font-size: 11px; font-weight: 400; }
 .btn-clear { margin-left: auto; background: none; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: 11px; padding: 1px 8px; cursor: pointer; }
 .btn-clear:disabled { opacity: .45; cursor: not-allowed; }
 .sv-tool-btn,
@@ -577,23 +676,23 @@ async function onStop() {
 .sv-section-actions .btn-clear { margin-left: 0; }
 .sv-empty { color: var(--dim); font-size: 12px; padding: 12px; text-align: center; }
 
-/* CPU 条 */
-.sv-cpu-list { display: flex; flex-direction: column; gap: 3px; max-height: 130px; overflow-y: auto; }
-.sv-cpu-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
-.sv-cpu-name { width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--fg); }
-.sv-cpu-bar-bg { flex: 1; height: 14px; background: #e7e2d6; border-radius: 0; overflow: hidden; }
-.sv-cpu-bar { height: 100%; border-radius: 0; transition: width 0.3s; }
-.sv-cpu-pct { width: 52px; text-align: right; color: var(--fg); font-variant-numeric: tabular-nums; }
-.sv-cpu-switches { width: 82px; text-align: right; color: var(--dim); font-size: 11px; }
+.sv-health-grid { display: grid; grid-template-columns: repeat(6, minmax(118px, 1fr)); gap: 8px; }
+.sv-health-card { min-width: 0; border: 1px solid var(--border); border-radius: var(--radius); background: #fffdf8; padding: 8px 10px; display: flex; flex-direction: column; gap: 3px; }
+.sv-health-card span { color: var(--dim); font-size: 11px; }
+.sv-health-card b { color: var(--fg); font-size: 15px; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sv-health-card.warn { border-color: rgba(224, 86, 253, .45); background: #fff7fb; }
+.sv-health-card.warn span,
+.sv-health-card.warn b { color: var(--warn); }
+.sv-health-wide { grid-column: span 2; }
 
 /* 甘特 */
-.sv-gantt-section { flex: 1 1 430px; min-height: 430px; display: flex; flex-direction: column; }
+.sv-gantt-section { flex: 0 0 auto; min-height: 0; display: flex; flex-direction: column; }
 .sv-legend { display: flex; gap: 6px; flex-wrap: wrap; margin: 4px 0; }
 .sv-legend :deep(.sv-lg) { display: inline-flex; align-items: center; gap: 4px; background: #fbfaf5; color: #374151; border: 1px solid #ddd8ca; border-radius: 12px; padding: 2px 9px; font-size: 11px; cursor: pointer; user-select: none; box-shadow: inset 0 -1px 0 rgba(0,0,0,.03); }
 .sv-legend :deep(.sv-lg i) { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
 .sv-legend :deep(.sv-lg em) { color: #6b7280; font-style: normal; }
 .sv-legend :deep(.sv-lg-off) { opacity: .4; text-decoration: line-through; }
-.sv-canvas-wrap { position: relative; background: #fbfaf5; border: 1px solid var(--border); border-radius: var(--radius); overflow: auto; max-height: 360px; }
+.sv-canvas-wrap { position: relative; background: #fbfaf5; border: 1px solid var(--border); border-radius: var(--radius); overflow: visible; }
 .sv-canvas-wrap :deep(canvas) { display: block; width: 100%; cursor: crosshair; }
 .sv-tip { position: fixed; display: none; background: #1c2128; border: 1px solid #444c56; border-radius: 6px; padding: 6px 10px; font-size: 11px; color: #f0f6fc; pointer-events: none; z-index: 99; font-family: var(--font-mono, monospace); white-space: nowrap; }
 .sv-vcpu-title { font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
@@ -604,16 +703,44 @@ async function onStop() {
 .sv-vcpu :deep(.sv-vcpu-bar) { height: 100%; border-radius: 6px; }
 
 /* 事件列表 */
-.sv-events-section { max-height: 200px; display: flex; flex-direction: column; }
+.sv-events-section { flex: 0 0 auto; display: flex; flex-direction: column; }
 .sv-events-section.collapsed { flex: 0 0 auto; max-height: none; }
 .sv-events-section.collapsed .sv-section-title { margin-bottom: 0; }
-.sv-events { flex: 1; overflow-y: auto; background: #fbfaf5; border: 1px solid #e7e2d6; border-radius: 4px; padding: 6px; font-family: var(--font-mono); font-size: 11px; line-height: 1.5; }
-.sv-evt { display: flex; gap: 8px; white-space: nowrap; }
-.sv-evt-t { color: var(--dim); width: 110px; }
-.sv-evt-kind { width: 130px; }
-.sv-evt-detail { color: #374151; }
+.sv-events-table-wrap { max-height: 190px; }
+.sv-bottom-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(320px, .75fr); gap: 8px; margin-top: 8px; }
+.sv-runtime-section,
+.sv-context-section { height: 150px; min-height: 0; display: flex; flex-direction: column; }
+.sv-runtime-section .sv-table-wrap,
+.sv-context-section .sv-table-wrap { flex: 1; min-height: 0; }
+.sv-table-wrap { overflow: auto; border: 1px solid #e7e2d6; border-radius: 4px; background: #fbfaf5; }
+.sv-table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 11px; font-variant-numeric: tabular-nums; }
+.sv-table th { position: sticky; top: 0; z-index: 1; background: #f4f1e8; color: #605a50; font-weight: 650; text-align: left; border-bottom: 1px solid #d8d2c3; padding: 5px 6px; white-space: nowrap; }
+.sv-table td { border-bottom: 1px solid #ebe5d9; color: #374151; padding: 4px 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sv-table tbody tr:nth-child(even) td { background: #fffdf8; }
+.sv-table tbody tr:hover td { background: #eef6ff; }
+.sv-events-table th:nth-child(1),
+.sv-events-table td:nth-child(1) { width: 58px; text-align: right; }
+.sv-events-table th:nth-child(2),
+.sv-events-table td:nth-child(2) { width: 118px; }
+.sv-events-table th:nth-child(3),
+.sv-events-table td:nth-child(3) { width: 132px; }
+.sv-events-table th:nth-child(4),
+.sv-events-table td:nth-child(4) { width: 142px; }
+.sv-events-table th:nth-child(5),
+.sv-events-table td:nth-child(5) { width: 100px; }
+.sv-name-cell { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.sv-name-cell i { width: 8px; height: 8px; border-radius: 2px; flex: 0 0 auto; }
+.sv-meter-cell { display: grid; grid-template-columns: minmax(42px, 1fr) 44px; align-items: center; gap: 6px; }
+.sv-meter-cell em { color: var(--muted); font-style: normal; text-align: right; }
+.sv-inline-meter { height: 10px; min-width: 42px; border-radius: 5px; background: #e7e2d6; overflow: hidden; }
+.sv-inline-meter span { display: block; height: 100%; min-width: 1px; border-radius: 5px; }
+.sv-empty-cell { color: var(--dim); text-align: center; padding: 16px 8px !important; }
 .c-start { color: #5b8cff; }
 .c-stop { color: #ff7675; }
 .c-isr { color: #f5a623; }
 .c-idle { color: #555; }
+@media (max-width: 1100px) {
+  .sv-health-grid { grid-template-columns: repeat(3, minmax(118px, 1fr)); }
+  .sv-bottom-grid { grid-template-columns: 1fr; }
+}
 </style>
