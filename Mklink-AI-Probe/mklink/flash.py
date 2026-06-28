@@ -528,11 +528,6 @@ def burn_hex_file(
     if is_bin_file:
         print("[WARN] 检测到 .bin 文件，将使用 burn_bin 模式")
 
-    if mcu_key is None:
-        mcu_key = config.get("mcu_key")
-    if not mcu_key:
-        raise FlashError("mcu_key 未配置，请先运行 `python -m mklink project-init`")
-
     if flash_base is None:
         flash_base = project_info.get("flash_base") or "0x08000000"
     bin_base = (
@@ -548,6 +543,14 @@ def burn_hex_file(
     hpm_flash_cfg = project_info.get("hpm_flash_cfg")
     if not hpm_flash_cfg and board:
         hpm_flash_cfg = HPM_BOARD_FLASH_CFG.get(str(board).lower())
+
+    if mcu_key is None:
+        mcu_key = config.get("mcu_key")
+    if not mcu_key:
+        if is_hpm_project:
+            mcu_key = "custom"
+        else:
+            raise FlashError("mcu_key 未配置，请先运行 `python -m mklink project-init`")
 
     flash = MKLinkFlash.connect(port)
     try:

@@ -87,7 +87,12 @@ def _cli_iar_parse(project_root: str):
 
 
 def _detect_hpm_segger_project(project_root: str) -> dict | None:
-    """Detect the HPM Segger Embedded Studio output layout."""
+    """Detect HPM SDK output layouts.
+
+    Prefer native CMake build directories (``*_flash_xip_debug/output``) over
+    generated IDE exports, because one sample root may contain stale exports
+    for several boards.
+    """
     from pathlib import Path
     import json
 
@@ -105,6 +110,85 @@ def _detect_hpm_segger_project(project_root: str) -> dict | None:
     }
 
     root = Path(project_root)
+
+    def _read_json_target(json_files):
+        for json_file in sorted(json_files):
+            try:
+                data = json.loads(json_file.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    maybe_target = data.get("target")
+                    target = maybe_target if isinstance(maybe_target, dict) else data
+                    if isinstance(target, dict):
+                        return target
+            except Exception:
+                continue
+        return {}
+
+    def _parse_cmake_cache(cache_file: Path) -> dict:
+        values = {}
+        try:
+            for line in cache_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line or line.startswith(("//", "#")) or "=" not in line:
+                    continue
+                key_type, value = line.split("=", 1)
+                key = key_type.split(":", 1)[0].strip()
+                if key:
+                    values[key] = value.strip()
+        except Exception:
+            return {}
+        return values
+
+    def _first_file(directory: Path, suffix: str) -> Path | None:
+        files = sorted(directory.glob(f"*.{suffix}"))
+        return files[0] if files else None
+
+    cmake_candidates = []
+    for cache_file in root.glob("**/CMakeCache.txt"):
+        build_dir = cache_file.parent
+        output_dir = build_dir / "output"
+        if not output_dir.is_dir():
+            continue
+        bin_file = _first_file(output_dir, "bin")
+        map_file = _first_file(output_dir, "map")
+        elf_file = _first_file(output_dir, "elf")
+        if not (bin_file and map_file and elf_file):
+            continue
+
+        cache = _parse_cmake_cache(cache_file)
+        target = _read_json_target(
+            list((build_dir / "segger_embedded_studio").glob("*.json"))
+            + list((build_dir / "iar_embedded_workbench").glob("*.json"))
+        )
+        board = target.get("board") or cache.get("BOARD") or build_dir.name.split("_", 1)[0]
+        soc = target.get("soc", "")
+        device = target.get("target_device_name") or (f"{soc}x" if soc else board)
+        cmake_candidates.append((
+            bin_file.stat().st_mtime,
+            {
+                "ide_type": "HPM SDK CMake",
+                "project_name": cache.get("CMAKE_PROJECT_NAME") or target.get("name", root.name),
+                "device": device,
+                "vendor": "HPMicro",
+                "compiler": "gcc",
+                "board": board,
+                "soc": soc,
+                "flash_base": "0x80003000",
+                "bin_base": "0x80000400",
+                "hpm_flash_cfg": hpm_flash_cfg_by_board.get(str(board).lower()),
+                "ram_base": "0x01200000",
+                "flash_size": 0x1000000,
+                "ram_size": 0x80000,
+                "bin_path": str(bin_file.resolve()),
+                "map_path": str(map_file.resolve()),
+                "axf_path": str(elf_file.resolve()),
+                "out_path": str(elf_file.resolve()),
+                "readelf_path": cache.get("CMAKE_READELF", ""),
+            },
+        ))
+    if cmake_candidates:
+        return sorted(cmake_candidates, key=lambda item: item[0], reverse=True)[0][1]
+
+    ses_candidates = []
     for ses_dir in root.glob("**/segger_embedded_studio"):
         exe_dir = ses_dir / "Output" / "Debug" / "Exe"
         if not exe_dir.is_dir():
@@ -116,21 +200,12 @@ def _detect_hpm_segger_project(project_root: str) -> dict | None:
         if not (bin_files and map_files and elf_files):
             continue
 
-        target = {}
-        json_files = sorted(ses_dir.glob("*.json"))
-        if json_files:
-            try:
-                data = json.loads(json_files[0].read_text(encoding="utf-8"))
-                if isinstance(data, dict):
-                    maybe_target = data.get("target")
-                    target = maybe_target if isinstance(maybe_target, dict) else data
-                    if not isinstance(target, dict):
-                        target = {}
-            except Exception:
-                target = {}
+        target = _read_json_target(ses_dir.glob("*.json"))
 
         board = target.get("board", "hpm5301evklite")
-        return {
+        ses_candidates.append((
+            bin_files[0].stat().st_mtime,
+            {
             "ide_type": "SEGGER Embedded Studio",
             "project_name": target.get("name", root.name),
             "device": target.get("target_device_name", "HPM5301xEGx"),
@@ -148,7 +223,10 @@ def _detect_hpm_segger_project(project_root: str) -> dict | None:
             "map_path": str(map_files[0].resolve()),
             "axf_path": str(elf_files[0].resolve()),
             "out_path": str(elf_files[0].resolve()),
-        }
+            },
+        ))
+    if ses_candidates:
+        return sorted(ses_candidates, key=lambda item: item[0], reverse=True)[0][1]
 
     return None
 
@@ -179,8 +257,8 @@ def _cli_project_init(project_root: str):
     project_info = None
 
     if hpm:
-        ide_type = "SEGGER Embedded Studio"
-        print(f"[OK] 找到 HPM SES 输出目录: {hpm['bin_path']}")
+        ide_type = hpm.get("ide_type") or "SEGGER Embedded Studio"
+        print(f"[OK] 找到 HPM 输出目录: {hpm['bin_path']}")
         project_info = hpm
     elif ewp and not uvp:
         # IAR 项目

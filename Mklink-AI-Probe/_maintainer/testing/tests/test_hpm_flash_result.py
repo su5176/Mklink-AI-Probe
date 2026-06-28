@@ -1,6 +1,7 @@
 from pathlib import Path
 
-from mklink.flash import MKLinkFlash, parse_hpm_program_result
+from mklink.flash import MKLinkFlash, burn_hex_file, parse_hpm_program_result
+from mklink.project_config import save_config, save_project_info
 
 
 def test_hpm_program_requires_loaded_successfully_or_100_percent():
@@ -58,3 +59,46 @@ def test_hpm_burn_bin_does_not_treat_plain_zero_as_success(tmp_path: Path):
     assert result["success"] is False
     assert result["loaded_successfully"] is False
     assert result["download_100_percent"] is False
+
+
+def test_hpm_flash_does_not_require_mcu_profile(tmp_path: Path, monkeypatch):
+    bin_file = tmp_path / "demo.bin"
+    bin_file.write_bytes(b"demo")
+    save_config(str(tmp_path), {
+        "com_port": "COM9",
+        "mcu_key": None,
+        "swd_clock": 1000000,
+    })
+    save_project_info(str(tmp_path), {
+        "vendor": "HPMicro",
+        "board": "hpm6e00evk",
+        "flash_base": "0x80003000",
+        "bin_base": "0x80000400",
+        "bin_path": str(bin_file),
+    })
+
+    calls = []
+
+    class FakeFlash:
+        def set_swd_clock(self, swd_clock):
+            calls.append(("clock", swd_clock))
+
+        def get_idcode(self):
+            return 0x00000000
+
+        def burn_hpm_bin(self, path, *, addr, board=None, flash_cfg=None, progress_callback=None):
+            calls.append(("hpm", Path(path).name, addr, board))
+            return {"success": True}
+
+        def beep(self):
+            calls.append(("beep",))
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr(MKLinkFlash, "connect", staticmethod(lambda port=None: FakeFlash()))
+
+    result = burn_hex_file(project_root=str(tmp_path))
+
+    assert result["success"] is True
+    assert ("hpm", "demo.bin", "0x80000400", "hpm6e00evk") in calls

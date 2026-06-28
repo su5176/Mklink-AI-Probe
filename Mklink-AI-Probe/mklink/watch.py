@@ -83,10 +83,17 @@ def _parse_map_symbol(map_path: Path, name: str) -> tuple[int, int, str | None] 
     by_range = re.compile(
         rf"^\s*(?P<start>[0-9a-fA-F]{{8}})-(?P<end>[0-9a-fA-F]{{8}})\s+{name_re}\s+(?P<size>\d+)\s+\d+.*?(?P<object>\S+\.o)?\s*$"
     )
+    gcc_alloc = re.compile(
+        r"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+0x(?P<size>[0-9a-fA-F]+)\s+(?P<object>\S+\.(?:o|obj))\s*$"
+    )
+    gcc_symbol = re.compile(
+        rf"^\s*0x(?P<addr>[0-9a-fA-F]+)\s+{name_re}\s*$"
+    )
     try:
         lines = map_path.read_text(encoding="utf-8", errors="ignore").splitlines()
     except OSError:
         return None
+    previous_alloc: tuple[int, int, str | None] | None = None
     for line in lines:
         m = by_name.match(line)
         if m:
@@ -94,6 +101,22 @@ def _parse_map_symbol(map_path: Path, name: str) -> tuple[int, int, str | None] 
         m = by_range.match(line)
         if m:
             return int(m.group("start"), 16), int(m.group("size")), m.group("object")
+        m = gcc_alloc.match(line)
+        if m:
+            previous_alloc = (
+                int(m.group("addr"), 16),
+                int(m.group("size"), 16),
+                m.group("object"),
+            )
+            continue
+        m = gcc_symbol.match(line)
+        if m:
+            address = int(m.group("addr"), 16)
+            if previous_alloc:
+                alloc_addr, alloc_size, object_name = previous_alloc
+                if alloc_addr <= address < alloc_addr + max(alloc_size, 1):
+                    return address, max(alloc_size - (address - alloc_addr), 0), object_name
+            return address, 0, None
     return None
 
 
@@ -111,6 +134,8 @@ def _find_declared_type(source: str, name: str, object_name: str | None) -> str 
         obj = Path(object_name).name
         if obj.endswith(".o"):
             source_names.append(obj[:-2])
+        elif obj.endswith(".obj"):
+            source_names.append(obj[:-4])
     source_names.extend(["*.c", "*.h"])
 
     seen: set[Path] = set()
