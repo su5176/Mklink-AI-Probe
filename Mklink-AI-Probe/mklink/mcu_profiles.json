@@ -111,6 +111,28 @@
         { "name": "ram", "start": "0x00080000", "size": "0x40000" }
       ]
     },
+    "at32f422": {
+      "name": "ArteryTek AT32F422",
+      "idcode_pattern": "0x2BA01477",
+      "device_prefix": "AT32F42",
+      "flm_path": "FLM/AT32F422_128.FLM",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "cpu_freq_default": 240000000,
+      "page_size": 4096,
+      "sector_size": 4096,
+      "flash_size": "128KB",
+      "swd_clock_default": 1000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        { "name": "flash", "start": "0x08000000", "size": "0x20000" },
+        { "name": "ram", "start": "0x20000000", "size": "0x5000" }
+      ]
+    },
     "custom": {
       "name": "Custom MCU",
       "idcode_pattern": "",
