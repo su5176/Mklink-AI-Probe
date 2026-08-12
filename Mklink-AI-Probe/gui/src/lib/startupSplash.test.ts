@@ -12,7 +12,8 @@ describe('desktop startup splash', () => {
 
     expect(splashOffset).toBeGreaterThan(0)
     expect(moduleOffset).toBeGreaterThan(splashOffset)
-    expect(indexSource).toContain('src="/startup-probe.png"')
+    expect(indexSource).toContain('src="/brand/microkeen-about-hero.png"')
+    expect(indexSource).toContain('src="/brand/eternal-chip-logo-positive.png"')
     expect(indexSource).toContain('role="progressbar"')
     expect(indexSource).toContain('window.__MKLINK_STARTUP__')
   })

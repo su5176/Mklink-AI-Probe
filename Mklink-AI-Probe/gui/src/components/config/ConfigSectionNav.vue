@@ -21,6 +21,10 @@ const sections = computed(() => [
 
 <template>
   <nav class="section-nav" :aria-label="tr('配置区域', 'Configuration sections')">
+    <div class="section-nav-heading">
+      <span>DEVICE SETUP</span>
+      <strong>{{ tr('设备与连接', 'Device & Connection') }}</strong>
+    </div>
     <button
       v-for="section in sections"
       :key="section.id"
@@ -41,8 +45,33 @@ const sections = computed(() => [
   display: flex;
   flex-direction: column;
   gap: 4px;
-  width: 176px;
-  flex: 0 0 176px;
+  width: 184px;
+  flex: 0 0 184px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-card);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+}
+
+.section-nav-heading {
+  display: grid;
+  gap: 3px;
+  padding: 3px 8px 12px;
+  margin-bottom: 3px;
+  border-bottom: 1px solid var(--line);
+}
+
+.section-nav-heading span {
+  color: var(--brand-text);
+  font: 700 9px/1 var(--font-mono);
+  letter-spacing: .13em;
+}
+
+.section-nav-heading strong {
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
 }
 
 .section-button {
@@ -50,7 +79,7 @@ const sections = computed(() => [
   align-items: center;
   gap: 10px;
   width: 100%;
-  min-height: 38px;
+  min-height: 40px;
   padding: 0 12px;
   border: 1px solid transparent;
   border-radius: var(--radius);
@@ -60,6 +89,7 @@ const sections = computed(() => [
   font-size: 13px;
   text-align: left;
   cursor: pointer;
+  transition: color var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard), background var(--motion-fast) var(--ease-standard);
 }
 
 .section-button:hover {
@@ -69,10 +99,11 @@ const sections = computed(() => [
 }
 
 .section-button.active {
-  color: var(--accent);
-  background: #f3ece6;
-  border-color: var(--border);
-  font-weight: 600;
+  color: var(--nav-active-text);
+  background: var(--nav-active-bg);
+  border-color: var(--line-strong);
+  box-shadow: inset 3px 0 0 var(--brand-secondary);
+  font-weight: 650;
 }
 
 @media (max-width: 760px) {
@@ -81,7 +112,13 @@ const sections = computed(() => [
     flex-basis: auto;
     flex-direction: row;
     overflow-x: auto;
+    padding: 8px;
+    scrollbar-width: none;
   }
+
+  .section-nav::-webkit-scrollbar { display: none; }
+
+  .section-nav-heading { display: none; }
 
   .section-button {
     width: auto;

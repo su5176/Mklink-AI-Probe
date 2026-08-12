@@ -1,3 +1,7 @@
 /Mklink-AI-Probe/.superpowers/
+/Mklink-AI-Probe/.playwright-cli/
+/Mklink-AI-Probe/**/__pycache__/
 /Mklink-AI-Probe/gui/node_modules/
+/Mklink-AI-Probe/gui/src-tauri/target/
+/Mklink-AI-Probe/output/playwright/
 /.worktrees/

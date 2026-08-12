@@ -61,15 +61,19 @@ const parserBackend = computed(() => {
 
 <template>
   <section class="card source-panel" aria-labelledby="file-sources-title">
-    <header class="panel-header">
-      <div>
-        <h2 id="file-sources-title">{{ tr('文件来源', 'File Sources') }}</h2>
-        <span
-          data-testid="symbol-source-state"
-          :class="['badge', symbolStatus.loaded && !sourcePending ? 'badge-ok' : 'badge-warn']"
-        >
-          {{ sourcePending ? tr('待解析', 'Pending') : symbolStatus.loaded ? tr('符号已加载', 'Symbols loaded') : tr('符号未加载', 'Symbols not loaded') }}
-        </span>
+    <header class="file-panel-header">
+      <div class="file-heading-copy">
+        <span class="file-eyebrow">PROJECT ARTIFACTS</span>
+        <div class="file-title-row">
+          <h2 id="file-sources-title">{{ tr('文件来源', 'File Sources') }}</h2>
+          <span
+            data-testid="symbol-source-state"
+            :class="['badge', symbolStatus.loaded && !sourcePending ? 'badge-ok' : 'badge-warn']"
+          >
+            {{ sourcePending ? tr('待解析', 'Pending') : symbolStatus.loaded ? tr('符号已加载', 'Symbols loaded') : tr('符号未加载', 'Symbols not loaded') }}
+          </span>
+        </div>
+        <p>{{ tr('管理调试符号与链接映射文件。', 'Manage debug symbols and linker map files.') }}</p>
       </div>
       <span v-if="symbolStatus.loaded" class="symbol-counts">
         {{ symbolStatus.variable_count || 0 }} {{ tr('个固定可读变量', 'fixed readable variables') }} · {{ symbolStatus.struct_count || 0 }} {{ tr('种结构体类型', 'struct types') }} · {{ symbolStatus.enum_count || 0 }} {{ tr('种枚举类型', 'enum types') }}
@@ -173,23 +177,41 @@ const parserBackend = computed(() => {
   min-height: 270px;
 }
 
-.panel-header {
+.file-panel-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 16px;
-  margin-bottom: 22px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
 }
 
-.panel-header > div {
+.file-heading-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.file-title-row {
   display: flex;
   align-items: center;
   gap: 10px;
 }
 
-.panel-header h2 {
-  font-size: 15px;
-  font-weight: 600;
+.file-panel-header h2 {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.file-eyebrow {
+  color: var(--brand-text);
+  font: 700 9px/1 var(--font-mono);
+  letter-spacing: .13em;
+}
+
+.file-heading-copy p {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .symbol-counts,
@@ -271,7 +293,7 @@ const parserBackend = computed(() => {
 }
 
 @media (max-width: 720px) {
-  .panel-header {
+  .file-panel-header {
     align-items: flex-start;
     flex-direction: column;
   }

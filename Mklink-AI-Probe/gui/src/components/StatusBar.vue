@@ -53,9 +53,15 @@ async function handleRestart() {
 
 <style scoped>
 .status-bar {
+  min-height: var(--control-height);
   display: flex;
   align-items: center;
   gap: 6px;
+  padding: 3px 5px 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--surface-muted);
+  box-shadow: var(--shadow-control);
 }
 
 .status-item {
@@ -63,7 +69,7 @@ async function handleRestart() {
   align-items: center;
   gap: 4px;
   font-size: 12px;
-  color: var(--text-secondary);
+  color: var(--text-soft);
 }
 
 .status-label {

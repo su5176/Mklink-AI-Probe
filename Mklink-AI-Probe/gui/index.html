@@ -1,10 +1,36 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="porcelain" data-mode="light">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="theme-color" content="#f4f8f8" />
+    <link
+      rel="icon"
+      type="image/png"
+      href="/brand/eternal-chip-logo-positive.png"
+    />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>MKLink AI Probe</title>
+    <script>
+      (() => {
+        const themes = {
+          porcelain: ["light", "#f4f8f8"],
+          mica: ["light", "#e8eded"],
+          aqua: ["light", "#e6f2f3"],
+          abyss: ["dark", "#0b2529"],
+          graphite: ["dark", "#0e1415"],
+          aurora: ["dark", "#010d0d"],
+        };
+        try {
+          const saved = localStorage.getItem("mklink-theme");
+          const theme = themes[saved] ? saved : "porcelain";
+          document.documentElement.dataset.theme = theme;
+          document.documentElement.dataset.mode = themes[theme][0];
+          document.documentElement.style.colorScheme = themes[theme][0];
+          document.querySelector('meta[name="theme-color"]').content =
+            themes[theme][1];
+        } catch (_) {}
+      })();
+    </script>
     <style>
       html,
       body,
@@ -15,7 +41,7 @@
       body {
         margin: 0;
         overflow: hidden;
-        background: #020611;
+        background: #f4f8f8;
       }
       #startup-splash {
         position: fixed;
@@ -28,9 +54,11 @@
         padding: clamp(28px, 5vh, 64px) clamp(24px, 6vw, 96px);
         box-sizing: border-box;
         overflow: hidden;
-        background: #020611;
-        color: #f4f8ff;
-        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        background: #f4f8f8;
+        color: #333333;
+        font-family:
+          "Alibaba PuHuiTi 2.0", "Microsoft YaHei UI", "Microsoft YaHei",
+          system-ui, sans-serif;
         opacity: 1;
         transition: opacity 240ms ease;
       }
@@ -40,15 +68,20 @@
       }
       .startup-visual {
         align-self: center;
-        width: min(72vh, 760px, 82vw);
-        aspect-ratio: 1;
+        width: min(82vw, 920px);
+        aspect-ratio: 16 / 9;
         min-height: 0;
+        overflow: hidden;
+        border: 1px solid #c7d7d7;
+        border-radius: 12px;
+        background: #0b2529;
+        box-shadow: 0 24px 64px rgba(3, 30, 33, 0.18);
       }
       .startup-image {
         display: block;
         width: 100%;
         height: 100%;
-        object-fit: contain;
+        object-fit: cover;
         animation: startup-image-enter 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
       }
       .startup-footer {
@@ -62,38 +95,66 @@
         gap: 16px;
         margin-bottom: 10px;
       }
+      .startup-brand-lockup {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        min-width: 0;
+      }
+      .startup-company-logo {
+        width: 126px;
+        height: 34px;
+        object-fit: contain;
+      }
+      .startup-company-logo-negative {
+        display: none;
+      }
+      html[data-mode="dark"] .startup-company-logo-positive {
+        display: none;
+      }
+      html[data-mode="dark"] .startup-company-logo-negative {
+        display: block;
+      }
       .startup-brand {
         font-size: 16px;
-        font-weight: 650;
+        font-weight: 750;
         letter-spacing: 0;
+        white-space: nowrap;
       }
       #startup-progress-value {
-        color: #8bbcf7;
-        font: 600 12px/1 Consolas, monospace;
+        color: #07656b;
+        font:
+          600 12px/1 Consolas,
+          monospace;
       }
       .startup-progress {
         width: 100%;
         height: 5px;
         overflow: hidden;
-        background: #1b2a3d;
+        background: #dce6e6;
       }
       #startup-progress-fill {
         width: 8%;
         height: 100%;
-        background: #2e9df4;
-        box-shadow: 0 0 14px rgba(46, 157, 244, 0.55);
+        background: #097e86;
         transition: width 180ms ease-out;
       }
       #startup-status {
         min-height: 20px;
         margin: 9px 0 0;
-        color: #9ca9bb;
+        color: #5f7070;
         font-size: 12px;
         text-align: center;
       }
       @keyframes startup-image-enter {
-        from { opacity: 0; transform: scale(0.975); }
-        to { opacity: 1; transform: scale(1); }
+        from {
+          opacity: 0;
+          transform: scale(0.975);
+        }
+        to {
+          opacity: 1;
+          transform: scale(1);
+        }
       }
       @media (max-width: 720px) {
         #startup-splash {
@@ -101,11 +162,38 @@
           padding: 24px 18px;
         }
         .startup-visual {
-          width: min(64vh, 88vw);
+          width: min(90vw, 620px);
         }
         .startup-footer {
           width: min(520px, 88vw);
         }
+        .startup-company-logo {
+          width: 98px;
+        }
+        .startup-brand {
+          font-size: 13px;
+        }
+      }
+      html[data-mode="dark"] body,
+      html[data-mode="dark"] #startup-splash {
+        background: #0b2529;
+        color: #edf5f4;
+      }
+      html[data-mode="dark"] .startup-visual {
+        border-color: rgba(181, 216, 219, 0.3);
+        box-shadow: 0 24px 64px rgba(0, 0, 0, 0.38);
+      }
+      html[data-mode="dark"] #startup-progress-value {
+        color: #9dcbcf;
+      }
+      html[data-mode="dark"] .startup-progress {
+        background: rgba(181, 216, 219, 0.18);
+      }
+      html[data-mode="dark"] #startup-progress-fill {
+        background: #6bb8b1;
+      }
+      html[data-mode="dark"] #startup-status {
+        color: #a8bbb8;
       }
       @media (prefers-reduced-motion: reduce) {
         #startup-splash,
@@ -123,13 +211,25 @@
       <div class="startup-visual">
         <img
           class="startup-image"
-          src="/startup-probe.png"
-          alt="MKLink AI Probe 下载器"
+          src="/brand/microkeen-about-hero.png"
+          alt="MicroKeen MKLink AI Probe 下载器"
         />
       </div>
       <div class="startup-footer">
         <div class="startup-heading">
-          <span class="startup-brand">MKLink AI Probe</span>
+          <span class="startup-brand-lockup">
+            <img
+              class="startup-company-logo startup-company-logo-positive"
+              src="/brand/eternal-chip-logo-positive.png"
+              alt="ETERNAL CHIP"
+            />
+            <img
+              class="startup-company-logo startup-company-logo-negative"
+              src="/brand/eternal-chip-logo-negative.png"
+              alt="ETERNAL CHIP"
+            />
+            <span class="startup-brand">MKLink AI Probe</span>
+          </span>
           <span id="startup-progress-value">8%</span>
         </div>
         <div
@@ -148,36 +248,36 @@
     </div>
     <script>
       (() => {
-        const splash = document.getElementById('startup-splash')
-        const progress = document.getElementById('startup-progress')
-        const fill = document.getElementById('startup-progress-fill')
-        const valueLabel = document.getElementById('startup-progress-value')
-        const status = document.getElementById('startup-status')
-        let value = 8
-        let timer = 0
+        const splash = document.getElementById("startup-splash");
+        const progress = document.getElementById("startup-progress");
+        const fill = document.getElementById("startup-progress-fill");
+        const valueLabel = document.getElementById("startup-progress-value");
+        const status = document.getElementById("startup-status");
+        let value = 8;
+        let timer = 0;
 
         const update = (nextValue, nextStatus) => {
-          value = Math.max(value, Math.min(100, Math.round(nextValue)))
-          fill.style.width = `${value}%`
-          valueLabel.textContent = `${value}%`
-          progress.setAttribute('aria-valuenow', String(value))
-          if (nextStatus) status.textContent = nextStatus
-        }
+          value = Math.max(value, Math.min(100, Math.round(nextValue)));
+          fill.style.width = `${value}%`;
+          valueLabel.textContent = `${value}%`;
+          progress.setAttribute("aria-valuenow", String(value));
+          if (nextStatus) status.textContent = nextStatus;
+        };
 
         timer = window.setInterval(() => {
-          if (value < 18) update(value + 1)
-        }, 320)
+          if (value < 18) update(value + 1);
+        }, 320);
 
         window.__MKLINK_STARTUP__ = {
           update,
           finish() {
-            window.clearInterval(timer)
-            update(100)
-            splash.classList.add('is-complete')
-            window.setTimeout(() => splash.remove(), 260)
+            window.clearInterval(timer);
+            update(100);
+            splash.classList.add("is-complete");
+            window.setTimeout(() => splash.remove(), 260);
           },
-        }
-      })()
+        };
+      })();
     </script>
     <script type="module" src="/src/main.ts"></script>
   </body>

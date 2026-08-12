@@ -204,7 +204,8 @@ button, select, input { font: inherit; }
 .history-menu small, .history-empty { color: var(--text-muted, #657084); white-space: nowrap; }
 .history-empty { display: block; padding: 10px; text-align: center; }
 .ending-select { height: 30px; min-width: 0; border: 1px solid var(--border, #cbd2dc); background: var(--surface, #fff); color: inherit; }
-.send-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; border-color: #2563eb; background: #2563eb; color: #fff; }
+.send-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; border-color: var(--brand); background: var(--brand); color: #fff; }
+.send-button:hover:not(:disabled) { border-color: var(--brand-hover); background: var(--brand-hover); }
 button:disabled { opacity: .45; cursor: not-allowed; }
 .transmit-error { padding: 0 8px 6px; color: #dc2626; font-size: 12px; }
 @media (max-width: 720px) {

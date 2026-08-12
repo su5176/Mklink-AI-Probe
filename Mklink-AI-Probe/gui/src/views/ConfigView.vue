@@ -302,8 +302,12 @@ onMounted(async () => {
         data-testid="local-device-panel"
         aria-labelledby="local-device-title"
       >
-        <header class="panel-header">
-          <h2 id="local-device-title">{{ tr('本地设备', 'Local Device') }}</h2>
+        <header class="config-panel-header">
+          <div class="config-panel-heading-copy">
+            <span class="config-panel-eyebrow">MICROKEEN PROBE</span>
+            <h2 id="local-device-title">{{ tr('本地设备', 'Local Device') }}</h2>
+            <p>{{ tr('选择调试器串口并配置 SWD 调试链路。', 'Select the probe port and configure the SWD debug link.') }}</p>
+          </div>
           <span :class="['badge', deviceStatus.connected ? 'badge-ok' : 'badge-err']">
             {{ deviceStatus.connected ? tr('已连接', 'Connected') : tr('未连接', 'Disconnected') }}
           </span>
@@ -401,8 +405,12 @@ onMounted(async () => {
       />
 
       <section v-else-if="activeSection === 'remote'" class="card remote-panel">
-        <header class="panel-header">
-          <h2>{{ tr('远程连接', 'Remote Connection') }}</h2>
+        <header class="config-panel-header">
+          <div class="config-panel-heading-copy">
+            <span class="config-panel-eyebrow">REMOTE LINK</span>
+            <h2>{{ tr('远程连接', 'Remote Connection') }}</h2>
+            <p>{{ tr('连接已部署的 MKLink 服务实例。', 'Connect to a deployed MKLink service instance.') }}</p>
+          </div>
           <span :class="['badge', wsConnected ? 'badge-ok' : 'badge-err']">
             {{ wsConnected ? tr('已连接', 'Connected') : tr('未连接', 'Disconnected') }}
           </span>
@@ -422,7 +430,13 @@ onMounted(async () => {
       </section>
 
       <section v-else class="card serve-panel">
-        <header class="panel-header"><h2>{{ tr('启动服务', 'Start Service') }}</h2></header>
+        <header class="config-panel-header">
+          <div class="config-panel-heading-copy">
+            <span class="config-panel-eyebrow">LOCAL SERVICE</span>
+            <h2>{{ tr('启动服务', 'Start Service') }}</h2>
+            <p>{{ tr('将当前工作站作为受控的远程调试端点。', 'Expose this workstation as a controlled remote debug endpoint.') }}</p>
+          </div>
+        </header>
         <div class="alert alert-info">{{ tr('在本地启动 MKLink 远程服务，供其他客户端连接。', 'Start the MKLink remote service locally for other clients.') }}</div>
         <div class="form-row">
           <label class="form-label" for="serve-host">{{ tr('绑定地址', 'Bind Address') }}</label>
@@ -465,7 +479,7 @@ onMounted(async () => {
 <style scoped>
 .config-workspace {
   display: grid;
-  grid-template-columns: 176px minmax(0, 1fr);
+  grid-template-columns: 184px minmax(0, 1fr);
   align-items: start;
   gap: 20px;
 }
@@ -477,19 +491,39 @@ onMounted(async () => {
 .local-panel,
 .remote-panel,
 .serve-panel {
-  min-height: 270px;
+  min-height: 252px;
 }
 
-.panel-header {
+.config-panel-header {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
+  justify-content: space-between;
   gap: 10px;
-  margin-bottom: 20px;
+  margin-bottom: 24px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
 }
 
-.panel-header h2 {
-  font-size: 15px;
-  font-weight: 600;
+.config-panel-heading-copy {
+  display: grid;
+  gap: 3px;
+}
+
+.config-panel-eyebrow {
+  color: var(--brand-text);
+  font: 700 9px/1 var(--font-mono);
+  letter-spacing: .13em;
+}
+
+.config-panel-header h2 {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.config-panel-heading-copy p {
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .icon-button,
@@ -500,7 +534,7 @@ onMounted(async () => {
 }
 
 .icon-button {
-  width: 30px;
+  width: var(--control-height);
   padding: 0;
 }
 
@@ -511,6 +545,7 @@ onMounted(async () => {
 .local-actions,
 .panel-actions {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin: 18px 0 20px 110px;
 }
@@ -527,10 +562,10 @@ onMounted(async () => {
   gap: 10px;
   margin-top: -8px;
   padding: 8px 12px;
-  border: 1px solid #f59e0b;
-  border-radius: 4px;
-  background: #fef3c7;
-  color: #7c4a03;
+  border: 1px solid color-mix(in srgb, var(--warn) 58%, var(--line));
+  border-radius: var(--radius-card);
+  background: var(--warn-bg);
+  color: var(--warn);
 }
 
 .firmware-banner span {
@@ -542,6 +577,29 @@ onMounted(async () => {
     grid-template-columns: 1fr;
   }
 
+  .form-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto auto;
+    align-items: center;
+  }
+
+  .form-label {
+    grid-column: 1 / -1;
+    width: auto;
+    text-align: left;
+  }
+
+  .form-input {
+    grid-column: 1 / -1;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .form-select {
+    width: 100%;
+    min-width: 0;
+  }
+
   .local-actions,
   .panel-actions {
     margin-left: 0;
@@ -551,6 +609,13 @@ onMounted(async () => {
   .firmware-banner {
     grid-column: 1;
     flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 460px) {
+  .config-panel-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 </style>

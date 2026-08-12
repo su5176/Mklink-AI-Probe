@@ -73,7 +73,10 @@ describe('App version footer', () => {
   it('switches the global navigation between Chinese and English', async () => {
     const wrapper = mountApp()
 
-    expect(wrapper.get('.app-title').text()).toBe('MKLink')
+    expect(wrapper.get('.app-title').text()).toContain('MKLink AI Probe')
+    expect(wrapper.get('.app-title').text()).toContain('MicroKeen')
+    expect(wrapper.get('.company-logo-positive').attributes('src')).toBe('/brand/eternal-chip-logo-positive.png')
+    expect(wrapper.get('.product-device').attributes('src')).toBe('/brand/microkeen-probe.png')
     expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['配置', '仪表盘', '脱机烧录', '在线烧录', '现场 Agent'])
     await wrapper.get('[data-testid="global-language-toggle"]').trigger('click')
     expect(wrapper.findAll('.nav-tab').map(tab => tab.text())).toEqual(['Config', 'Dashboard', 'Offline Flash', 'Online Flash', 'Site Agent'])
@@ -150,7 +153,7 @@ describe('App version footer', () => {
     expect(source).toContain('.header-right .status-bar')
     expect(source).toContain('width: max-content')
     expect(source).toMatch(/\.nav-tab\s*\{[^}]*white-space:\s*nowrap/s)
-    expect(source).toMatch(/@media \(max-width: 720px\)[\s\S]*\.store-menu-panel\s*\{[^}]*position:\s*fixed[^}]*top:\s*46px[^}]*right:\s*8px/s)
+    expect(source).toMatch(/@media \(max-width: 720px\)[\s\S]*\.store-menu-panel\s*\{[^}]*position:\s*fixed[^}]*top:\s*58px[^}]*right:\s*8px/s)
   })
 
   it('does not mount route views or poll device state before the backend API is ready', async () => {

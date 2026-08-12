@@ -254,7 +254,7 @@ async function quickReset() {
 }
 .dot-user { background: var(--success); }
 .dot-ai { background: var(--warn); }
-.alert-warn { color: var(--warn); padding: 8px; border: 1px solid var(--border); border-radius: var(--radius); background: #f5f0e1; }
+.alert-warn { color: var(--warn); padding: 8px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--warn-bg); }
 @media (max-width: 900px) {
   .dashboard-nav-row { flex-wrap: wrap; }
   .dashboard-nav-row .tabs-bar { flex-basis: 100%; }
