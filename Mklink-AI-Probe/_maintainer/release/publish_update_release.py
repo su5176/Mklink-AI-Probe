@@ -576,7 +576,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--release-dir", required=True, type=Path)
     parser.add_argument("--updater-installer", required=True, type=Path)
     parser.add_argument("--updater-signature", required=True, type=Path)
-    parser.add_argument("--github-repo", default="su5176/Mklink-AI-Probe")
+    parser.add_argument("--github-repo", default="Aladdin-Wang/Mklink-AI-Probe")
     parser.add_argument("--gitee-repo", default="Aladdin-Wang/Mklink-AI-Probe")
     parser.add_argument("--repository", type=Path, default=Path.cwd())
     return parser

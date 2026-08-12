@@ -27,8 +27,8 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_MANIFEST_URLS = (
-    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
     "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/updates/latest.json",
+    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
 )
 USER_AGENT = "Mklink-AI-Probe-Skill-Updater"
 MANAGED_CONTENT_ROOTS = (PurePosixPath("gui/dist"),)

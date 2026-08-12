@@ -45,6 +45,35 @@ def test_version_comparison_handles_stable_and_prerelease(updater):
         updater.version_key("latest")
 
 
+def test_manifest_sources_prefer_github_and_fall_back_to_gitee(
+    updater, monkeypatch,
+):
+    github, gitee = updater.DEFAULT_MANIFEST_URLS
+    assert github == (
+        "https://raw.githubusercontent.com/Aladdin-Wang/"
+        "Mklink-AI-Probe/updates/latest.json"
+    )
+    assert gitee == (
+        "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json"
+    )
+
+    calls = []
+
+    def request(url):
+        calls.append(url)
+        if url == github:
+            raise OSError("GitHub unavailable")
+        return json.dumps({"version": "0.1.6"}).encode("utf-8")
+
+    monkeypatch.setattr(updater, "_request_bytes", request)
+
+    manifest, manifest_url = updater.fetch_manifest(updater.DEFAULT_MANIFEST_URLS)
+
+    assert manifest == {"version": "0.1.6"}
+    assert manifest_url == gitee
+    assert calls == [github, gitee]
+
+
 def test_check_uses_24_hour_cache_without_hiding_newer_version(
     updater, monkeypatch, tmp_path,
 ):
