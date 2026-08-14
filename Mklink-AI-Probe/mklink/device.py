@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import re
 import struct
 import tempfile
@@ -332,6 +333,11 @@ class Device:
         self._bridge = None
         self._flash = None
         self._connected = False
+        # HIL-Infra lockd 协议互操作锁（connect 时获取）：断连即释放
+        hil_lock = getattr(self, "_hil_lock", None)
+        if hil_lock is not None:
+            hil_lock.release()
+            self._hil_lock = None
 
     @property
     def connected(self) -> bool:
@@ -1770,6 +1776,19 @@ def connect(
         elf_backend=elf_backend,
     )
     dev._connect()
+    # HIL-Infra lockd 协议互操作：connect 成功即持有 transport_usb-serial_<COM>，
+    # close() 释放；与 hil_core.lockd 编排器在同一锁名上互斥（T5 原生对齐）。
+    from mklink.hil_lock import HilFileLock, transport_lock_name
+    hil_lock = HilFileLock(
+        transport_lock_name("usb-serial", dev.port),
+        owner_id=f"mklink-{os.getpid()}",
+    )
+    try:
+        hil_lock.acquire()
+    except Exception:
+        dev.close()
+        raise
+    dev._hil_lock = hil_lock
     return dev
 
 
