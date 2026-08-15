@@ -123,6 +123,32 @@ class HilFileLock:
         self._held = False
         return True
 
+    def renew(self, lease_s: float | None = None) -> bool:
+        """续租：先验所有权再原子替换；失败（含所有权丢失）返回 False。
+
+        长会话按 lease_s/3 周期调用，防止租约过期后被他人回收。
+        """
+        if not self._held:
+            return False
+        if lease_s is not None:
+            self.lease_s = float(lease_s)
+        tmp = self.path.with_name(self.path.name + f".renew-{self.owner_id[:8]}")
+        tmp.write_text(json.dumps(self._payload()), encoding="utf-8")
+        for attempt in range(5):  # Windows 杀毒/索引器可能短暂持锁
+            try:
+                current = self._read()
+                if current is None or current.get("owner_id") != self.owner_id:
+                    tmp.unlink()
+                    return False  # 所有权已丢失（过期被回收）
+                os.replace(tmp, self.path)
+                return True
+            except OSError:
+                if attempt == 4:
+                    tmp.unlink()
+                    return False
+                time.sleep(0.02)
+        return False
+
     @property
     def held(self) -> bool:
         return self._held
