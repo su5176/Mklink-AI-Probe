@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-16T13:59:11+08:00",
+  "updated_at": "2026-08-16T14:12:15+08:00",
   "repository": {
     "url": "https://github.com/su5176/Mklink-AI-Probe",
     "project_root": "Mklink-AI-Probe",
     "branch": "feature/eternal-chip-gui",
     "head": "feature/eternal-chip-gui 包含 c9fc938：在立芯恒方 GUI 基线上选择性同步僵尸锁修复、安全 VCC 控制、MKLink 探针重启和对应 MCP/REST/GUI 测试；既有立芯品牌界面与 HIL 锁保持不变。",
-    "remote_head": "origin/master 包含 GitHub PR #10 merge commit 2f8e902 和合并后门禁收口；PR 状态为 MERGED。su5176 仓库当前没有 v0.1.6 标签或 Release。",
+    "remote_head": "用户已授权将 feature/eternal-chip-gui 与 master 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。",
     "working_tree": "功能与项目记忆均已提交，生产构建生成的 dist 哈希文件已恢复/清理；既有未跟踪 Python、egg-info 和 native build 缓存保持原样。"
   },
   "mission": {
@@ -14,8 +14,8 @@
     "maintenance": "交接只保留当前基线、最新证据、有效约束、限制和下一动作；历史从 Git 查询。"
   },
   "current_session": {
-    "status": "probe_controls_synced_hardware_gate_waived",
-    "current_task": "把主分支的僵尸锁修复、安全 VCC 控制和 MKLink 探针重启选择性同步到立芯恒方 GUI 分支，同时保留独立品牌界面和既有 HIL 锁。",
+    "status": "probe_controls_synced_and_pushed",
+    "current_task": "主分支的僵尸锁修复、安全 VCC 控制和 MKLink 探针重启已选择性同步到立芯恒方 GUI 分支并推送到 GitHub origin；独立品牌界面和既有 HIL 锁保持不变。",
     "release": "PR #10 保留已发布 v0.1.6 的代码基线且不移动标签。Aladdin-Wang fork 的 v0.1.6 发布记录属于贡献者仓库；su5176 目标仓库当前没有 v0.1.6 标签或 Release，本次未授权发布。"
   },
   "milestones": [
@@ -71,7 +71,7 @@
     },
     {
       "area": "探针控制与僵尸锁同步验收",
-      "result": "c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit。"
+      "result": "c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit；随后明确授权并通过 Git 原子推送同步到 GitHub origin。"
     }
   ],
   "decisions": [
@@ -90,7 +90,7 @@
   "hardware": {
     "probe": "维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。",
     "target": "ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。",
-    "permission": "用户已授权本地合并 FLM 修复与本次改进到 master/feature/eternal-chip-gui，并明确豁免本次真机门禁；未授权推送、发布、烧录或其他真机动作。"
+    "permission": "用户已授权本地合并及 master/feature/eternal-chip-gui 的 GitHub origin 推送，并明确豁免本次真机门禁；未授权标签、Release、Gitee 同步、烧录或其他真机动作。"
   },
   "known_limits": [
     "高事件率 SystemView 仍可能溢出目标 RTT 缓冲。",

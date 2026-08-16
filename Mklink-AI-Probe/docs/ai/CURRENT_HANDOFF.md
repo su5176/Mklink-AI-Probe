@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-16T13:59:11+08:00`
+- 更新时间：`2026-08-16T14:12:15+08:00`
 - 分支：`feature/eternal-chip-gui`
 - HEAD：`feature/eternal-chip-gui 包含 c9fc938：在立芯恒方 GUI 基线上选择性同步僵尸锁修复、安全 VCC 控制、MKLink 探针重启和对应 MCP/REST/GUI 测试；既有立芯品牌界面与 HIL 锁保持不变。`
-- 远端 HEAD：`origin/master 包含 GitHub PR #10 merge commit 2f8e902 和合并后门禁收口；PR 状态为 MERGED。su5176 仓库当前没有 v0.1.6 标签或 Release。`
+- 远端 HEAD：`用户已授权将 feature/eternal-chip-gui 与 master 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。`
 - 工作树：功能与项目记忆均已提交，生产构建生成的 dist 哈希文件已恢复/清理；既有未跟踪 Python、egg-info 和 native build 缓存保持原样。
-- 当前任务：把主分支的僵尸锁修复、安全 VCC 控制和 MKLink 探针重启选择性同步到立芯恒方 GUI 分支，同时保留独立品牌界面和既有 HIL 锁。
-- 状态：`probe_controls_synced_hardware_gate_waived`
+- 当前任务：主分支的僵尸锁修复、安全 VCC 控制和 MKLink 探针重启已选择性同步到立芯恒方 GUI 分支并推送到 GitHub origin；独立品牌界面和既有 HIL 锁保持不变。
+- 状态：`probe_controls_synced_and_pushed`
 
 ## 里程碑
 
@@ -28,7 +28,7 @@
 - **源码与本地 Skill 同步**：Aladdin-Wang GitHub/Gitee master 与 su5176 PR #10 已同步；用户级 Skill、完整 GUI/MCP 依赖导入和 Skill 校验通过，快速启动网页已写入当前 MICROKEEN 卷。su5176 PR #10 于 2026-08-12 合并为 2f8e902。
 - **PR #10 合并门禁复核**：GitHub 合并前状态 CLEAN、MERGEABLE，头 4d7d617 相对基线 6360843 前进 35 个提交且未落后；仓库未配置远端状态检查。本机隔离复核通过 GUI 54 文件/521 项、Vite 生产构建、Tauri Rust 12 项与 cargo check。首次 Python 全量得到 1284 passed、1 skipped；3 项仅因隔离 worktree 缺少未入库 mklink-stcp.dll 报错，在补入与 PR 完全相同 stcp_bridge 源码树生成且 SHA-256 一致的 DLL 后定向 3 项全通过。旧 Device 连接测试仍 mock 已移除的 _resolve_port，已改为 mock 当前 load_config 入口以消除本地项目配置依赖；修正后的最终 Python 全量为 1288 passed、1 skipped。PR 中既有真实 Chrome 双标签、下载器重连和 HPM/串口/RTT 真机闭环继续作为实机证据。
 - **立芯恒方 GUI 分支验收**：GUI 精修后全量 56 文件/525 项通过，Vite 生产构建、Tauri cargo check 与立芯 GUI 规范校验通过；真实 Chromium 在 1440x1000、1024x768 与 390x844 下完成 porcelain/abyss、配置、仪表盘、主题面板和 About 视觉验收。主题选择、外围点击与 Esc 均能收起面板，Esc 会把焦点还给触发按钮；390px 下修复配置标题全局样式污染并移除可见滚动条轨道。Python 全量仍沿用本分支前次 1285 passed、1 skipped 及 3 项环境缺件 setup error 证据。未执行连接、烧录或其他真机动作。
-- **探针控制与僵尸锁同步验收**：c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit。
+- **探针控制与僵尸锁同步验收**：c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit；随后明确授权并通过 Git 原子推送同步到 GitHub origin。
 
 ## 架构决策
 
@@ -48,7 +48,7 @@
 
 - **probe**：维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。
 - **target**：ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。
-- **permission**：用户已授权本地合并 FLM 修复与本次改进到 master/feature/eternal-chip-gui，并明确豁免本次真机门禁；未授权推送、发布、烧录或其他真机动作。
+- **permission**：用户已授权本地合并及 master/feature/eternal-chip-gui 的 GitHub origin 推送，并明确豁免本次真机门禁；未授权标签、Release、Gitee 同步、烧录或其他真机动作。
 
 ## 下一动作
 
