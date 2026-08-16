@@ -28,6 +28,8 @@ const {
   uploadFileSource,
   connectDevice,
   disconnectDevice,
+  setPowerOn,
+  rebootProbe,
   parseAxf,
   probeFirmwareCheck,
 } = useMklinkApi()
@@ -36,6 +38,7 @@ const toast = useToast()
 const symbolCatalog = useSymbolCatalog()
 
 const activeSection = ref<ConfigSection>('local')
+const powerVoltages = [1800, 3300, 5000] as const
 const config = ref<ProjectConfig>({})
 const localPort = ref('')
 const portOptions = ref<{ label: string; value: string }[]>([])
@@ -46,6 +49,8 @@ const portsLoading = ref(false)
 const savingLocal = ref(false)
 const connecting = ref(false)
 const disconnecting = ref(false)
+const poweringVoltage = ref<1800 | 3300 | 5000 | null>(null)
+const rebootingProbe = ref(false)
 const browsingFiles = ref(false)
 const parsingSymbols = ref(false)
 const localSaveState = ref<'idle' | 'saving' | 'saved'>('idle')
@@ -167,6 +172,43 @@ async function disconnectLocal() {
     toast.error(tr('断开失败: ', 'Disconnect failed: ') + error.message)
   } finally {
     disconnecting.value = false
+  }
+}
+
+async function applyProbePower(voltageMv: 1800 | 3300 | 5000) {
+  if (!deviceStatus.value.connected || poweringVoltage.value !== null) return
+  const confirm5v = voltageMv === 5000
+  if (confirm5v && !window.confirm(tr(
+    '危险：5V 可能烧毁 3.3V 目标板。仅当你已核对原理图、供电路径和当前连接负载均可承受 5V 时才能继续。确认输出 5V？',
+    'Danger: 5 V can destroy a 3.3 V target. Continue only after verifying the schematic, power path, and connected load are all 5 V tolerant. Output 5 V?',
+  ))) return
+
+  poweringVoltage.value = voltageMv
+  try {
+    await setPowerOn(voltageMv, confirm5v)
+    toast.success(tr(`VCC 已设置为 ${(voltageMv / 1000).toFixed(1)}V`, `VCC set to ${(voltageMv / 1000).toFixed(1)} V`))
+  } catch (error: any) {
+    toast.error(tr('设置 VCC 失败: ', 'Failed to set VCC: ') + error.message)
+  } finally {
+    poweringVoltage.value = null
+  }
+}
+
+async function restartProbe() {
+  if (!deviceStatus.value.connected || rebootingProbe.value) return
+  if (!window.confirm(tr(
+    '重启 MKLink 探针会中断当前调试和数据流，并释放串口连接。确认继续？',
+    'Rebooting the MKLink probe interrupts debugging and data streams and releases the serial connection. Continue?',
+  ))) return
+
+  rebootingProbe.value = true
+  try {
+    await rebootProbe()
+    toast.success(tr('MKLink 已重启，请等待探针重新枚举后再连接', 'MKLink rebooted. Wait for the probe to enumerate before reconnecting.'))
+  } catch (error: any) {
+    toast.error(tr('MKLink 重启失败: ', 'Failed to reboot MKLink: ') + error.message)
+  } finally {
+    rebootingProbe.value = false
   }
 }
 
@@ -385,6 +427,42 @@ onMounted(async () => {
           </button>
         </div>
 
+        <section class="probe-controls" data-testid="probe-controls" aria-labelledby="probe-controls-title">
+          <div class="probe-controls-heading">
+            <h3 id="probe-controls-title">{{ tr('探针电源与重启', 'Probe Power and Reboot') }}</h3>
+            <span>{{ tr('命令会立即作用于当前接线', 'Commands immediately affect the connected hardware') }}</span>
+          </div>
+          <div class="probe-power-warning" role="note">
+            <TriangleAlert :size="16" aria-hidden="true" />
+            <span>{{ tr('输出电压前请核对目标板额定电压；5V 接入 3.3V 系统可能造成永久损坏。', 'Verify the target voltage rating before enabling VCC. Applying 5 V to a 3.3 V system can cause permanent damage.') }}</span>
+          </div>
+          <div class="probe-control-actions">
+            <span class="probe-control-label">VCC</span>
+            <button
+              v-for="voltage in powerVoltages"
+              :key="voltage"
+              class="btn btn-sm"
+              :class="{ 'danger-voltage': voltage === 5000 }"
+              type="button"
+              :data-testid="`probe-power-${voltage}`"
+              :disabled="!deviceStatus.connected || poweringVoltage !== null || rebootingProbe"
+              @click="applyProbePower(voltage)"
+            >
+              {{ poweringVoltage === voltage ? tr('设置中...', 'Applying...') : `${(voltage / 1000).toFixed(1)}V` }}
+            </button>
+            <button
+              class="btn btn-sm icon-command probe-reboot"
+              type="button"
+              data-testid="reboot-probe"
+              :disabled="!deviceStatus.connected || poweringVoltage !== null || rebootingProbe"
+              @click="restartProbe"
+            >
+              <RefreshCw :size="14" aria-hidden="true" />
+              {{ rebootingProbe ? tr('重启中...', 'Rebooting...') : tr('重启 MKLink', 'Reboot MKLink') }}
+            </button>
+          </div>
+        </section>
+
       </section>
 
       <FileSourcesPanel
@@ -555,6 +633,68 @@ onMounted(async () => {
   font-size: 12px;
 }
 
+.probe-controls {
+  display: grid;
+  gap: 10px;
+  margin-top: 4px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface-soft, var(--surface));
+}
+
+.probe-controls-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.probe-controls-heading h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.probe-controls-heading span,
+.probe-control-label {
+  color: var(--dim);
+  font-size: 12px;
+}
+
+.probe-power-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 8px 10px;
+  border: 1px solid #f59e0b;
+  border-radius: 4px;
+  background: #fef3c7;
+  color: #7c4a03;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.probe-power-warning svg {
+  flex: 0 0 auto;
+  margin-top: 1px;
+}
+
+.probe-control-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.danger-voltage {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.probe-reboot {
+  margin-left: auto;
+}
+
 .firmware-banner {
   grid-column: 2;
   display: flex;
@@ -601,9 +741,14 @@ onMounted(async () => {
   }
 
   .local-actions,
-  .panel-actions {
+  .panel-actions,
+  .probe-controls-heading {
     margin-left: 0;
     flex-wrap: wrap;
+  }
+
+  .probe-reboot {
+    margin-left: 0;
   }
 
   .firmware-banner {

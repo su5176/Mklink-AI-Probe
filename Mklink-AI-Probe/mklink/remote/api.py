@@ -1593,6 +1593,12 @@ def create_app(
 
     @app.post("/api/device/reset")
     async def reset_device():
+        async with _exclusive_probe_control("reset") as (device, stopped):
+            await run_in_threadpool(device.reset)
+        return {"status": "ok", "stopped": stopped}
+
+    @asynccontextmanager
+    async def _exclusive_probe_control(operation: str):
         if not _state["device"] or not _state["device"].connected:
             raise HTTPException(status_code=400, detail="Device not connected")
         from mklink.remote.dashboards import stop_bridge_dashboards
@@ -1611,9 +1617,43 @@ def create_app(
                         "message": str(error),
                     },
                 ) from error
-            async with async_target_debug_lease(_state, "reset"):
-                await run_in_threadpool(_state["device"].reset)
-        return {"status": "ok", "stopped": stopped}
+            async with async_target_debug_lease(_state, operation):
+                yield _state["device"], stopped
+
+    @app.post("/api/device/power")
+    async def set_probe_power(
+        voltage_mv: int = Body(...),
+        confirm_5v: bool = Body(default=False),
+    ):
+        try:
+            async with _exclusive_probe_control("set-power") as (device, stopped):
+                await run_in_threadpool(
+                    device.set_power_on,
+                    voltage_mv,
+                    confirm_5v=confirm_5v,
+                )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        return {
+            "status": "ok",
+            "power_on": True,
+            "voltage_mv": voltage_mv,
+            "stopped": stopped,
+        }
+
+    @app.post("/api/device/reboot")
+    async def reboot_probe():
+        device = None
+        stopped: list[str] = []
+        try:
+            async with _exclusive_probe_control("reboot-probe") as (device, stopped):
+                remember_device_connection(_state, device)
+                await run_in_threadpool(device.reboot)
+        finally:
+            if device is not None and not device.connected:
+                _state["device"] = None
+                _state["dispatcher"] = None
+        return {"status": "rebooted", "connected": False, "stopped": stopped}
 
     @app.post("/api/device/erase")
     async def erase_device():

@@ -778,6 +778,77 @@ def test_reset_does_not_send_command_when_dashboard_cannot_stop():
     device.reset.assert_not_called()
 
 
+def test_probe_power_api_requires_explicit_5v_confirmation_and_releases_lease():
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    calls = []
+    device = MagicMock()
+    device.connected = True
+
+    def set_power_on(voltage_mv, *, confirm_5v=False):
+        owner = state["resource_manager"].get_status()["target_debug"]["owner"]
+        calls.append((voltage_mv, confirm_5v, owner))
+        if voltage_mv == 5000 and not confirm_5v:
+            raise ValueError("5 V requires explicit confirmation")
+
+    device.set_power_on.side_effect = set_power_on
+    state["device"] = device
+
+    safe = client.post("/api/device/power", json={"voltage_mv": 3300})
+    refused = client.post("/api/device/power", json={"voltage_mv": 5000})
+    confirmed = client.post(
+        "/api/device/power",
+        json={"voltage_mv": 5000, "confirm_5v": True},
+    )
+
+    assert safe.status_code == 200
+    assert safe.json()["voltage_mv"] == 3300
+    assert refused.status_code == 400
+    assert confirmed.status_code == 200
+    assert calls == [
+        (3300, False, "user:api:set-power"),
+        (5000, False, "user:api:set-power"),
+        (5000, True, "user:api:set-power"),
+    ]
+    assert state["resource_manager"].get_status() == {}
+
+
+def test_probe_reboot_api_clears_disconnected_device_and_releases_lease():
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    owners_seen = []
+    device = MagicMock()
+    device.connected = True
+
+    def reboot():
+        owners_seen.append(
+            state["resource_manager"].get_status()["target_debug"]["owner"]
+        )
+        device.connected = False
+
+    device.reboot.side_effect = reboot
+    state["device"] = device
+
+    response = client.post("/api/device/reboot")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "rebooted",
+        "connected": False,
+        "stopped": [],
+    }
+    assert owners_seen == ["user:api:reboot-probe"]
+    assert state["device"] is None
+    assert state["dispatcher"] is None
+    assert state["resource_manager"].get_status() == {}
+
+
 def test_native_api_preempts_and_stops_dashboard_before_target_access():
     from mklink.remote.resource_manager import ResourceGroup
 

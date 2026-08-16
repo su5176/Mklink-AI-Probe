@@ -3,11 +3,11 @@ name: mklink-ai-probe
 description: |
   MKLink/MicroLink 嵌入式调试：固件烧录、RTT View/VOFA/SuperWatch 可视化、RAM/寄存器读写、
   AXF 符号与 HardFault 调试、Modbus RTU、通用串口调试、本地 GUI/API、
-  VPN/局域网直连远程调试。
+  MKLink VCC 电压控制与探针重启、VPN/局域网直连远程调试。
   能力以 MCP tool 暴露（vendor-neutral，Claude Code / Cursor / ChatGPT 等均可调用），
   亦提供 CLI（python -m mklink）与 FastAPI/GUI。
   触发：Keil/IAR 初始化/烧录、RTT/VOFA 观测、read_ram/watch/superwatch、
-  Modbus 扫描/读写/dashboard/点表生成、串口 open/send/dashboard、resources、symbols/typeinfo、dump-memory、flush-memory、version、serve/gui、web-entry、U盘HTML快速启动、
+  Modbus 扫描/读写/dashboard/点表生成、串口 open/send/dashboard、resources、symbols/typeinfo、dump-memory、flush-memory、set_power_on、reboot_probe、version、serve/gui、web-entry、U盘HTML快速启动、
   VPN/局域网远程调试、远程烧录、Site Agent、现场机、remote sites/status/capabilities/upload、
   **SystemView RTOS 跟踪**（systemview-integrate 集成/systemview 观测/systemview-analyze 分析/systemview-report 报告，任务切换/ISR/CPU 占用）、
   RTT 控制块静态编译（rtt_storage_mode=1）、散射文件中固定 RTT 地址、MKLINK_RTT_STATIC 宏、`.ARM.__at_0xADDR` 段名。
@@ -21,7 +21,7 @@ description: |
 
 | 层 | 形态 | 何时用 |
 |---|---|---|
-| **① MCP 能力层**（首选） | 51 个 MCP tool（`mcp__mklink__*`），见下方速查 | Claude Code / 任意 MCP client 环境——参数 schema 化、自带智能默认、自动分块等增值 |
+| **① MCP 能力层**（首选） | 55 个 MCP tool（`mcp__mklink__*`），见下方速查 | Claude Code / 任意 MCP client 环境——参数 schema 化、自带智能默认、自动分块等增值 |
 | **② 方法论层**（本文件 + `references/`） | 编排知识 | 教 Agent「何时用哪个 tool/命令、边界、排查思路」——MCP 与 CLI 共用 |
 | **③ CLI 兜底层** | `python -m mklink <cmd>` | 人类入口、OpenAI/Codex 跨 harness、无 MCP 环境、MCP 未覆盖的可视化/工作流 |
 
@@ -95,15 +95,17 @@ description: |
 - **符号/AXF 默认使用内置 pyelftools**：`load_symbols`/`read_variable`/`write_variable`/`memory_map`/函数断点/`decode_hardfault` 源码行不依赖用户电脑的编译工具链。AI **默认使用内置 pyelftools**，不得因 `readelf_available:false` 阻止 AXF 操作。**仅在用户明确指定** `elf_backend=external` 时，才调用本机 `readelf`/`addr2line`；仅设置工具路径不会自动启用 external。内置解析遇到不支持的文件时先报告原因，取得用户同意后才能切换外部兼容后端。
 - **未知 MCU 禁止直接改 `custom` 兜底**：烧录前若项目 MCU 不在 `mcu_profiles.json`，先调用 MCP `detect_mcu_profile` 或 CLI `python -m mklink mcu-detect`。多内部 FLM 候选时把候选报给用户选择，再用 `flm`/`--flm` 固化；找不到本地 FLM/Pack 时停止并提示安装或解包 Keil/Arm Pack。HPMicro 是明确例外，见下一条。
 - **HPMicro 禁止寻找或加载 FLM**：`HPM*` 型号使用探针设备端 HPM ROM API。MCP `flash` 传 `.bin`、精确 `target_part`、`base_address`，并传 `board`（推荐）或四字 `hpm_flash_cfg`；返回 `algorithm_source: "hpm-rom-api"`。在线、脱机和 CLI 都不得为 HPM 下载 Pack 或调用 `load.flm`。
+- **VCC 输出属于硬件激励**：`set_power_on` 只允许 1800/3300/5000 mV。每次 5000 mV 调用前必须让用户明确确认当前原理图、供电路径和负载可承受 5 V，并传 `confirm_5v=True`；不得根据历史确认或默认值自动输出 5 V。3.3 V 系统误接 5 V 可能永久损坏硬件。
+- **区分两类复位**：`reset` 只复位目标 MCU；`reboot_probe` 重启 MKLink 探针本身，会断开当前会话并释放串口/HIL 锁，调用后需等待 USB 重新枚举再连接。
 
-## MCP tool 速查（52 tools，按能力域）
+## MCP tool 速查（55 tools，按能力域）
 
 | 域 | Tools | 备注 |
 |---|---|---|
 | 健康 | `ping` | 无需连接，首调确认 server 活着 |
 | 项目配置 | `detect_mcu_profile` | 新 MCU 发现、FLM 候选选择、profile 固化 |
 | 连接 | `discover_probes` · `connect` · `disconnect` · `device_status` | connect 传 `axf=` 才能读变量 |
-| Flash | `flash` · `erase_chip` · `erase_sector` · `reset` | flash 一站式（MCU+FLM+时钟自动） |
+| Flash / 探针控制 | `flash` · `erase_chip` · `erase_sector` · `reset` · `set_power_on` · `reboot_probe` | `reset` 复位目标；5 V 必须逐次确认；`reboot_probe` 会断连 |
 | 内存 | `read_memory` · `write_memory` · `flush_memory` | flush_memory **自动分块**（CLI 不分块会 FAIL） |
 | 变量/寄存器 | `read_variable` · `write_variable` · `read_register` | 需先 connect(axf=) 或 load_symbols |
 | 调试 | `halt` · `resume` · `step` · `set_breakpoint` · `clear_breakpoint` · `clear_all_breakpoints` · `read_core_registers` | FPB 硬件断点 |

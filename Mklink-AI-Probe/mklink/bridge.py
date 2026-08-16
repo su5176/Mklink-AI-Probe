@@ -275,6 +275,28 @@ class MKLinkSerialBridge:
             self._echo_callback = None
             return response
 
+    def send_command_nowait(self, cmd: str) -> None:
+        """Send one REPL command without waiting for the next prompt.
+
+        This is reserved for commands such as ``reboot()`` that intentionally
+        restart the probe and therefore cannot produce a reliable trailing
+        prompt.  The serial write is flushed before returning so callers may
+        immediately close the bridge and release its process/HIL locks.
+        """
+        with self._cmd_lock:
+            if self._ctx.state not in (DeviceState.READY, DeviceState.BUSY):
+                raise ConnectionError(
+                    f"设备未就绪，当前状态: {self._ctx.state.value}。请先连接设备。"
+                )
+            if self._serial is None or not self._serial.is_open:
+                raise ConnectionError("设备串口未打开。请先连接设备。")
+            try:
+                self._serial.write((cmd + "\n").encode("utf-8"))
+                self._serial.flush()
+            except serial.SerialException as e:
+                self._ctx.state = DeviceState.ERROR
+                raise ConnectionError(f"写入串口失败: {e}") from e
+
     def send_script(self, commands: list[str]) -> list[str]:
         """批量发送命令序列，每条等待完成。"""
         results = []

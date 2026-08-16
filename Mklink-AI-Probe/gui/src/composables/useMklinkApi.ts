@@ -171,6 +171,22 @@ export function useMklinkApi() {
     return api('/api/device/reset', { method: 'POST' })
   }
 
+  async function setPowerOn(voltageMv: 1800 | 3300 | 5000, confirm5v = false) {
+    return api('/api/device/power', {
+      method: 'POST',
+      body: JSON.stringify({
+        voltage_mv: voltageMv,
+        confirm_5v: confirm5v,
+      }),
+    })
+  }
+
+  async function rebootProbe() {
+    const result = await api('/api/device/reboot', { method: 'POST' })
+    await refreshStatus()
+    return result
+  }
+
   async function eraseDevice() {
     return api('/api/device/erase', { method: 'POST' })
   }
@@ -277,6 +293,8 @@ export function useMklinkApi() {
     refreshStatus,
     flashDevice,
     resetDevice,
+    setPowerOn,
+    rebootProbe,
     eraseDevice,
     haltDevice,
     resumeDevice,

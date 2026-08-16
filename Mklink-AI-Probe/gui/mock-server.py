@@ -121,6 +121,7 @@ ONLINE_FLASH_ROOT = {"enabled": True, "version": "1.0", "cache_dir": ".mklink/on
 ONLINE_TARGETS = []
 ONLINE_JOBS_ACTIVE = None
 HARDFAULT = {"fault": False}
+SUPPORTED_POWER_VOLTAGES_MV = {1800, 3300, 5000}
 
 # ---- routing --------------------------------------------------------------
 GET_ROUTES = {
@@ -186,6 +187,22 @@ def resolve_mutation(path: str, method: str, body):
     """POST/PUT/DELETE: return a sensible success payload."""
     if path == "/api/device/connect":
         return DEVICE_STATUS
+    if path == "/api/device/power":
+        voltage_mv = body.get("voltage_mv") if isinstance(body, dict) else None
+        confirm_5v = body.get("confirm_5v", False) if isinstance(body, dict) else False
+        if type(voltage_mv) is not int or voltage_mv not in SUPPORTED_POWER_VOLTAGES_MV:
+            return {"detail": "voltage_mv must be one of 1800, 3300, or 5000"}
+        if voltage_mv == 5000 and confirm_5v is not True:
+            return {"detail": "5 V output requires explicit confirm_5v=true"}
+        return {
+            "status": "ok",
+            "power_on": True,
+            "voltage_mv": voltage_mv,
+            "stopped": [],
+            "mock": True,
+        }
+    if path == "/api/device/reboot":
+        return {"status": "rebooted", "connected": False, "stopped": [], "mock": True}
     if path == "/api/device/read-memory":
         return {"data_hex": "DEADBEEF"}
     if path == "/api/device/read-variable":

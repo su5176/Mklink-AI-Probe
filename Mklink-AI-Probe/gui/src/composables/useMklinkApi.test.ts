@@ -63,6 +63,26 @@ describe('RTT API contracts', () => {
     }))
   })
 
+  it('forwards the guarded probe voltage request exactly', async () => {
+    const api = useMklinkApi()
+    await api.setPowerOn(5000, true)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/device/power', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ voltage_mv: 5000, confirm_5v: true }),
+    }))
+  })
+
+  it('refreshes connection state after rebooting the probe', async () => {
+    const api = useMklinkApi()
+    await api.rebootProbe()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/device/reboot', expect.objectContaining({
+      method: 'POST',
+    }))
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/device/status', expect.any(Object))
+  })
+
   it('surfaces structured backend symbol-source errors', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,

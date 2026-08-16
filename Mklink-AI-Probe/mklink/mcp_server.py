@@ -380,6 +380,34 @@ def _register_flash_tools(mcp: Any) -> None:
         dev.reset()
         return {"reset": True}
 
+    @mcp.tool()
+    def set_power_on(voltage_mv: int, confirm_5v: bool = False) -> dict:
+        """Enable MKLink VCC output at exactly 1.8 V, 3.3 V, or 5 V.
+
+        Args:
+            voltage_mv: One of 1800, 3300, or 5000 millivolts.
+            confirm_5v: Must be True for every 5000 mV request, and only after
+                the user has verified that the connected target is 5 V
+                tolerant.  Applying 5 V to a 3.3 V target can destroy it.
+        """
+        dev = _connected_device()
+        dev.set_power_on(voltage_mv, confirm_5v=confirm_5v)
+        return {"power_on": True, "voltage_mv": voltage_mv}
+
+    @mcp.tool()
+    def reboot_probe() -> dict:
+        """Reboot the MKLink probe itself and release the current session.
+
+        This is different from ``reset``, which resets only the target MCU.
+        The probe disconnects and must be connected again after enumeration.
+        """
+        dev = _connected_device()
+        try:
+            dev.reboot()
+        finally:
+            _reset_device()
+        return {"rebooted": True, "connected": False}
+
 
 def _register_memory_tools(mcp: Any) -> None:
     @mcp.tool()
