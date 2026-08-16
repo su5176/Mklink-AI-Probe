@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-12T17:08:00+08:00`
+- 更新时间：`2026-08-16T13:59:11+08:00`
 - 分支：`feature/eternal-chip-gui`
-- HEAD：`feature/eternal-chip-gui 包含立芯恒方 GUI、六主题、MicroKeen 品牌资产和主题弹层 UX 精修；维护者已授权提交并推送至 origin/feature/eternal-chip-gui，尚未合并。`
+- HEAD：`feature/eternal-chip-gui 包含 c9fc938：在立芯恒方 GUI 基线上选择性同步僵尸锁修复、安全 VCC 控制、MKLink 探针重启和对应 MCP/REST/GUI 测试；既有立芯品牌界面与 HIL 锁保持不变。`
 - 远端 HEAD：`origin/master 包含 GitHub PR #10 merge commit 2f8e902 和合并后门禁收口；PR 状态为 MERGED。su5176 仓库当前没有 v0.1.6 标签或 Release。`
-- 工作树：立芯恒方 GUI 源码、测试、品牌资产、生产构建输出和项目记忆纳入功能提交；Playwright 截图、会话目录、Python 缓存和 Rust target 已加入忽略规则。
-- 当前任务：在 feature/eternal-chip-gui 上完成 MKLink AI Probe 的立芯恒方 GUI 版本并做交互精修：保留原功能布局，引入六主题设计系统、MicroKeen 顶栏产品图、新版 About 主视觉与可自动收起的受控主题面板。
-- 状态：`eternal_chip_gui_implemented_pending_hardware`
+- 工作树：功能与项目记忆均已提交，生产构建生成的 dist 哈希文件已恢复/清理；既有未跟踪 Python、egg-info 和 native build 缓存保持原样。
+- 当前任务：把主分支的僵尸锁修复、安全 VCC 控制和 MKLink 探针重启选择性同步到立芯恒方 GUI 分支，同时保留独立品牌界面和既有 HIL 锁。
+- 状态：`probe_controls_synced_hardware_gate_waived`
 
 ## 里程碑
 
@@ -28,6 +28,7 @@
 - **源码与本地 Skill 同步**：Aladdin-Wang GitHub/Gitee master 与 su5176 PR #10 已同步；用户级 Skill、完整 GUI/MCP 依赖导入和 Skill 校验通过，快速启动网页已写入当前 MICROKEEN 卷。su5176 PR #10 于 2026-08-12 合并为 2f8e902。
 - **PR #10 合并门禁复核**：GitHub 合并前状态 CLEAN、MERGEABLE，头 4d7d617 相对基线 6360843 前进 35 个提交且未落后；仓库未配置远端状态检查。本机隔离复核通过 GUI 54 文件/521 项、Vite 生产构建、Tauri Rust 12 项与 cargo check。首次 Python 全量得到 1284 passed、1 skipped；3 项仅因隔离 worktree 缺少未入库 mklink-stcp.dll 报错，在补入与 PR 完全相同 stcp_bridge 源码树生成且 SHA-256 一致的 DLL 后定向 3 项全通过。旧 Device 连接测试仍 mock 已移除的 _resolve_port，已改为 mock 当前 load_config 入口以消除本地项目配置依赖；修正后的最终 Python 全量为 1288 passed、1 skipped。PR 中既有真实 Chrome 双标签、下载器重连和 HPM/串口/RTT 真机闭环继续作为实机证据。
 - **立芯恒方 GUI 分支验收**：GUI 精修后全量 56 文件/525 项通过，Vite 生产构建、Tauri cargo check 与立芯 GUI 规范校验通过；真实 Chromium 在 1440x1000、1024x768 与 390x844 下完成 porcelain/abyss、配置、仪表盘、主题面板和 About 视觉验收。主题选择、外围点击与 Esc 均能收起面板，Esc 会把焦点还给触发按钮；390px 下修复配置标题全局样式污染并移除可见滚动条轨道。Python 全量仍沿用本分支前次 1285 passed、1 skipped 及 3 项环境缺件 setup error 证据。未执行连接、烧录或其他真机动作。
+- **探针控制与僵尸锁同步验收**：c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit。
 
 ## 架构决策
 
@@ -40,19 +41,20 @@
 - 由命令主动打开的浏览器 GUI 使用标签页会话租约；最后标签消失后正常关闭后端并释放资源，显式 --no-browser 和 Tauri sidecar 保持常驻。
 - 立芯恒方作为软件界面品牌，MicroKeen 作为烧录器硬件品牌；GUI 保留现有信息架构并统一使用 porcelain、mica、aqua、abyss、graphite、aurora 六主题。
 - 主题入口使用受控弹层而非原生 details/select；选择主题、点击外围或按 Esc 后收起，Esc 关闭时恢复触发按钮焦点。
+- VCC 仅接受 1800、3300、5000 mV；5000 mV 必须在 GUI 和后端同时显式确认，避免误将 5V 加到 3.3V 系统。
+- reboot() 仅重启 MKLink 探针并主动关闭连接、释放串口与 HIL 锁；目标 MCU 复位继续使用 reset()/cmd.set_reset()。
 
 ## 真机环境
 
 - **probe**：维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。
 - **target**：ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。
-- **permission**：维护者已授权创建分支、实现立芯恒方 GUI，并提交、推送 feature/eternal-chip-gui；本次未授权连接、烧录、发布、合并或 Gitee 同步。
+- **permission**：用户已授权本地合并 FLM 修复与本次改进到 master/feature/eternal-chip-gui，并明确豁免本次真机门禁；未授权推送、发布、烧录或其他真机动作。
 
 ## 下一动作
 
-1. 在明确授权的下载器与目标板上完成连接、烧录、RTT/数据流和资源释放真机闭环，或取得硬件门禁豁免。
-2. 维护者审阅已推送的 feature/eternal-chip-gui；完成真机闭环或取得门禁豁免后再发起合并。
-3. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
-4. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
+1. 需要补充硬件证据时，在额定电压已核对的目标板上分别验证 1.8V/3.3V，5V 仅使用明确可承受 5V 的负载，并验证探针重启后的重新枚举与锁释放。
+2. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
+3. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
 
 ## 已知限制
 
@@ -62,8 +64,7 @@
 - 先楫定制店铺尚无权威链接，菜单项保持禁用。
 - USB Web Entry 和安装更新仍需更多平台与干净 Windows 验证。
 - 发布器默认仓库参数仍含旧备用名；下次发布前应修正或继续显式传入两端 Aladdin-Wang 仓库。
-- 本机缺少 Go 1.25/C 编译环境与预构建 mklink-stcp.dll，导致 3 个 Site Agent 打包测试无法完成。
-- 本次 GUI 变更尚未获得下载器与目标板真机闭环证据，因此不满足合并门禁。
+- 本次按用户豁免未取得 VCC 输出与探针重启的真机闭环证据；软件协议、安全门禁和 mock 浏览器闭环已通过。
 
 ## 延续协议
 
