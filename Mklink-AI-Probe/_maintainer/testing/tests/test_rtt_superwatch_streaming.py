@@ -1306,6 +1306,63 @@ def test_superwatch_adds_catalog_array_leaves_and_merges_contiguous_reads(tmp_pa
     ]
 
 
+def test_superwatch_array_snapshot_keeps_latest_values_out_of_time_channels(tmp_path):
+    from mklink.dwarf_parser import DwarfInfo, DwarfVariable
+    from mklink.symbol_catalog import SymbolCatalog
+
+    axf = tmp_path / "app.axf"
+    axf.write_bytes(b"axf")
+    info = DwarfInfo(
+        base_types={1: ("int16_t", 2)},
+        arrays={2: (1, 8)},
+        variables={
+            "samples": DwarfVariable(
+                "samples", 10, 2, 0x20000020, 8, "int16_t[]",
+            ),
+        },
+    )
+    catalog = SymbolCatalog.from_dwarf(
+        info, axf_path=str(axf), ram_ranges=[(0x20000000, 0x20010000)]
+    )
+    device = SimpleNamespace(
+        _dwarf_info=info,
+        symbol_catalog=catalog,
+        _project_root=str(tmp_path),
+        _port=None,
+    )
+    manager = SuperWatchStreamManager()
+    manager.prepare(device)
+
+    selected = manager.select_array_snapshot("samples")
+    scalar_items, sampled_items, blocks = manager._sampling_layout_locked()
+
+    assert selected["snapshot"]["count"] == 4
+    assert selected["snapshot"]["values"] == []
+    assert scalar_items == ()
+    assert [item.name for item in sampled_items] == [
+        f"samples[{index}]" for index in range(4)
+    ]
+    assert [(block.address, block.size) for block in blocks] == [
+        (0x20000020, 8),
+    ]
+    assert manager.list_watches() == []
+
+    assert manager._update_array_snapshot_locked([{
+        "timestamp_us": 25,
+        "samples[0]": -2,
+        "samples[1]": -1,
+        "samples[2]": 3,
+        "samples[3]": 5,
+    }])
+    snapshot = manager.get_array_snapshot()["snapshot"]
+    assert snapshot["sequence"] == 1
+    assert snapshot["timestamp_us"] == 25
+    assert snapshot["values"] == [-2.0, -1.0, 3.0, 5.0]
+
+    assert manager.clear_array_snapshot() == {"snapshot": None}
+    assert manager.get_array_snapshot() == {"snapshot": None}
+
+
 def test_dump_stream_decodes_catalog_typedef_with_scalar_kind_and_size():
     from mklink.dump_memory import decode_frame_to_points
 

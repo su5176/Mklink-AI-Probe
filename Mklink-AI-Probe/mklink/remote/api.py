@@ -2114,6 +2114,38 @@ def create_app(
         items = await run_in_threadpool(managers["superwatch"].list_watches)
         return {"items": items}
 
+    @app.get("/api/dash/superwatch/array-snapshot")
+    async def superwatch_array_snapshot():
+        managers = get_managers()
+        return await run_in_threadpool(
+            managers["superwatch"].get_array_snapshot,
+        )
+
+    @app.post("/api/dash/superwatch/array-snapshot/select")
+    async def superwatch_array_snapshot_select(name: str = Body(..., embed=True)):
+        managers = get_managers()
+        manager = managers["superwatch"]
+
+        def prepare_and_select():
+            if manager._runtime is None and _state["device"] and _state["device"].connected:
+                manager.prepare(_state["device"])
+            return manager.select_array_snapshot(name)
+
+        try:
+            result = await run_in_threadpool(prepare_and_select)
+        except SymbolCatalogError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @app.post("/api/dash/superwatch/array-snapshot/clear")
+    async def superwatch_array_snapshot_clear():
+        managers = get_managers()
+        return await run_in_threadpool(
+            managers["superwatch"].clear_array_snapshot,
+        )
+
     @app.get("/api/dash/superwatch/inspect")
     async def superwatch_inspect(name: str):
         if not _state["device"] or not _state["device"].connected:

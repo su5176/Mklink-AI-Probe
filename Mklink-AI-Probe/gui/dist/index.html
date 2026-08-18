@@ -69,9 +69,7 @@
       }
       #startup-progress-value {
         color: #8bbcf7;
-        font:
-          600 12px/1 Consolas,
-          monospace;
+        font: 600 12px/1 Consolas, monospace;
       }
       .startup-progress {
         width: 100%;
@@ -94,14 +92,8 @@
         text-align: center;
       }
       @keyframes startup-image-enter {
-        from {
-          opacity: 0;
-          transform: scale(0.975);
-        }
-        to {
-          opacity: 1;
-          transform: scale(1);
-        }
+        from { opacity: 0; transform: scale(0.975); }
+        to { opacity: 1; transform: scale(1); }
       }
       @media (max-width: 720px) {
         #startup-splash {
@@ -124,8 +116,8 @@
         }
       }
     </style>
-    <script type="module" crossorigin src="/assets/index-CDebp3AN.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/core-DxEK1kPB.js" />
+    <script type="module" crossorigin src="/assets/index-DUbDpJzC.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/core-DxEK1kPB.js">
   </head>
   <body>
     <div id="app"></div>
@@ -158,36 +150,36 @@
     </div>
     <script>
       (() => {
-        const splash = document.getElementById("startup-splash");
-        const progress = document.getElementById("startup-progress");
-        const fill = document.getElementById("startup-progress-fill");
-        const valueLabel = document.getElementById("startup-progress-value");
-        const status = document.getElementById("startup-status");
-        let value = 8;
-        let timer = 0;
+        const splash = document.getElementById('startup-splash')
+        const progress = document.getElementById('startup-progress')
+        const fill = document.getElementById('startup-progress-fill')
+        const valueLabel = document.getElementById('startup-progress-value')
+        const status = document.getElementById('startup-status')
+        let value = 8
+        let timer = 0
 
         const update = (nextValue, nextStatus) => {
-          value = Math.max(value, Math.min(100, Math.round(nextValue)));
-          fill.style.width = `${value}%`;
-          valueLabel.textContent = `${value}%`;
-          progress.setAttribute("aria-valuenow", String(value));
-          if (nextStatus) status.textContent = nextStatus;
-        };
+          value = Math.max(value, Math.min(100, Math.round(nextValue)))
+          fill.style.width = `${value}%`
+          valueLabel.textContent = `${value}%`
+          progress.setAttribute('aria-valuenow', String(value))
+          if (nextStatus) status.textContent = nextStatus
+        }
 
         timer = window.setInterval(() => {
-          if (value < 18) update(value + 1);
-        }, 320);
+          if (value < 18) update(value + 1)
+        }, 320)
 
         window.__MKLINK_STARTUP__ = {
           update,
           finish() {
-            window.clearInterval(timer);
-            update(100);
-            splash.classList.add("is-complete");
-            window.setTimeout(() => splash.remove(), 260);
+            window.clearInterval(timer)
+            update(100)
+            splash.classList.add('is-complete')
+            window.setTimeout(() => splash.remove(), 260)
           },
-        };
-      })();
-    </script>
+        }
+      })()
+    </script>
   </body>
 </html>

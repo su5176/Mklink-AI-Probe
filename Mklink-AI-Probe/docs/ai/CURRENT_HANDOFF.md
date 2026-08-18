@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-16T14:11:23+08:00`
-- 分支：`master`
-- HEAD：`master 已包含 FLM 修复 8da2d2d、HIL 锁与续租、探针控制修复 9ec1b9f 和真机门禁豁免记录；feature/eternal-chip-gui 保持独立品牌界面并包含同一探针控制改进。`
-- 远端 HEAD：`用户已授权将 master 与 feature/eternal-chip-gui 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。`
-- 工作树：本次功能与交接均已提交，tracked 工作树干净；Vite 哈希产物已恢复，既有未跟踪生成目录保持不变且不纳入 Git。
-- 当前任务：FLM 查找修复、僵尸串口锁修复、安全 VCC 1800/3300/5000、MKLink reboot 与 HIL 锁已在 master 和独立立芯恒方 GUI 分支完成验证、合并并推送到 GitHub origin。
-- 状态：`probe_controls_pushed`
+- 更新时间：`2026-08-18T17:10:00+08:00`
+- 分支：`feature/superwatch-array-snapshot`
+- HEAD：`功能分支基于 su5176/master；核心提交 9021ecc 新增 SuperWatch 一维标量数组最新快照曲线。`
+- 远端 HEAD：`功能分支已推送到 a2160823797-wq 分叉，并向 su5176/Mklink-AI-Probe 提交 Draft PR #12；上游 master 未修改。`
+- 工作树：数组快照实现、测试、生产构建和上游 PR 已完成；当前只追加 PR 交接文档。
+- 当前任务：SuperWatch 数组快照曲线已作为 Draft PR #12 提交到 su5176/Mklink-AI-Probe，等待上游评审。
+- 状态：`superwatch_array_snapshot_pr_open`
 
 ## 里程碑
 
@@ -21,6 +21,7 @@
 
 ## 验证证据
 
+- **SuperWatch 数组快照曲线**：聚焦 Python 116 项和 GUI 17 项通过；上游基线 GUI 全量 55 文件/527 项通过，Vite 生产构建通过。上游基线 Python 全量 1302 passed、1 skipped，3 项仅因当前源码树没有预置 native/stcp_bridge/build/mklink-stcp.dll 且本机没有 Go/C 编译工具链而在 Site Agent 干净打包准备阶段报错。真实网页连接下载器并加载包含 uart_comm_rx_buf 的 AXF，uint8_t[128] 快照序号持续递增，页面绘制 0..127 索引曲线；实测约 720-735 Hz，普通时间通道保持 0 pts、前端历史预计 0 MB，证明数组未展开写入时间历史缓冲。验收后已停止 SuperWatch、断开设备并释放本地服务与硬件资源。
 - **僵尸锁与探针电源/重启控制**：Windows PID 判定现同时检查 OpenProcess 与 GetExitCodeProcess；真实已退出子进程仍保留句柄时正确返回死亡，serial_MKLINK_AUTO_CONNECT.lock 回归可自动删除。Device/MCP/REST/GUI 新增 1800/3300/5000 mV 与 probe reboot；5V 在 Device、REST、MCP、GUI 四层要求逐次显式确认，reboot 后释放串口与 HIL 锁，活动 RTT/SystemView 在参数校验通过后先安全停止。最终 Python 1300 passed、1 skipped；GUI 54 文件/525 项、Vite 生产构建、Tauri cargo check 通过。真实 Playwright 验证 3.3V 请求 confirm_5v=false、取消 5V 不发请求、确认 5V 才发送 confirm_5v=true、reboot 需确认。浏览器使用模拟后端，未对硬件输出电压；项目无已确认 bench.yaml，维护者于 2026-08-16 明确豁免本次真机门禁，不得把该豁免表述为真机验证通过。
 - **双分支本地合并与隔离**：master 与 feature/eternal-chip-gui 均完成本地快进。立芯分支运行时 c9fc938 通过 Python 全量覆盖（首轮 1297 passed、1 skipped，PyPI 恢复后受影响文件 7/7 通过）、GUI 56 文件/529 项、生产构建、cargo check 和真实 Chromium + mock 验收。两分支 mklink 核心、Skill 与探针控制回归测试无差异；HIL 锁提交分别位于两条祖先链，立芯品牌提交 7ba8f57 不是 master 祖先。用户随后明确授权，两条分支通过 Git 原子推送同步到 GitHub origin。
 - **FLM 查找修复选择性合并**：从 origin/master 8f6a094 创建 fix/pdsc-device-algorithm，仅摘取原提交 68d4e4f 为 8da2d2d；差异只有 mklink/mcu_detect.py 与 mklink/mcu_profiles.json，无 GUI 或 HIL 锁文件。真实 D:\Keil_v5\ARM\PACK 中 Keil.STM32F4xx_DFP.pdsc 对 STM32F411CEUx/RETx 均命中 device 级 CMSIS/Flash/STM32F4xx_512.FLM。Python 全量先得 1282 passed、1 skipped，环境性失败随后逐项联网复跑通过；GUI 54 文件/521 项、Vite 生产构建、Tauri cargo check 均通过。Site Agent 打包补入与当前 stcp_bridge 源码哈希一致的本地 DLL 后 3 项通过，DLL 与测试产物均不提交。
@@ -33,6 +34,7 @@
 
 ## 架构决策
 
+- SuperWatch 数组快照 MVP 只支持 1..4096 个元素的一维标量数组；同一时间选择一个数组，后端随既有采样循环更新最新值，前端约 20 Hz 拉取并按索引绘制，不保存数组时间历史。
 - Windows 串口锁 owner 只有在进程退出码为 STILL_ACTIVE 时才判定存活；访问拒绝或查询失败保持保守，不自动删除可能属于活动进程的锁。
 - VCC 只接受 1800/3300/5000 mV；5000 mV 每次都需显式 confirm_5v=True，GUI 另有危险确认；reset 复位目标 MCU，reboot_probe 重启探针并断开会话。
 - 历史端口是软偏好，可回退自动发现；当前会话手选端口首次保持严格约束，失败后切回自动搜索。
@@ -51,12 +53,14 @@
 
 ## 下一动作
 
-1. 监控 v0.1.6 用户反馈，运行时修复从新的 fix/feature 分支开始。
-2. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
-3. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
+1. 跟进 su5176/Mklink-AI-Probe Draft PR #12 的评审反馈；上游合并后再由维护者决定版本与发布。
+2. 监控 v0.1.6 用户反馈，运行时修复从新的 fix/feature 分支开始。
+3. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
+4. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
 
 ## 已知限制
 
+- 当前源码树未包含有效的 native/stcp_bridge/build/mklink-stcp.dll，导致与本功能无关的 3 个 Site Agent 干净打包测试无法建立前置条件；其余 Python 全量测试通过。
 - VCC 与探针 reboot 无本次提交对应的真机 HIL 证据；维护者已明确豁免，真实浏览器仅验证了受保护的请求路径。
 - 高事件率 SystemView 仍可能溢出目标 RTT 缓冲。
 - V4 脱机首次触发的瞬时空失败仍需冷启动复现。

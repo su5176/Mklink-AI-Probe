@@ -1396,6 +1396,7 @@ class SuperWatchStreamManager:
         self._acquisition_mode = "idle"
         self._stream_integrity: dict[str, int] = {}
         self._dump_restart = threading.Event()
+        self._array_snapshot: dict[str, Any] | None = None
         self.set_stream_hub(stream_hub)
 
     def set_stream_hub(self, stream_hub) -> None:
@@ -1456,6 +1457,7 @@ class SuperWatchStreamManager:
                         for path in selected_paths:
                             rebound.add(path)
                     self._runtime = rebound
+                    self._rebind_array_snapshot_locked(new_catalog)
                     self._origin_us = None
                     self._flush_binary_batch_locked()
                     self._rebuild_metadata_cache_locked(publish=True)
@@ -1484,6 +1486,61 @@ class SuperWatchStreamManager:
             )
             self._rebuild_metadata_cache_locked(publish=True)
 
+    def _build_array_snapshot_locked(self, catalog, name: str) -> dict[str, Any]:
+        from mklink.superwatch import WatchItem
+
+        descriptors = catalog.array_descriptors(name)
+        items = tuple(
+            WatchItem(
+                descriptor.path,
+                descriptor.address,
+                descriptor.type_name,
+                descriptor.size,
+                enum_values={
+                    value: label for label, value in descriptor.enum_values.items()
+                },
+                scalar_kind=(
+                    "signed"
+                    if descriptor.scalar_kind == "enum" and descriptor.enum_signed
+                    else descriptor.scalar_kind
+                ),
+            )
+            for descriptor in descriptors
+        )
+        return {
+            "name": name,
+            "type_name": descriptors[0].type_name,
+            "address": descriptors[0].address,
+            "element_size": descriptors[0].size,
+            "count": len(descriptors),
+            "items": items,
+            "sequence": 0,
+            "timestamp_us": None,
+            "values": [],
+        }
+
+    def _rebind_array_snapshot_locked(self, catalog) -> None:
+        if self._array_snapshot is None:
+            return
+        name = self._array_snapshot["name"]
+        try:
+            self._array_snapshot = self._build_array_snapshot_locked(catalog, name)
+        except Exception:
+            self._array_snapshot = None
+
+    def _sampling_layout_locked(self):
+        from mklink.superwatch import build_read_blocks
+
+        scalar_items = tuple(self._runtime.items) if self._runtime is not None else ()
+        if self._array_snapshot is None:
+            blocks = tuple(self._runtime.blocks) if self._runtime is not None else ()
+            return scalar_items, scalar_items, blocks
+        items_by_name = {item.name: item for item in scalar_items}
+        for item in self._array_snapshot["items"]:
+            items_by_name.setdefault(item.name, item)
+        items = tuple(items_by_name.values())
+        return scalar_items, items, tuple(build_read_blocks(items, max_gap=256))
+
     def start(self, device) -> None:
         if self._thread is not None and self._thread.is_alive():
             if self.running:
@@ -1510,11 +1567,10 @@ class SuperWatchStreamManager:
                         if (
                             self._collecting.is_set()
                             and self._runtime is not None
-                            and bool(self._runtime.items)
+                            and bool(self._runtime.items or self._array_snapshot)
                         ):
                             runtime = self._runtime
-                            blocks = tuple(runtime.blocks)
-                            items = tuple(runtime.items)
+                            scalar_items, items, blocks = self._sampling_layout_locked()
                             config_generation = self._config_generation
                             origin_us = self._origin_us
                         else:
@@ -1585,10 +1641,14 @@ class SuperWatchStreamManager:
                                             self._dropped_read_cycles += 1
                                             break
                                         self._origin_us = origin_us
-                                        if self._publish_sample_points_locked(
+                                        published = self._publish_sample_points_locked(
                                             points,
-                                            names=tuple(item.name for item in items),
-                                        ):
+                                            names=tuple(item.name for item in scalar_items),
+                                        )
+                                        snapshot_updated = self._update_array_snapshot_locked(points)
+                                        if snapshot_updated and not published:
+                                            self._record_sample_rate_locked()
+                                        if published or snapshot_updated:
                                             self._completed_read_cycles += 1
                         finally:
                             session.stop()
@@ -1614,11 +1674,15 @@ class SuperWatchStreamManager:
                                 self._dropped_read_cycles += 1
                             else:
                                 self._origin_us = result.origin_us
-                                self._publish_sample_points_locked(
+                                published = self._publish_sample_points_locked(
                                     result.points,
-                                    names=tuple(item.name for item in items),
+                                    names=tuple(item.name for item in scalar_items),
                                 )
-                                self._completed_read_cycles += 1
+                                snapshot_updated = self._update_array_snapshot_locked(result.points)
+                                if snapshot_updated and not published:
+                                    self._record_sample_rate_locked()
+                                if published or snapshot_updated:
+                                    self._completed_read_cycles += 1
                     except Exception as e:
                         with self._read_lock:
                             self._read_errors += 1
@@ -1828,6 +1892,7 @@ class SuperWatchStreamManager:
                     raise SuperWatchTransactionError("rebind", exc) from exc
                 with self._read_lock:
                     self._runtime = new_runtime
+                    self._rebind_array_snapshot_locked(new_catalog)
                     self._origin_us = None
                     self._flush_binary_batch_locked()
                     self._rebuild_metadata_cache_locked(publish=True)
@@ -1858,6 +1923,70 @@ class SuperWatchStreamManager:
             result = self._runtime.remove(name)
             self._rebuild_metadata_cache_locked(publish=True)
             return {"item": result}
+
+    def select_array_snapshot(self, name: str) -> dict:
+        with self._read_lock:
+            if self._runtime is None or self._runtime.symbol_catalog is None:
+                return {"error": "SuperWatch symbol catalog is unavailable"}
+            if self._array_snapshot is not None and self._array_snapshot["name"] == name:
+                return {"snapshot": self._array_snapshot_payload_locked()}
+            self._array_snapshot = self._build_array_snapshot_locked(
+                self._runtime.symbol_catalog, name,
+            )
+            self._config_generation += 1
+            self._origin_us = None
+            self._dump_restart.set()
+            return {"snapshot": self._array_snapshot_payload_locked()}
+
+    def clear_array_snapshot(self) -> dict:
+        with self._read_lock:
+            if self._array_snapshot is not None:
+                self._array_snapshot = None
+                self._config_generation += 1
+                self._origin_us = None
+                self._dump_restart.set()
+            return {"snapshot": None}
+
+    def get_array_snapshot(self) -> dict:
+        with self._read_lock:
+            return {"snapshot": self._array_snapshot_payload_locked()}
+
+    def _array_snapshot_payload_locked(self) -> dict | None:
+        if self._array_snapshot is None:
+            return None
+        return {
+            key: value
+            for key, value in self._array_snapshot.items()
+            if key != "items"
+        }
+
+    def _update_array_snapshot_locked(self, points) -> bool:
+        if self._array_snapshot is None:
+            return False
+        names = tuple(item.name for item in self._array_snapshot["items"])
+        merged: dict[str, Any] = {}
+        timestamp_us = None
+        for point in points:
+            for name in names:
+                if name in point:
+                    merged[name] = point[name]
+            if point.get("timestamp_us") is not None:
+                timestamp_us = point["timestamp_us"]
+        if any(name not in merged for name in names):
+            return False
+        try:
+            values = [float(merged[name]) for name in names]
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in values):
+            return False
+        self._array_snapshot = {
+            **self._array_snapshot,
+            "sequence": self._array_snapshot["sequence"] + 1,
+            "timestamp_us": timestamp_us,
+            "values": values,
+        }
+        return True
 
     def publish_metadata(self, *, force: bool = False) -> int:
         with self._read_lock:
@@ -1929,6 +2058,13 @@ class SuperWatchStreamManager:
             return False
         if time.monotonic() - self._last_metadata_publish_monotonic >= 1.0:
             self._publish_cached_metadata()
+        self._record_sample_rate_locked()
+        self._pending_samples.append(row)
+        if len(self._pending_samples) >= self._batch_samples:
+            self._flush_binary_batch_locked()
+        return True
+
+    def _record_sample_rate_locked(self) -> None:
         completed_at = self._clock()
         self._rate_timestamps.append(completed_at)
         cutoff = completed_at - 1.0
@@ -1941,10 +2077,6 @@ class SuperWatchStreamManager:
             )
         else:
             self._actual_rate = 0.0
-        self._pending_samples.append(row)
-        if len(self._pending_samples) >= self._batch_samples:
-            self._flush_binary_batch_locked()
-        return True
 
     def _flush_binary_batch(self) -> bool:
         with self._read_lock:

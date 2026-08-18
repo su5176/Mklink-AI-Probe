@@ -18,6 +18,7 @@ from mklink.elf_backend import ElfSection
 from mklink.c_layout import CLayoutError
 from mklink.symbol_catalog import (
     SymbolCatalog,
+    SymbolCatalogError,
     SymbolValueError,
     decode_descriptor,
     encode_descriptor,
@@ -139,6 +140,8 @@ def test_catalog_pages_large_array_without_losing_later_elements(tmp_path):
     root = next(item for item in catalog.browse_roots() if item.path == "values")
     assert root.kind == "branch"
     assert root.child_count == 300
+    assert root.array_dimensions == (300,)
+    assert root.snapshot_eligible is True
     ranges = catalog.browse_children("values")
     assert [(item.label, item.range_start, item.range_end) for item in ranges] == [
         ("[0..255]", 0, 255),
@@ -148,6 +151,29 @@ def test_catalog_pages_large_array_without_losing_later_elements(tmp_path):
     assert len(tail) == 44
     assert tail[0].descriptor.path == "values[256]"
     assert tail[-1].descriptor.path == "values[299]"
+
+
+def test_catalog_resolves_one_dimensional_scalar_array_snapshots(tmp_path):
+    axf = tmp_path / "app.axf"
+    axf.write_bytes(b"axf")
+    catalog = SymbolCatalog.from_dwarf(
+        _dwarf_fixture(),
+        axf_path=str(axf),
+        ram_ranges=[(0x20000000, 0x20010000)],
+    )
+
+    descriptors = catalog.array_descriptors("buffer")
+
+    assert [item.path for item in descriptors] == [
+        f"buffer[{index}]" for index in range(8)
+    ]
+    assert [item.address for item in descriptors] == [
+        0x20000060 + index * 2 for index in range(8)
+    ]
+    with pytest.raises(SymbolCatalogError, match="not an array"):
+        catalog.array_descriptors("buffer[0]")
+    with pytest.raises(SymbolCatalogError, match="scalar numeric"):
+        catalog.array_descriptors("controllers")
 
 
 def test_catalog_pages_struct_arrays_by_direct_element(tmp_path):
@@ -195,6 +221,9 @@ def test_catalog_pages_each_dimension_of_nested_arrays(tmp_path):
     )
 
     rows = catalog.browse_children("matrix")
+    root = next(item for item in catalog.browse_roots() if item.path == "matrix")
+    assert root.array_dimensions == (4, 300)
+    assert root.snapshot_eligible is False
     assert [item.path for item in rows] == [f"matrix[{index}]" for index in range(4)]
     assert all(item.child_count == 300 for item in rows)
     ranges = catalog.browse_children("matrix[2]")

@@ -1,22 +1,22 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-16T14:11:23+08:00",
+  "updated_at": "2026-08-18T17:10:00+08:00",
   "repository": {
     "url": "https://github.com/su5176/Mklink-AI-Probe",
     "project_root": "Mklink-AI-Probe",
-    "branch": "master",
-    "head": "master 已包含 FLM 修复 8da2d2d、HIL 锁与续租、探针控制修复 9ec1b9f 和真机门禁豁免记录；feature/eternal-chip-gui 保持独立品牌界面并包含同一探针控制改进。",
-    "remote_head": "用户已授权将 master 与 feature/eternal-chip-gui 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。",
-    "working_tree": "本次功能与交接均已提交，tracked 工作树干净；Vite 哈希产物已恢复，既有未跟踪生成目录保持不变且不纳入 Git。"
+    "branch": "feature/superwatch-array-snapshot",
+    "head": "功能分支基于 su5176/master；核心提交 9021ecc 新增 SuperWatch 一维标量数组最新快照曲线。",
+    "remote_head": "功能分支已推送到 a2160823797-wq 分叉，并向 su5176/Mklink-AI-Probe 提交 Draft PR #12；上游 master 未修改。",
+    "working_tree": "数组快照实现、测试、生产构建和上游 PR 已完成；当前只追加 PR 交接文档。"
   },
   "mission": {
     "product": "维护 MKLink/MicroLink 的烧录、调试、数据流、Web/Tauri GUI、AI Skill 和远程 Site Agent。",
     "maintenance": "交接只保留当前基线、最新证据、有效约束、限制和下一动作；历史从 Git 查询。"
   },
   "current_session": {
-    "status": "probe_controls_pushed",
-    "current_task": "FLM 查找修复、僵尸串口锁修复、安全 VCC 1800/3300/5000、MKLink reboot 与 HIL 锁已在 master 和独立立芯恒方 GUI 分支完成验证、合并并推送到 GitHub origin。",
-    "release": "PR #10 保留已发布 v0.1.6 的代码基线且不移动标签。Aladdin-Wang fork 的 v0.1.6 发布记录属于贡献者仓库；su5176 目标仓库当前没有 v0.1.6 标签或 Release，本次未授权发布。"
+    "status": "superwatch_array_snapshot_pr_open",
+    "current_task": "SuperWatch 数组快照曲线已作为 Draft PR #12 提交到 su5176/Mklink-AI-Probe，等待上游评审。",
+    "release": "本次改为向 su5176/Mklink-AI-Probe 提交通用功能 Draft PR；不发布、不签名、不创建标签或 Release，也不更新自动升级清单。"
   },
   "milestones": [
     {
@@ -41,6 +41,10 @@
     }
   ],
   "verification": [
+    {
+      "area": "SuperWatch 数组快照曲线",
+      "result": "聚焦 Python 116 项和 GUI 17 项通过；上游基线 GUI 全量 55 文件/527 项通过，Vite 生产构建通过。上游基线 Python 全量 1302 passed、1 skipped，3 项仅因当前源码树没有预置 native/stcp_bridge/build/mklink-stcp.dll 且本机没有 Go/C 编译工具链而在 Site Agent 干净打包准备阶段报错。真实网页连接下载器并加载包含 uart_comm_rx_buf 的 AXF，uint8_t[128] 快照序号持续递增，页面绘制 0..127 索引曲线；实测约 720-735 Hz，普通时间通道保持 0 pts、前端历史预计 0 MB，证明数组未展开写入时间历史缓冲。验收后已停止 SuperWatch、断开设备并释放本地服务与硬件资源。"
+    },
     {
       "area": "僵尸锁与探针电源/重启控制",
       "result": "Windows PID 判定现同时检查 OpenProcess 与 GetExitCodeProcess；真实已退出子进程仍保留句柄时正确返回死亡，serial_MKLINK_AUTO_CONNECT.lock 回归可自动删除。Device/MCP/REST/GUI 新增 1800/3300/5000 mV 与 probe reboot；5V 在 Device、REST、MCP、GUI 四层要求逐次显式确认，reboot 后释放串口与 HIL 锁，活动 RTT/SystemView 在参数校验通过后先安全停止。最终 Python 1300 passed、1 skipped；GUI 54 文件/525 项、Vite 生产构建、Tauri cargo check 通过。真实 Playwright 验证 3.3V 请求 confirm_5v=false、取消 5V 不发请求、确认 5V 才发送 confirm_5v=true、reboot 需确认。浏览器使用模拟后端，未对硬件输出电压；项目无已确认 bench.yaml，维护者于 2026-08-16 明确豁免本次真机门禁，不得把该豁免表述为真机验证通过。"
@@ -79,6 +83,7 @@
     }
   ],
   "decisions": [
+    "SuperWatch 数组快照 MVP 只支持 1..4096 个元素的一维标量数组；同一时间选择一个数组，后端随既有采样循环更新最新值，前端约 20 Hz 拉取并按索引绘制，不保存数组时间历史。",
     "Windows 串口锁 owner 只有在进程退出码为 STILL_ACTIVE 时才判定存活；访问拒绝或查询失败保持保守，不自动删除可能属于活动进程的锁。",
     "VCC 只接受 1800/3300/5000 mV；5000 mV 每次都需显式 confirm_5v=True，GUI 另有危险确认；reset 复位目标 MCU，reboot_probe 重启探针并断开会话。",
     "历史端口是软偏好，可回退自动发现；当前会话手选端口首次保持严格约束，失败后切回自动搜索。",
@@ -95,6 +100,7 @@
     "permission": "维护者已授权本次 bug/特性开发、本地分支合并及 master/feature/eternal-chip-gui 的 GitHub origin 推送，并于 2026-08-16 明确豁免 VCC/reboot 真机门禁；该豁免不授权任何 5V 实机输出。标签、Release、Gitee 同步和破坏性烧录仍需单独授权。"
   },
   "known_limits": [
+    "当前源码树未包含有效的 native/stcp_bridge/build/mklink-stcp.dll，导致与本功能无关的 3 个 Site Agent 干净打包测试无法建立前置条件；其余 Python 全量测试通过。",
     "VCC 与探针 reboot 无本次提交对应的真机 HIL 证据；维护者已明确豁免，真实浏览器仅验证了受保护的请求路径。",
     "高事件率 SystemView 仍可能溢出目标 RTT 缓冲。",
     "V4 脱机首次触发的瞬时空失败仍需冷启动复现。",
@@ -104,6 +110,7 @@
     "发布器默认仓库参数仍含旧备用名；下次发布前应修正或继续显式传入两端 Aladdin-Wang 仓库。"
   ],
   "next_actions": [
+    "跟进 su5176/Mklink-AI-Probe Draft PR #12 的评审反馈；上游合并后再由维护者决定版本与发布。",
     "监控 v0.1.6 用户反馈，运行时修复从新的 fix/feature 分支开始。",
     "下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。",
     "需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。"

@@ -99,23 +99,41 @@
     <div v-else class="variable-groups">
       <h3 class="variable-root-heading">{{ tr('全局变量', 'Global Variables') }}</h3>
       <template v-for="row in rows" :key="row.node.key">
-        <button
+        <div
           v-if="row.node.kind === 'branch' || row.node.kind === 'range'"
           class="branch-row"
-          type="button"
-          :data-testid="`branch-${row.node.key}`"
           :title="row.node.key"
-          :style="{ paddingLeft: rowIndent(row.depth) }"
-          @click="toggleBranch(row.node)"
         >
-          <LoaderCircle v-if="catalog.browseLoading.value.has(row.node.key)" class="branch-spinner" :size="15" aria-hidden="true" />
-          <ChevronDown v-else-if="row.expanded" :size="15" aria-hidden="true" />
-          <ChevronRight v-else :size="15" aria-hidden="true" />
-          <span class="branch-name">{{ row.node.label }}</span>
-          <span v-if="row.node.childCount !== null" class="branch-count">
-            {{ row.node.kind === 'range' ? row.node.childCount : `${row.selectedLeafCount} / ${row.node.childCount}` }}
-          </span>
-        </button>
+          <button
+            class="branch-toggle"
+            type="button"
+            :data-testid="`branch-${row.node.key}`"
+            :style="{ paddingLeft: rowIndent(row.depth) }"
+            @click="toggleBranch(row.node)"
+          >
+            <LoaderCircle v-if="catalog.browseLoading.value.has(row.node.key)" class="branch-spinner" :size="15" aria-hidden="true" />
+            <ChevronDown v-else-if="row.expanded" :size="15" aria-hidden="true" />
+            <ChevronRight v-else :size="15" aria-hidden="true" />
+            <span class="branch-name">{{ row.node.label }}</span>
+            <span v-if="row.node.childCount !== null" class="branch-count">
+              {{ row.node.kind === 'range' ? row.node.childCount : `${row.selectedLeafCount} / ${row.node.childCount}` }}
+            </span>
+          </button>
+          <button
+            v-if="isArraySnapshotNode(row.node)"
+            class="snapshot-button"
+            :class="{ active: snapshotPath === row.node.key }"
+            type="button"
+            :data-testid="`snapshot-${row.node.key}`"
+            :disabled="snapshotBusy === row.node.key"
+            :title="snapshotPath === row.node.key ? tr('关闭数组快照曲线', 'Close array snapshot curve') : tr('显示数组快照曲线', 'Show array snapshot curve')"
+            :aria-label="snapshotPath === row.node.key ? tr(`关闭 ${row.node.key} 快照曲线`, `Close ${row.node.key} snapshot curve`) : tr(`显示 ${row.node.key} 快照曲线`, `Show ${row.node.key} snapshot curve`)"
+            :aria-pressed="snapshotPath === row.node.key"
+            @click="toggleArraySnapshot(row.node)"
+          >
+            <Activity :size="15" aria-hidden="true" />
+          </button>
+        </div>
         <button
           v-else-if="row.node.kind === 'container' && row.node.container"
           class="container-row"
@@ -289,7 +307,7 @@
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
-import { ChevronDown, ChevronRight, Code2, Eye, EyeOff, LoaderCircle, Plus, RefreshCw, X } from '@lucide/vue'
+import { Activity, ChevronDown, ChevronRight, Code2, Eye, EyeOff, LoaderCircle, Plus, RefreshCw, X } from '@lucide/vue'
 import { useSymbolCatalog } from '../../composables/useSymbolCatalog'
 import { useToast } from '../../composables/useToast'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
@@ -306,14 +324,17 @@ const props = withDefaults(defineProps<{
   symbolError?: string
   latestValues: Record<string, number | boolean>
   hiddenChannels?: ReadonlySet<string>
+  snapshotPath?: string | null
 }>(), {
   symbolLoaded: true,
   symbolError: '',
+  snapshotPath: null,
 })
 
 const emit = defineEmits<{
   'visibility-change': [path: string, visible: boolean]
   'selection-removed': [path: string]
+  'snapshot-change': [path: string | null]
 }>()
 
 const catalog = useSymbolCatalog()
@@ -337,6 +358,7 @@ const cLayoutPack = ref('')
 const selectedOnly = ref(false)
 const selected = shallowRef(new Set<string>())
 const selectionBusy = shallowRef(new Set<string>())
+const snapshotBusy = ref<string | null>(null)
 const writing = shallowRef(new Set<string>())
 const editing = ref<string | null>(null)
 const editValues = reactive<Record<string, string>>({})
@@ -387,6 +409,33 @@ async function loadWorkspace(): Promise<void> {
     await refreshSelectedDescriptors()
   } catch (cause) {
     toast.error(cause instanceof Error ? cause.message : String(cause))
+  }
+}
+
+function isArraySnapshotNode(node: SymbolTreeNode): boolean {
+  if (node.kind !== 'branch') return false
+  if (node.browse?.snapshot_eligible) return true
+  return node.children.length > 0 && node.children.every(child => /^\[\d+\]$/.test(child.label))
+}
+
+async function toggleArraySnapshot(node: SymbolTreeNode): Promise<void> {
+  snapshotBusy.value = node.key
+  try {
+    const active = props.snapshotPath === node.key
+    const response = await request(
+      active
+        ? '/api/dash/superwatch/array-snapshot/clear'
+        : '/api/dash/superwatch/array-snapshot/select',
+      {
+        method: 'POST',
+        body: active ? undefined : JSON.stringify({ name: node.key }),
+      },
+    )
+    emit('snapshot-change', response?.snapshot?.name ?? null)
+  } catch (cause) {
+    toast.error(cause instanceof Error ? cause.message : String(cause))
+  } finally {
+    snapshotBusy.value = null
   }
 }
 
@@ -642,23 +691,47 @@ watch(tree, roots => {
 .variable-groups { min-height: 0; overflow: auto; }
 .variable-root-heading { margin: 0; padding: 7px 10px; color: var(--muted); background: var(--bg); font-size: 11px; font-weight: 600; }
 .branch-row {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  min-height: 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.branch-toggle {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;
   align-items: center;
   gap: 5px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 32px;
   padding-top: 4px;
-  padding-right: 10px;
+  padding-right: 8px;
   padding-bottom: 4px;
   border: 0;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  background: transparent;
   color: var(--fg);
   cursor: pointer;
   text-align: left;
 }
 .branch-row:hover { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
+.snapshot-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  margin-right: 5px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.snapshot-button:hover, .snapshot-button.active { border-color: var(--accent); color: var(--accent); }
+.snapshot-button.active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.snapshot-button:disabled { color: var(--muted); cursor: default; opacity: 0.5; }
 .branch-spinner { animation: branch-spin 0.8s linear infinite; }
 @keyframes branch-spin { to { transform: rotate(360deg); } }
 .container-row {

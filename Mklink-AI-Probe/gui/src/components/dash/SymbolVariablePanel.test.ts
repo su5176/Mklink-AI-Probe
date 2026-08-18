@@ -355,6 +355,41 @@ describe('SymbolVariablePanel', () => {
     expect(wrapper.findAll('.branch-row')).toHaveLength(1)
   })
 
+  it('selects and clears a one-dimensional array snapshot curve', async () => {
+    mocks.browseRoots.value = [{
+      key: 'values', path: 'values', label: 'values', kind: 'branch',
+      type_name: 'float[]', size: 128 * 4, address: 0x20001000,
+      descriptor: null, container: null, child_count: 128, range_start: null, range_end: null,
+      array_dimensions: [128], snapshot_eligible: true,
+    }]
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(okJson({ items: [] }))
+      .mockResolvedValueOnce(okJson({ snapshot: { name: 'values', count: 128 } }))
+      .mockResolvedValueOnce(okJson({ snapshot: null }))
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(SymbolVariablePanel, {
+      props: { deviceConnected: true, latestValues: {}, snapshotPath: null },
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="snapshot-values"]').trigger('click')
+    await flushPromises()
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/dash/superwatch/array-snapshot/select',
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ name: 'values' }) }),
+    )
+    expect(wrapper.emitted('snapshot-change')).toEqual([['values']])
+
+    await wrapper.setProps({ snapshotPath: 'values' })
+    await wrapper.get('[data-testid="snapshot-values"]').trigger('click')
+    await flushPromises()
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      '/api/dash/superwatch/array-snapshot/clear',
+      expect.objectContaining({ method: 'POST' }),
+    )
+    expect(wrapper.emitted('snapshot-change')).toEqual([['values'], [null]])
+  })
+
   it('opens a chosen 256-element range without loading earlier ranges', async () => {
     const valueDescriptor = (index: number) => ({
       ...catalogItems[2],
@@ -393,7 +428,7 @@ describe('SymbolVariablePanel', () => {
     await flushPromises()
     const secondRange = wrapper.findAll('.branch-row').find(row => row.text().includes('[256..511]'))
     expect(secondRange).toBeDefined()
-    await secondRange!.trigger('click')
+    await secondRange!.get('button').trigger('click')
     await flushPromises()
 
     expect(wrapper.get('[data-testid="leaf-values[256]"]').exists()).toBe(true)

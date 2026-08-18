@@ -257,6 +257,8 @@ export interface SymbolBrowseNode {
   child_count: number | null
   range_start: number | null
   range_end: number | null
+  array_dimensions?: readonly number[]
+  snapshot_eligible?: boolean
 }
 
 export interface SymbolBrowsePage {
