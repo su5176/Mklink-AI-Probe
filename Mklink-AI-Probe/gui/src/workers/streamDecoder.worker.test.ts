@@ -845,6 +845,31 @@ describe('StreamDecoder worker controller', () => {
     expect(Array.from(new Float64Array(visible.ends))).toEqual([10, 12, 14, 20, 30])
   })
 
+  it('does not fabricate a long task interval across a target overflow', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 6, systemViewRecords(
+        { kind: 4, taskId: 7, ticks: 10n, timeUs: 10 },
+        { kind: 1, ticks: 20n, timeUs: 20 },
+        { kind: 17, ticks: 30n, timeUs: 30 },
+        { kind: 4, taskId: 8, ticks: 40n, timeUs: 40 },
+        { kind: 5, taskId: 8, ticks: 50n, timeUs: 50 },
+        { kind: 17, ticks: 60n, timeUs: 60 },
+      ), StreamType.SYSTEMVIEW),
+      connectionGeneration: 1,
+      frameTicket: 1,
+    })
+    decoder.handle({ type: 'visible-range', requestId: 1, start: 0, end: 70, pixelWidth: 400 })
+
+    const visible = messages.at(-1)
+    if (visible?.type !== 'systemview-visible') throw new Error('expected SystemView visible data')
+    expect(Array.from(new Uint32Array(visible.taskIds))).toEqual([0, 8])
+    expect(Array.from(new Float64Array(visible.starts))).toEqual([20, 30])
+    expect(Array.from(new Float64Array(visible.ends))).toEqual([30, 40])
+    expect(visible.events.find(event => event.kind === 'overflow')).toBeTruthy()
+  })
+
   it('keeps inactive task metadata and computes exact Task ISR Scheduler Idle statistics', () => {
     const { decoder, messages } = setup()
     decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
@@ -884,6 +909,33 @@ describe('StreamDecoder worker controller', () => {
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ isr_id: 15, duration_ticks: 1 }),
       ]))
+  })
+
+  it('keeps context statistics cumulative when the visible range moves', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 4, systemViewRecords(
+        { kind: 4, taskId: 1, ticks: 10n, timeUs: 10 },
+        { kind: 5, taskId: 1, ticks: 20n, timeUs: 20 },
+        { kind: 4, taskId: 1, ticks: 30n, timeUs: 30 },
+        { kind: 5, taskId: 1, ticks: 40n, timeUs: 40 },
+      ), StreamType.SYSTEMVIEW),
+      connectionGeneration: 1, frameTicket: 1,
+    })
+
+    decoder.handle({ type: 'visible-range', requestId: 1, start: 0, end: 25, pixelWidth: 200 })
+    const first = messages.at(-1)
+    decoder.handle({ type: 'visible-range', requestId: 2, start: 25, end: 50, pixelWidth: 200 })
+    const second = messages.at(-1)
+    if (first?.type !== 'systemview-visible' || second?.type !== 'systemview-visible') {
+      throw new Error('expected SystemView visible data')
+    }
+
+    const firstTask = first.contexts.find(context => context.type === 1 && context.id === 1)
+    const secondTask = second.contexts.find(context => context.type === 1 && context.id === 1)
+    expect(firstTask).toMatchObject({ count: 2, totalTicks: 20 })
+    expect(secondTask).toMatchObject({ count: 2, totalTicks: 20 })
   })
 
   it('breaks interval pairing across a dropped batch and reset clears pending context', () => {

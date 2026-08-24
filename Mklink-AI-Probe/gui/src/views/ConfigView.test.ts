@@ -21,11 +21,11 @@ const mocks = vi.hoisted(() => {
       updateConfig: vi.fn(),
       connectDevice: vi.fn(),
       disconnectDevice: vi.fn(),
-      setPowerOn: vi.fn(),
-      rebootProbe: vi.fn(),
       parseAxf: vi.fn(),
       uploadFileSource: vi.fn(),
       probeFirmwareCheck: vi.fn(),
+      upgradeProbeFirmware: vi.fn(),
+      downloadProbeFirmware: vi.fn(),
     },
     wsConnect: vi.fn(),
     wsDisconnect: vi.fn(),
@@ -36,7 +36,7 @@ const mocks = vi.hoisted(() => {
     pickSymbolFile: vi.fn(),
     pickMapFile: vi.fn(),
     refreshSymbolCatalog: vi.fn(),
-    confirm: vi.fn(),
+    saveBlobFile: vi.fn(),
   }
 })
 
@@ -65,6 +65,10 @@ vi.mock('../lib/desktopSettings', async importOriginal => ({
 vi.mock('../lib/filePicker', () => ({
   pickSymbolFile: mocks.pickSymbolFile,
   pickMapFile: mocks.pickMapFile,
+}))
+
+vi.mock('../lib/downloadTextFile', () => ({
+  saveBlobFile: mocks.saveBlobFile,
 }))
 
 vi.mock('../composables/useSymbolCatalog', () => ({
@@ -105,8 +109,6 @@ describe('ConfigView', () => {
     mocks.api.updateConfig.mockResolvedValue({})
     mocks.api.connectDevice.mockResolvedValue({})
     mocks.api.disconnectDevice.mockResolvedValue(undefined)
-    mocks.api.setPowerOn.mockResolvedValue({ status: 'ok' })
-    mocks.api.rebootProbe.mockResolvedValue({ status: 'rebooted', connected: false })
     mocks.api.parseAxf.mockResolvedValue({
       loaded: true,
       axf_path: 'C:\\saved\\app.axf',
@@ -115,6 +117,14 @@ describe('ConfigView', () => {
     mocks.api.uploadFileSource.mockResolvedValue({ path: '' })
     mocks.refreshSymbolCatalog.mockResolvedValue(undefined)
     mocks.api.probeFirmwareCheck.mockResolvedValue({ status: 'ok' })
+    mocks.api.upgradeProbeFirmware.mockResolvedValue({ status: 'up_to_date' })
+    mocks.api.downloadProbeFirmware.mockResolvedValue({
+      blob: new Blob(['uf2']),
+      filename: 'MicroLink_V3.3.7.uf2',
+      version: 'V3.3.7',
+      source: 'github',
+    })
+    mocks.saveBlobFile.mockResolvedValue(true)
     mocks.loadDesktopSettings.mockReturnValue({
       version: 1,
       symbolPath: 'C:\\saved\\app.axf',
@@ -127,14 +137,13 @@ describe('ConfigView', () => {
     mocks.pickSymbolFile.mockResolvedValue(null)
     mocks.pickMapFile.mockResolvedValue(null)
     vi.spyOn(window, 'open').mockImplementation(() => null)
-    mocks.confirm.mockReturnValue(true)
-    vi.stubGlobal('confirm', mocks.confirm)
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
   })
 
-  it('renders one four-section workspace with Local Device selected by default', async () => {
+  it('renders one five-section workspace with Local Device selected by default', async () => {
     const wrapper = await mountView()
 
-    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(4)
+    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(5)
     expect(wrapper.get('[data-testid="config-section-local"]').attributes('aria-current')).toBe('page')
     expect(wrapper.get('[data-testid="local-device-panel"]').exists()).toBe(true)
 
@@ -144,6 +153,10 @@ describe('ConfigView', () => {
     expect(text).not.toContain('MCU 类型')
     expect(text).not.toContain('MCU 提示')
     expect(text).not.toContain('高级配置 (RTT)')
+    expect(text).not.toContain('探针电源与重启')
+    expect(text).not.toContain('VCC')
+    expect(text).not.toContain('重启 MKLink')
+    expect(wrapper.find('[data-testid="probe-controls"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="device-status"]').exists()).toBe(false)
   })
 
@@ -323,40 +336,6 @@ describe('ConfigView', () => {
     expect(wrapper.get('[data-testid="disconnect-local"]').attributes('disabled')).toBeDefined()
   })
 
-  it('sets supported probe voltages and requires a second action for 5V', async () => {
-    mocks.deviceStatus.connected = true
-    const wrapper = await mountView()
-
-    await wrapper.get('[data-testid="probe-power-3300"]').trigger('click')
-    await flushPromises()
-
-    expect(mocks.api.setPowerOn).toHaveBeenCalledWith(3300, false)
-
-    mocks.api.setPowerOn.mockClear()
-    mocks.confirm.mockReturnValueOnce(false)
-    await wrapper.get('[data-testid="probe-power-5000"]').trigger('click')
-    await flushPromises()
-    expect(mocks.api.setPowerOn).not.toHaveBeenCalled()
-
-    mocks.confirm.mockReturnValueOnce(true)
-    await wrapper.get('[data-testid="probe-power-5000"]').trigger('click')
-    await flushPromises()
-    expect(mocks.api.setPowerOn).toHaveBeenCalledWith(5000, true)
-    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('5.0V'))
-  })
-
-  it('confirms probe reboot and reports that the connection is dropped', async () => {
-    mocks.deviceStatus.connected = true
-    const wrapper = await mountView()
-
-    await wrapper.get('[data-testid="reboot-probe"]').trigger('click')
-    await flushPromises()
-
-    expect(mocks.confirm).toHaveBeenCalledOnce()
-    expect(mocks.api.rebootProbe).toHaveBeenCalledOnce()
-    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('MKLink 已重启'))
-  })
-
   it('rejects local SWD clock settings above 10 MHz', async () => {
     const wrapper = await mountView()
     const input = wrapper.get('[data-testid="swd-clock"]')
@@ -531,6 +510,22 @@ describe('ConfigView', () => {
     expect(window.open).toHaveBeenCalledWith('http://0.0.0.0:9000/docs', '_blank')
   })
 
+  it('keeps firmware update as a separate sidebar section after Start Service', async () => {
+    const wrapper = await mountView()
+    const sections = wrapper.findAll('[data-testid="config-section"]')
+
+    expect(sections.map(section => section.text())).toEqual([
+      '本地设备', '文件来源', '远程连接', '启动服务', '固件升级',
+    ])
+    await wrapper.get('[data-testid="config-section-serve"]').trigger('click')
+    expect(wrapper.find('[data-testid="firmware-upgrade-panel"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    expect(wrapper.get('[data-testid="config-section-firmware"]').attributes('aria-current')).toBe('page')
+    expect(wrapper.get('[data-testid="firmware-upgrade-panel"]').text()).toContain('固件升级')
+    expect(wrapper.find('[data-testid="launch-server"]').exists()).toBe(false)
+  })
+
   it('preserves the probe firmware upgrade warning', async () => {
     mocks.api.probeFirmwareCheck.mockResolvedValue({
       status: 'upgrade_required',
@@ -543,5 +538,42 @@ describe('ConfigView', () => {
     const wrapper = await mountView()
 
     expect(wrapper.get('[data-testid="firmware-warning"]').text()).toContain('探针固件需要升级')
+  })
+
+  it('shows the latest version and saves firmware after automatic update fails', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, state: 'running' })
+    mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({
+      status: 'manual_required',
+      current_version: 'V3.3.6',
+      latest_version: 'V3.3.7',
+      firmware: 'MicroLink_V3.3.7.uf2',
+      model: 'V3',
+      family: 'microlink',
+      download_available: true,
+      message: '未检测到 Bootloader U 盘',
+    })
+    const blob = new Blob(['release-uf2'], { type: 'application/octet-stream' })
+    mocks.api.downloadProbeFirmware.mockResolvedValueOnce({
+      blob,
+      filename: 'MicroLink_V3.3.7.uf2',
+      version: 'V3.3.7',
+      source: 'gitee',
+      family: 'microlink',
+    })
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="manual-firmware-download"]').text()).toContain('最新固件：V3.3.7')
+    expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('未检测到 Bootloader U 盘')
+
+    await wrapper.get('[data-testid="download-firmware"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V3', 'microlink')
+    expect(mocks.saveBlobFile).toHaveBeenCalledWith('MicroLink_V3.3.7.uf2', blob)
+    expect(wrapper.get('[data-testid="firmware-download-status"]').text()).toContain('Gitee')
   })
 })

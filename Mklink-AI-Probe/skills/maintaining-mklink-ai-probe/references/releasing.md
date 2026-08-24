@@ -51,10 +51,6 @@ $PortableWork = "..\release\<YYYYMMDD-HHMMSS>-portable-work"
 $NsisFiles = @(Get-ChildItem "gui\src-tauri\target\release\bundle\nsis\*.exe")
 if ($NsisFiles.Count -ne 1) { throw "Expected exactly one NSIS executable" }
 $Nsis = $NsisFiles[0]
-$SkillArchive = Join-Path $env:TEMP "Mklink-AI-Probe-v$Version-source-skill.zip"
-git -C .. archive --format=zip --prefix="Mklink-AI-Probe-v$Version/" `
-  --output $SkillArchive HEAD:Mklink-AI-Probe
-
 python packaging/site_agent/build.py --output "$PortableWork\core"
 Push-Location site-agent-gui\src-tauri
 cargo build --release
@@ -72,7 +68,6 @@ python _maintainer/release/prepare_release.py `
   --output $ReleaseDir `
   --nsis $Nsis.FullName `
   --updater-signature "$($Nsis.FullName).sig" `
-  --skill-archive $SkillArchive `
   --site-agent-archive "$PortableWork\gui\MKLink-Site-Agent-v$Version-windows-x86_64-portable.zip" `
   --site-agent-manifest "$PortableWork\gui\MKLink-Site-Agent-v$Version-windows-x86_64-portable.manifest.json"
 ```
@@ -87,9 +82,12 @@ The directory must contain exactly:
 - `SHA256SUMS.txt`
 - `release-manifest.json`
 
-Remove the temporary source Skill archive after preparation. The published update
-document includes the installer and Skill package size, SHA-256, and source
-commit so AI clients can verify automatic updates before installation.
+`prepare_release.py` builds the public Skill archive directly from the release
+commit using an explicit runtime-content allowlist. It excludes repository
+maintenance instructions, project memory, tests, desktop source, and maintainer
+build skills. The published update document includes the installer and Skill
+package size, SHA-256, and source commit so AI clients can verify automatic
+updates before installation.
 
 Install and qualify the NSIS candidate under a restricted PATH. Confirm health,
 bundled-sidecar use, no Python child process, probe discovery without exposing

@@ -1,6 +1,35 @@
 from mklink import mcp_server, update_check
 
 
+def test_runtime_manifest_sources_prefer_github_and_fall_back_to_gitee(monkeypatch):
+    github, gitee = update_check.DEFAULT_MANIFEST_URLS
+    assert github == (
+        "https://raw.githubusercontent.com/Aladdin-Wang/"
+        "Mklink-AI-Probe/updates/latest.json"
+    )
+    assert gitee == (
+        "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json"
+    )
+
+    calls = []
+
+    def request(url, timeout):
+        calls.append((url, timeout))
+        if url == github:
+            raise OSError("GitHub unavailable")
+        return b'{"version":"0.1.6"}'
+
+    monkeypatch.setattr(update_check, "_request_bytes", request)
+
+    manifest, manifest_url = update_check.fetch_manifest(
+        update_check.DEFAULT_MANIFEST_URLS, timeout=7.5,
+    )
+
+    assert manifest == {"version": "0.1.6"}
+    assert manifest_url == gitee
+    assert calls == [(github, 7.5), (gitee, 7.5)]
+
+
 def test_runtime_update_check_uses_shared_cache(monkeypatch, tmp_path):
     cache = tmp_path / "update.json"
     manifest = {"version": "9.8.7", "notes": "Important fixes"}

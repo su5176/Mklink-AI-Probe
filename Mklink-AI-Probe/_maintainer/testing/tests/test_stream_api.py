@@ -236,6 +236,19 @@ def test_publish_from_external_thread_wakes_websocket(client, app, monkeypatch):
         ("post", "/api/dash/superwatch/add", {"json": {"name": "a"}}, "add_watch"),
         ("post", "/api/dash/superwatch/remove", {"json": {"name": "a"}}, "remove_watch"),
         ("get", "/api/dash/superwatch/status", {}, "get_status"),
+        (
+            "post", "/api/dash/superwatch/array-snapshot/select",
+            {"json": {"name": "a", "start_index": 0, "count": 1}},
+            "select_array_snapshot",
+        ),
+        (
+            "post", "/api/dash/superwatch/array-snapshot/clear",
+            {"json": {}}, "clear_array_snapshot",
+        ),
+        (
+            "get", "/api/dash/superwatch/array-snapshot",
+            {}, "get_array_snapshot",
+        ),
     ],
 )
 def test_superwatch_locking_api_work_does_not_block_health(

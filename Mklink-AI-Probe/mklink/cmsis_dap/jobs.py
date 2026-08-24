@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 import uuid
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Callable, Deque, Dict, List, Optional
+from typing import Callable, Deque, Dict, Iterator, List, Optional, Sequence
 
 from .errors import FlashError, FlashErrorCode
 from .daemon_executor import DaemonSingleExecutor
@@ -21,6 +22,13 @@ from .models import (
     assert_transition,
 )
 from ..remote.resource_manager import ResourceError, ResourceGroup
+
+
+# Keep the generic host-side read request aligned with the common 4 KiB
+# Flash sector. Callers that have reliable FLM geometry may provide a smaller
+# or larger exact sector sequence explicitly.
+READ_MEMORY_CHUNK_SIZE = 4 * 1024
+MAX_READ_MEMORY_SIZE = 64 * 1024 * 1024
 
 
 _ACTION_STATES = {
@@ -129,6 +137,112 @@ class OnlineFlashJobManager:
                 ) from exc
             return job_id
 
+    def read_memory(
+        self,
+        request: JobRequest,
+        address: int,
+        size: int,
+        *,
+        chunk_size: int = READ_MEMORY_CHUNK_SIZE,
+    ) -> bytes:
+        """Read target memory through a short-lived, resource-protected session."""
+        if type(size) is not int or size <= 0 or size > MAX_READ_MEMORY_SIZE:
+            raise ValueError(
+                f"size must be between 1 and {MAX_READ_MEMORY_SIZE} bytes"
+            )
+        if type(chunk_size) is not int or chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+        chunk_size = min(chunk_size, READ_MEMORY_CHUNK_SIZE)
+        chunk_sizes = tuple(
+            min(chunk_size, size - offset)
+            for offset in range(0, size, chunk_size)
+        )
+        return b"".join(self.iter_memory(request, address, chunk_sizes))
+
+    def iter_memory(
+        self,
+        request: JobRequest,
+        address: int,
+        chunk_sizes: Sequence[int],
+    ) -> Iterator[bytes]:
+        """Yield target-memory chunks from one resource-protected connection."""
+        from mklink.hpm_config import is_hpm_target
+
+        hpm_target = is_hpm_target(request.target_part)
+        if type(address) is not int or address < 0:
+            raise ValueError("address must be a non-negative integer")
+        sizes = tuple(chunk_sizes)
+        if not sizes or any(type(value) is not int or value <= 0 for value in sizes):
+            raise ValueError("chunk_sizes must contain positive integers")
+        size = sum(sizes)
+        if size > MAX_READ_MEMORY_SIZE:
+            raise ValueError(
+                f"size must be between 1 and {MAX_READ_MEMORY_SIZE} bytes"
+            )
+        owner = f"user:online-read:{uuid.uuid4()}"
+        backend = None
+        acquired = False
+        try:
+            acquired = True
+            resources = [ResourceGroup.TARGET_DEBUG]
+            if hpm_target:
+                resources.append(ResourceGroup.MKLINK_BRIDGE)
+            self._resource_manager.acquire_many(
+                resources,
+                owner,
+                preempt=request.preempt_ai,
+                preempt_user_dashboard=True,
+            )
+            if self._prepare_connect is not None:
+                self._prepare_connect(request)
+            backend = self._backend_factory()
+            connect_options = dict(
+                probe=request.probe_id,
+                target=request.target_part,
+                frequency=request.frequency,
+                pack=request.pack_path,
+                custom_flm_paths=request.custom_flm_paths,
+                custom_flm_digests=request.custom_flm_digests,
+                custom_flm_regions=request.custom_flm_regions,
+                pack_flm_regions=request.pack_flm_regions,
+                custom_flm_ram_start=request.custom_flm_ram_start,
+                custom_flm_ram_size=request.custom_flm_ram_size,
+                connect_mode=request.connect_mode,
+                reset_mode=request.reset_mode,
+            )
+            if hpm_target:
+                connect_options.update(
+                    board=request.board,
+                    hpm_flash_cfg=request.hpm_flash_cfg,
+                )
+            backend.connect(**connect_options)
+            regions = tuple(backend.memory_regions())
+            end = address + size
+            if end < address or not any(
+                address >= region.start and end <= region.end
+                for region in regions
+                if region.is_flash or region.is_ram
+            ):
+                raise FlashError(
+                    FlashErrorCode.IMAGE_OUT_OF_RANGE,
+                    "requested memory range is outside the target memory map",
+                )
+            offset = 0
+            for chunk_size in sizes:
+                yield backend.read_memory(address + offset, chunk_size)
+                offset += chunk_size
+        finally:
+            if backend is not None:
+                try:
+                    backend.disconnect()
+                except Exception:
+                    pass
+            if acquired:
+                try:
+                    self._resource_manager.release(owner)
+                except Exception:
+                    pass
+
     def get(self, job_id: str) -> JobSnapshot:
         with self._condition:
             return self._snapshot(self._require_job(job_id))
@@ -219,6 +333,7 @@ class OnlineFlashJobManager:
         backend = None
         connection_may_be_open = False
         acquire_attempted = False
+        deferred_erase = False
         primary_error: Optional[FlashError] = None
         with self._condition:
             if job.state is not JobState.QUEUED or job.cancel_requested:
@@ -286,6 +401,7 @@ class OnlineFlashJobManager:
                                     custom_flm_paths=job.request.custom_flm_paths,
                                     custom_flm_digests=job.request.custom_flm_digests,
                                     custom_flm_regions=job.request.custom_flm_regions,
+                                    pack_flm_regions=job.request.pack_flm_regions,
                                     custom_flm_ram_start=job.request.custom_flm_ram_start,
                                     custom_flm_ram_size=job.request.custom_flm_ram_size,
                                     connect_mode=job.request.connect_mode,
@@ -298,6 +414,17 @@ class OnlineFlashJobManager:
                                     )
                                 backend.connect(**connect_options)
                             elif action == "erase":
+                                deferred_erase = bool(
+                                    getattr(backend, "erase_deferred", False)
+                                    and "program" in job.request.actions
+                                )
+                                if deferred_erase:
+                                    with self._condition:
+                                        self._emit_locked(
+                                            job,
+                                            "log",
+                                            message="erase in progress (completed by HPM ROM during program)",
+                                        )
                                 if job.request.sector_addresses:
                                     backend.erase_sectors(job.request.sector_addresses)
                                 else:
@@ -307,13 +434,83 @@ class OnlineFlashJobManager:
                                 with self._condition:
                                     if job.cancel_requested:
                                         break
-                                backend.program(job.image)
+                                last_reported_percent = -1
+
+                                def report_program_progress(value: float) -> None:
+                                    nonlocal deferred_erase, last_reported_percent
+                                    try:
+                                        fraction = float(value)
+                                    except (TypeError, ValueError):
+                                        return
+                                    if fraction > 1:
+                                        fraction /= 100.0
+                                    fraction = min(1.0, max(0.0, fraction))
+                                    if deferred_erase and fraction <= 0:
+                                        return
+                                    percent = int(fraction * 100)
+                                    if percent <= last_reported_percent and fraction < 1:
+                                        return
+                                    last_reported_percent = percent
+                                    if deferred_erase and fraction > 0:
+                                        with self._condition:
+                                            self._complete_deferred_stage_locked(job, "erase")
+                                        deferred_erase = False
+                                    self._program_progress(job, fraction)
+
+                                if not deferred_erase:
+                                    report_program_progress(0)
+                                backend.program(
+                                    job.image,
+                                    progress_callback=report_program_progress,
+                                )
+                                if deferred_erase:
+                                    with self._condition:
+                                        self._complete_deferred_stage_locked(job, "erase")
+                                    deferred_erase = False
+                                report_program_progress(1)
                             elif action == "verify":
                                 self._refresh_image(job)
                                 with self._condition:
                                     if job.cancel_requested:
                                         break
-                                backend.verify(job.image)
+                                last_reported_percent = -1
+
+                                def report_verify_progress(value: float) -> None:
+                                    nonlocal last_reported_percent
+                                    try:
+                                        fraction = float(value)
+                                    except (TypeError, ValueError):
+                                        return
+                                    if fraction > 1:
+                                        fraction /= 100.0
+                                    fraction = min(1.0, max(0.0, fraction))
+                                    percent = int(fraction * 100)
+                                    if percent <= last_reported_percent and fraction < 1:
+                                        return
+                                    last_reported_percent = percent
+                                    self._verify_progress(job, fraction)
+
+                                report_verify_progress(0)
+                                verify = backend.verify
+                                try:
+                                    verify_parameters = inspect.signature(verify).parameters
+                                    accepts_progress = (
+                                        "progress_callback" in verify_parameters
+                                        or any(
+                                            parameter.kind is inspect.Parameter.VAR_KEYWORD
+                                            for parameter in verify_parameters.values()
+                                        )
+                                    )
+                                except (TypeError, ValueError):
+                                    accepts_progress = False
+                                if accepts_progress:
+                                    verify(
+                                        job.image,
+                                        progress_callback=report_verify_progress,
+                                    )
+                                else:
+                                    verify(job.image)
+                                report_verify_progress(1)
                             elif action == "reset":
                                 backend.reset_run(job.request.reset_mode)
                         except FlashError:
@@ -321,7 +518,8 @@ class OnlineFlashJobManager:
                         except Exception as exc:
                             raise FlashError(_ACTION_ERRORS[action], str(exc)) from exc
                         with self._condition:
-                            self._stage_complete_locked(job, action)
+                            if not (action == "erase" and deferred_erase):
+                                self._stage_complete_locked(job, action)
             except ResourceError as exc:
                 primary_error = FlashError(
                     FlashErrorCode.PROBE_BUSY,
@@ -462,6 +660,63 @@ class OnlineFlashJobManager:
         job.updated_at = time.monotonic()
         self._emit_locked(job, "progress", progress=job.total_progress)
         self._emit_locked(job, "log", message=f"{action} complete")
+
+    def _complete_deferred_stage_locked(self, job: _Job, action: str) -> None:
+        """Complete a prior stage without overwriting the active stage."""
+        job.completed_actions += 1
+        job.total_progress = max(
+            job.total_progress,
+            job.completed_actions / len(job.request.actions),
+        )
+        job.updated_at = time.monotonic()
+        self._emit_locked(job, "progress", progress=job.total_progress)
+        self._emit_locked(job, "log", message=f"{action} complete")
+
+    def _program_progress(self, job: _Job, fraction: float) -> None:
+        with self._condition:
+            if job.current_action != "program" or job.image is None:
+                return
+            if fraction < job.stage_progress:
+                return
+            job.stage_progress = fraction
+            job.total_progress = max(
+                job.total_progress,
+                (job.completed_actions + fraction) / len(job.request.actions),
+            )
+            job.updated_at = time.monotonic()
+            completed = min(job.image.size, round(job.image.size * fraction))
+            self._emit_locked(
+                job,
+                "progress",
+                message=(
+                    f"[PROGRAM] {completed} / {job.image.size} Bytes "
+                    f"({round(fraction * 100)}%)"
+                ),
+                progress=job.total_progress,
+            )
+
+    def _verify_progress(self, job: _Job, fraction: float) -> None:
+        with self._condition:
+            if job.current_action != "verify" or job.image is None:
+                return
+            if fraction < job.stage_progress:
+                return
+            job.stage_progress = fraction
+            job.total_progress = max(
+                job.total_progress,
+                (job.completed_actions + fraction) / len(job.request.actions),
+            )
+            job.updated_at = time.monotonic()
+            verified = min(job.image.size, round(job.image.size * fraction))
+            self._emit_locked(
+                job,
+                "progress",
+                message=(
+                    f"[VERIFY] {verified} / {job.image.size} Bytes "
+                    f"({round(fraction * 100)}%)"
+                ),
+                progress=job.total_progress,
+            )
 
     def _fail_locked(self, job: _Job, error: FlashError) -> None:
         job.error_code = error.code.value

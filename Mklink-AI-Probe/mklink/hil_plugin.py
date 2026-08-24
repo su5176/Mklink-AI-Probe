@@ -1,9 +1,7 @@
 """HIL-Core v0.2 one-shot JSON adapter for Mklink-AI-Probe.
 
-The adapter intentionally exposes only lifecycle methods and ``debug.read``
-to unattended jobs.  Existing MCP/CLI development workflows remain unchanged.
-It has no dependency on hil_core: stdin/stdout are the protocol boundary and
-the plugin keeps ownership of its existing interoperable transport lock.
+The unattended surface intentionally exposes lifecycle methods and read-only
+debug operations. Existing interactive MCP and CLI workflows are unchanged.
 """
 from __future__ import annotations
 
@@ -24,6 +22,7 @@ from mklink.hil_lock import HilFileLock, HilLockHeld, transport_lock_name
 PROTOCOL = "hil-plugin-json-v1"
 PLUGIN = "Mklink-AI-Probe"
 CAPABILITIES = ["program", "debug", "console.rtt", "console.uart", "bus.modbus"]
+READ_TARGETS = {"plugin-version", "probe-status", "memory", "register", "variable"}
 MAX_READ_BYTES = 4096
 
 
@@ -32,8 +31,11 @@ def _success(data: Any) -> dict[str, Any]:
 
 
 def _failure(error_type: str, message: str) -> dict[str, Any]:
-    return {"ok": False, "data": None,
-            "error": {"type": error_type, "message": message}}
+    return {
+        "ok": False,
+        "data": None,
+        "error": {"type": error_type, "message": message},
+    }
 
 
 def _package_version() -> str:
@@ -67,13 +69,21 @@ def _transport(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def _port_info(port: str):
-    return next((item for item in list_ports.comports()
-                 if str(item.device).casefold() == port.casefold()), None)
+    return next(
+        (
+            item
+            for item in list_ports.comports()
+            if str(item.device).casefold() == port.casefold()
+        ),
+        None,
+    )
 
 
 def _interface_number(info: Any) -> str | None:
-    text = " ".join(str(getattr(info, key, "") or "")
-                    for key in ("hwid", "location", "interface")).strip()
+    text = " ".join(
+        str(getattr(info, key, "") or "")
+        for key in ("hwid", "location", "interface")
+    ).strip()
     match = re.search(r"(?i)MI[_-]?(\d+)", text)
     if match is None:
         match = re.search(r"(?i)(?:x\.|\.)(\d+)$", text)
@@ -88,10 +98,16 @@ def _actual_identity(transport: dict[str, Any]) -> dict[str, str]:
     actual_vid = getattr(info, "vid", None)
     actual_pid = getattr(info, "pid", None)
     actual_serial = str(getattr(info, "serial_number", "") or "").strip()
-    expected_vid = _parse_int(transport["vid"], "transport.vid") \
-        if transport.get("vid") is not None else None
-    expected_pid = _parse_int(transport["pid"], "transport.pid") \
-        if transport.get("pid") is not None else None
+    expected_vid = (
+        _parse_int(transport["vid"], "transport.vid")
+        if transport.get("vid") is not None
+        else None
+    )
+    expected_pid = (
+        _parse_int(transport["pid"], "transport.pid")
+        if transport.get("pid") is not None
+        else None
+    )
     expected_serial = str(transport.get("serial") or "").strip()
     if expected_vid is not None and actual_vid != expected_vid:
         raise ValueError("probe VID does not match bench identity")
@@ -117,21 +133,27 @@ def _actual_identity(transport: dict[str, Any]) -> dict[str, str]:
     expected_locator = str(transport.get("locator") or "").strip()
     if expected_locator and locator.casefold() != expected_locator.casefold():
         raise ValueError("probe locator does not match bench identity")
-    return {"port": port, "serial": actual_serial,
-            "locator": locator or expected_locator}
+    return {
+        "port": port,
+        "serial": actual_serial,
+        "locator": locator or expected_locator,
+    }
 
 
 def _lock(transport: dict[str, Any], purpose: str) -> HilFileLock:
     root = os.environ.get("HIL_CORE_LOCK_ROOT") or None
     return HilFileLock(
         transport_lock_name("usb-serial", str(transport["port"])),
-        root=Path(root) if root else None, lease_s=30,
-        owner_id=f"mklink-hil-{purpose}-{os.getpid()}")
+        root=Path(root) if root else None,
+        lease_s=30,
+        owner_id=f"mklink-hil-{purpose}-{os.getpid()}",
+    )
 
 
 def _health(transport: dict[str, Any]) -> dict[str, Any]:
     identity = _actual_identity(transport)
     from mklink.discovery import _probe_port
+
     with _lock(transport, "health"):
         verified = _probe_port(str(transport["port"]))
     if not verified:
@@ -144,9 +166,8 @@ def _safe_state(transport: dict[str, Any]) -> dict[str, Any]:
     lock = _lock(transport, "safe-state")
     lock.acquire()
     lock.release()
-    verified = not lock.path.exists()
     return {
-        "verified": verified,
+        "verified": not lock.path.exists(),
         "state": "process-local probe session closed; no sustained output",
     }
 
@@ -156,13 +177,33 @@ def _read(request: dict[str, Any], transport: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(params, dict):
         raise ValueError("params must be an object")
     target = str(params.get("target") or "plugin-version")
+    if target not in READ_TARGETS:
+        raise ValueError(
+            "params.target must be plugin-version, probe-status, memory, "
+            "register, or variable"
+        )
     if target == "plugin-version":
         with _lock(transport, "version"):
             return {"target": target, "value": _package_version()}
     if target == "probe-status":
         return {"target": target, "value": _health(transport)}
 
+    address = None
+    size = None
+    name = None
+    if target == "memory":
+        address = _parse_int(params.get("address"), "params.address")
+        size = _parse_int(params.get("size"), "params.size")
+        if not 1 <= size <= MAX_READ_BYTES:
+            raise ValueError(f"params.size must be 1..{MAX_READ_BYTES}")
+    else:
+        name = str(params.get("name") or "").strip()
+        if not name:
+            raise ValueError(f"params.name is required for {target} read")
+
+    _actual_identity(transport)
     from mklink import connect
+
     port = str(transport["port"])
     dut = request.get("dut") if isinstance(request.get("dut"), dict) else {}
     project_root = str(dut.get("firmware_project") or ".")
@@ -173,26 +214,25 @@ def _read(request: dict[str, Any], transport: dict[str, Any]) -> dict[str, Any]:
         kwargs["axf"] = str(params["axf"])
     with connect(**kwargs) as device:
         if target == "memory":
-            address = _parse_int(params.get("address"), "params.address")
-            size = _parse_int(params.get("size"), "params.size")
-            if not 1 <= size <= MAX_READ_BYTES:
-                raise ValueError(f"params.size must be 1..{MAX_READ_BYTES}")
             data = device.read_memory(address, size)
-            return {"target": target, "address": address, "size": len(data),
-                    "encoding": "hex", "value": data.hex()}
+            return {
+                "target": target,
+                "address": address,
+                "size": len(data),
+                "encoding": "hex",
+                "value": data.hex(),
+            }
         if target == "register":
-            name = str(params.get("name") or "").strip()
-            if not name:
-                raise ValueError("params.name is required for register read")
-            return {"target": target, "name": name,
-                    "value": device.read_register(name)}
-        if target == "variable":
-            name = str(params.get("name") or "").strip()
-            if not name:
-                raise ValueError("params.name is required for variable read")
-            return {"target": target, "name": name,
-                    "value": device.read_variable(name)}
-    raise ValueError("params.target must be plugin-version, probe-status, memory, register, or variable")
+            return {
+                "target": target,
+                "name": name,
+                "value": device.read_register(name),
+            }
+        return {
+            "target": target,
+            "name": name,
+            "value": device.read_variable(name),
+        }
 
 
 def dispatch(request: Any) -> dict[str, Any]:
@@ -202,8 +242,9 @@ def dispatch(request: Any) -> dict[str, Any]:
     if method not in {"identify", "capabilities", "health", "invoke", "safe_state"}:
         return _failure("plugin-protocol", "unsupported method")
     if method == "invoke" and (
-            request.get("verb") != "debug.read"
-            or request.get("action_class") != "observe"):
+        request.get("verb") != "debug.read"
+        or request.get("action_class") != "observe"
+    ):
         return _failure(
             "action-refused",
             "unattended Mklink v0.2 surface only permits observe/debug.read; "
@@ -212,11 +253,20 @@ def dispatch(request: Any) -> dict[str, Any]:
     try:
         transport = _transport(request)
         if method == "identify":
-            return _success({"plugin": PLUGIN, "version": _package_version(),
-                             "identity": _actual_identity(transport)})
+            return _success(
+                {
+                    "plugin": PLUGIN,
+                    "version": _package_version(),
+                    "identity": _actual_identity(transport),
+                }
+            )
         if method == "capabilities":
-            return _success({"capabilities": list(CAPABILITIES),
-                             "automation_verbs": ["debug.read"]})
+            return _success(
+                {
+                    "capabilities": list(CAPABILITIES),
+                    "automation_verbs": ["debug.read"],
+                }
+            )
         if method == "health":
             return _success(_health(transport))
         if method == "safe_state":
@@ -226,7 +276,7 @@ def dispatch(request: Any) -> dict[str, Any]:
         return _failure("lock-held", str(exc))
     except (FileNotFoundError, ValueError) as exc:
         return _failure("invalid-device", str(exc))
-    except Exception as exc:  # noqa: BLE001 - protocol boundary normalizes failures
+    except Exception as exc:  # noqa: BLE001 - normalize the protocol boundary
         return _failure(type(exc).__name__, str(exc) or type(exc).__name__)
 
 
@@ -236,8 +286,6 @@ def main() -> int:
     except (UnicodeError, json.JSONDecodeError) as exc:
         result = _failure("plugin-protocol", f"invalid JSON request: {exc}")
     else:
-        # Existing device helpers occasionally print diagnostics.  Keep stdout
-        # reserved for the one strict ActionResult and route diagnostics away.
         with redirect_stdout(sys.stderr):
             result = dispatch(request)
     sys.stdout.write(json.dumps(result, ensure_ascii=False, separators=(",", ":")))

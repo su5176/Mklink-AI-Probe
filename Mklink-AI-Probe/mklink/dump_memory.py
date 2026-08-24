@@ -90,6 +90,14 @@ FLAG_REGION_ERROR     = 0x0004
 FLAG_SAMPLE_DROPPED   = 0x0008
 
 
+class DumpMemoryReadError(RuntimeError):
+    """The dump stream returned a malformed or explicitly failed sample."""
+
+
+class DumpMemoryUnsupported(DumpMemoryReadError):
+    """The connected firmware did not expose a usable dump-memory response."""
+
+
 # Sentinel return values for _try_parse
 _NEED_MORE = object()
 _RETRY = object()
@@ -399,6 +407,129 @@ def read_dump_memory_once(
                 pass
         finally:
             bridge._exit_stream()
+
+
+def read_dump_memory_range_once(
+    bridge,
+    address: int,
+    size: int,
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.0005,
+) -> bytes:
+    """Read one complete region, including B1 multi-block responses.
+
+    ``read_dump_memory_once`` is retained for the streaming consumers that
+    only request a small sample.  Online Flash reads need the complete
+    payload: current firmware emits one B1 frame per 2048-byte block when a
+    request is larger than 2048 bytes.  This helper collects and validates all
+    blocks before returning, and never sends a text stream-stop command that
+    could be interpreted as target data.
+    """
+    if type(address) is not int or address < 0:
+        raise ValueError("dump-memory address must be a non-negative integer")
+    if type(size) is not int or size <= 0 or size > MAX_TOTAL_DATA_SIZE:
+        raise ValueError(
+            f"dump-memory size must be between 1 and {MAX_TOTAL_DATA_SIZE} bytes"
+        )
+    from mklink._types import DeviceState
+
+    parser = DumpMemoryParser(region_sizes=[size])
+    command = build_dump_mem_command([(address, size)], 0)
+    stop_command = build_dump_mem_command([(address, 1)], -1)
+    deadline = time.monotonic() + max(0.001, float(timeout))
+    blocks: dict[int, bytes] = {}
+    expected_blocks: int | None = None
+    raw_tail = bytearray()
+    bridge._enter_stream(DeviceState.DUMP_STREAM)
+    try:
+        # ``period=0`` emits one complete sample before the firmware returns
+        # to idle.  The previous request is stopped in the finally block with
+        # ``period=-1``; if a caller was interrupted, bridge.connect() also
+        # uses that state-machine stop value during stream recovery.
+        bridge._write_raw((command + "\n").encode("utf-8"))
+        while time.monotonic() < deadline:
+            raw = bridge.drain_stream_bytes(max_bytes=1024 * 1024)
+            if raw:
+                raw_tail.extend(raw[-4096:])
+            for frame in parser.feed(raw) if raw else ():
+                flags = int(frame.get("flags", 0))
+                if flags:
+                    raise DumpMemoryReadError(
+                        f"dump_memory returned error flags 0x{flags:04X}"
+                    )
+                regions = frame.get("regions", ())
+                payload = b"".join(
+                    data for region_index, data in regions if region_index == 0
+                )
+                if frame.get("format") == "OLD":
+                    # OLD frames are valid only for a single <=2048-byte
+                    # request.  Any such frame left over from another caller
+                    # must be discarded rather than returned as this range.
+                    if size > 2048:
+                        continue
+                    if len(payload) != size:
+                        continue
+                    return payload
+
+                total_size = int(frame.get("total_size", 0))
+                # A prior request may have already placed B1 frames in the
+                # USB queue.  The protocol has no address field, so total size
+                # is the only safe discriminator; discard mismatched samples
+                # until the current request's first block arrives.
+                if total_size != size:
+                    continue
+                block_size = int(frame.get("block_size", 0))
+                block_index = int(frame.get("block_index", -1))
+                block_count = int(frame.get("block_count", 0))
+                if (
+                    total_size != size
+                    or block_size <= 0
+                    or block_count <= 0
+                    or block_index < 0
+                    or block_index >= block_count
+                    or not bool(frame.get("block_crc_ok", False))
+                ):
+                    raise DumpMemoryReadError("dump_memory block metadata is invalid")
+                expected_blocks = block_count if expected_blocks is None else expected_blocks
+                if expected_blocks != block_count:
+                    raise DumpMemoryReadError("dump_memory block count changed")
+                expected_size = min(block_size, size - block_index * block_size)
+                if expected_size <= 0 or len(payload) != expected_size:
+                    raise DumpMemoryReadError(
+                        f"dump_memory block {block_index} returned {len(payload)} bytes"
+                    )
+                blocks[block_index] = payload
+                if len(blocks) == expected_blocks:
+                    result = b"".join(blocks[index] for index in range(expected_blocks))
+                    if len(result) != size:
+                        raise DumpMemoryReadError(
+                            f"dump_memory assembled {len(result)} bytes for {size}"
+                        )
+                    return result
+            if poll_interval:
+                time.sleep(poll_interval)
+        diagnostic = bytes(raw_tail).decode("utf-8", errors="replace").lower()
+        if (
+            "command not found" in diagnostic
+            or "attributeerror" in diagnostic
+            or "dump_memory fail" in diagnostic
+        ):
+            raise DumpMemoryUnsupported("cmd.dump_memory is not supported by the probe")
+        raise TimeoutError("timed out waiting for one complete dump-memory range")
+    finally:
+        try:
+            # Stop immediately instead of requesting another one-shot sample;
+            # the latter would leave a complete frame queued for the next
+            # operation on firmware that implements period=0 literally.
+            bridge._write_raw((stop_command + "\n").encode("utf-8"))
+            stop_deadline = time.monotonic() + 0.2
+            while time.monotonic() < stop_deadline:
+                bridge.drain_stream_bytes(max_bytes=1024 * 1024)
+                time.sleep(0.002)
+        except Exception:
+            pass
+        bridge._exit_stream()
 
 
 class DumpMemoryStreamSession:

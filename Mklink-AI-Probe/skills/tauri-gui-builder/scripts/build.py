@@ -277,6 +277,9 @@ def temporary_bundle_config(config_path):
     data = json.loads(original.decode("utf-8"))
     bundle = data.setdefault("bundle", {})
     bundle["targets"] = ["nsis"]
+    # LZMA's solid dictionary can fail to mmap on Windows machines with a
+    # constrained system drive; zlib keeps the standard NSIS bundle reliable.
+    bundle.setdefault("windows", {}).setdefault("nsis", {})["compression"] = "zlib"
     bundle["externalBin"] = [
         "binaries/mklink-sidecar"
     ]

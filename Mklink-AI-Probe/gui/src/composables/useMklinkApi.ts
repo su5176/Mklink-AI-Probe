@@ -12,6 +12,8 @@ import type {
   FlashRequest,
   ProjectHistory,
   ProbeFirmwareCheck,
+  ProbeFirmwareDownload,
+  ProbeFirmwareUpgrade,
   RttFindResponse,
   RttWriteResponse,
   FileSourceKind,
@@ -114,6 +116,35 @@ export function useMklinkApi() {
 
   async function probeFirmwareCheck(): Promise<ProbeFirmwareCheck> {
     return api<ProbeFirmwareCheck>('/api/probe/firmware-check')
+  }
+
+  async function upgradeProbeFirmware(confirm = false): Promise<ProbeFirmwareUpgrade> {
+    return api<ProbeFirmwareUpgrade>('/api/probe/firmware-upgrade', {
+      method: 'POST',
+      // The FastAPI endpoint declares a scalar bool body, so the wire format
+      // must be JSON true/false rather than an object wrapper.
+      body: JSON.stringify(confirm),
+    })
+  }
+
+  async function downloadProbeFirmware(
+    model: 'V3' | 'V4',
+    family: 'microlink' | 'hpmlink' = 'microlink',
+  ): Promise<ProbeFirmwareDownload> {
+    const query = new URLSearchParams({ model, family })
+    const res = await fetch(`${API_BASE}/api/probe/firmware-download?${query.toString()}`)
+    if (!res.ok) {
+      const error = await res.json().catch(() => null)
+      throw new Error(typeof error?.detail === 'string' ? error.detail : res.statusText)
+    }
+    return {
+      blob: await res.blob(),
+      filename: res.headers.get('X-MKLink-Firmware-Name')
+        || `${family === 'hpmlink' ? 'HPMLink' : 'MicroLink'}_${model}.uf2`,
+      version: res.headers.get('X-MKLink-Firmware-Version') || '',
+      source: (res.headers.get('X-MKLink-Firmware-Source') || 'github') as ProbeFirmwareDownload['source'],
+      family: (res.headers.get('X-MKLink-Firmware-Family') || family) as ProbeFirmwareDownload['family'],
+    }
   }
 
   async function connectDevice(req: ConnectRequest): Promise<DeviceStatus> {
@@ -288,6 +319,8 @@ export function useMklinkApi() {
     updateRttConfig,
     getMicrokeenInfo,
     probeFirmwareCheck,
+    upgradeProbeFirmware,
+    downloadProbeFirmware,
     connectDevice,
     disconnectDevice,
     refreshStatus,

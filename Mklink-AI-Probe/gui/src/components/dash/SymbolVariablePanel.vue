@@ -99,23 +99,56 @@
     <div v-else class="variable-groups">
       <h3 class="variable-root-heading">{{ tr('全局变量', 'Global Variables') }}</h3>
       <template v-for="row in rows" :key="row.node.key">
-        <button
+        <div
           v-if="row.node.kind === 'branch' || row.node.kind === 'range'"
           class="branch-row"
-          type="button"
-          :data-testid="`branch-${row.node.key}`"
           :title="row.node.key"
-          :style="{ paddingLeft: rowIndent(row.depth) }"
           @click="toggleBranch(row.node)"
         >
-          <LoaderCircle v-if="catalog.browseLoading.value.has(row.node.key)" class="branch-spinner" :size="15" aria-hidden="true" />
-          <ChevronDown v-else-if="row.expanded" :size="15" aria-hidden="true" />
-          <ChevronRight v-else :size="15" aria-hidden="true" />
-          <span class="branch-name">{{ row.node.label }}</span>
-          <span v-if="row.node.childCount !== null" class="branch-count">
-            {{ row.node.kind === 'range' ? row.node.childCount : `${row.selectedLeafCount} / ${row.node.childCount}` }}
-          </span>
-        </button>
+          <button
+            class="branch-toggle"
+            type="button"
+            :data-testid="`branch-${row.node.key}`"
+            :style="{ paddingLeft: rowIndent(row.depth) }"
+            @click.stop="toggleBranch(row.node)"
+          >
+            <LoaderCircle v-if="catalog.browseLoading.value.has(row.node.key)" class="branch-spinner" :size="15" aria-hidden="true" />
+            <ChevronDown v-else-if="row.expanded" :size="15" aria-hidden="true" />
+            <ChevronRight v-else :size="15" aria-hidden="true" />
+            <span class="branch-name">{{ row.node.label }}</span>
+            <span v-if="row.node.childCount !== null" class="branch-count">
+              {{ row.node.kind === 'range' ? row.node.childCount : `${row.selectedLeafCount} / ${row.node.childCount}` }}
+            </span>
+          </button>
+          <button
+            v-if="isArraySnapshotNode(row.node)"
+            class="snapshot-button"
+            :class="{ active: snapshotPath === row.node.key }"
+            type="button"
+            :data-testid="`snapshot-${row.node.key}`"
+            :disabled="snapshotBusy === row.node.key"
+            :title="snapshotPath === row.node.key ? tr('关闭数组快照曲线', 'Close array snapshot curve') : tr('设置数组快照范围', 'Configure array snapshot range')"
+            :aria-label="snapshotPath === row.node.key ? tr(`关闭 ${row.node.key} 快照曲线`, `Close ${row.node.key} snapshot curve`) : tr(`设置 ${row.node.key} 快照范围`, `Configure ${row.node.key} snapshot range`)"
+            :aria-pressed="snapshotPath === row.node.key"
+            @click.stop="toggleArraySnapshot(row.node)"
+          >
+            <Activity :size="15" aria-hidden="true" />
+          </button>
+          <button
+            v-if="snapshotPath === row.node.key"
+            class="visibility-button"
+            :class="{ hidden: hiddenChannels?.has(row.node.key) }"
+            type="button"
+            :data-testid="`visibility-${row.node.key}`"
+            :aria-label="hiddenChannels?.has(row.node.key) ? tr(`显示 ${row.node.key} 波形`, `Show ${row.node.key} waveform`) : tr(`隐藏 ${row.node.key} 波形`, `Hide ${row.node.key} waveform`)"
+            :aria-pressed="!hiddenChannels?.has(row.node.key)"
+            :title="hiddenChannels?.has(row.node.key) ? tr('显示波形', 'Show waveform') : tr('隐藏波形', 'Hide waveform')"
+            @click.stop="toggleVisibility(row.node.key)"
+          >
+            <EyeOff v-if="hiddenChannels?.has(row.node.key)" :size="15" aria-hidden="true" />
+            <Eye v-else :size="15" aria-hidden="true" />
+          </button>
+        </div>
         <button
           v-else-if="row.node.kind === 'container' && row.node.container"
           class="container-row"
@@ -284,12 +317,39 @@
         </footer>
       </section>
     </div>
+
+    <div v-if="snapshotDialogNode" class="modal-overlay" data-testid="array-snapshot-modal" @click.self="closeArraySnapshotDialog">
+      <section class="layout-modal array-snapshot-modal" role="dialog" aria-modal="true" aria-labelledby="array-snapshot-title">
+        <header class="layout-modal-header">
+          <h3 id="array-snapshot-title"><Activity :size="17" aria-hidden="true" />{{ tr('设置数组快照', 'Configure Array Snapshot') }}</h3>
+          <button class="icon-button" type="button" :title="tr('关闭', 'Close')" :aria-label="tr('关闭', 'Close')" @click="closeArraySnapshotDialog">
+            <X :size="16" aria-hidden="true" />
+          </button>
+        </header>
+        <p class="snapshot-modal-help">{{ snapshotDialogNode.key }} · {{ tr(`数组长度 ${arrayLength(snapshotDialogNode)}`, `Array length ${arrayLength(snapshotDialogNode)}`) }}</p>
+        <label class="layout-field">
+          <span>{{ tr('起始索引', 'Start index') }}</span>
+          <input v-model="snapshotStartIndex" class="form-input" data-testid="array-snapshot-start" inputmode="numeric" />
+        </label>
+        <label class="layout-field">
+          <span>{{ tr('读取数量', 'Read count') }}</span>
+          <input v-model="snapshotCount" class="form-input" data-testid="array-snapshot-count" inputmode="numeric" />
+        </label>
+        <p v-if="snapshotRangeError" class="snapshot-range-error" role="alert">{{ snapshotRangeError }}</p>
+        <footer class="layout-modal-actions">
+          <button type="button" class="btn btn-secondary" @click="closeArraySnapshotDialog">{{ tr('取消', 'Cancel') }}</button>
+          <button type="button" class="btn btn-primary" data-testid="array-snapshot-confirm" :disabled="snapshotBusy !== null" @click="confirmArraySnapshot">
+            {{ snapshotBusy ? tr('读取中', 'Starting') : tr('开始快照', 'Start Snapshot') }}
+          </button>
+        </footer>
+      </section>
+    </div>
   </aside>
 </template>
 
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
-import { ChevronDown, ChevronRight, Code2, Eye, EyeOff, LoaderCircle, Plus, RefreshCw, X } from '@lucide/vue'
+import { Activity, ChevronDown, ChevronRight, Code2, Eye, EyeOff, LoaderCircle, Plus, RefreshCw, X } from '@lucide/vue'
 import { useSymbolCatalog } from '../../composables/useSymbolCatalog'
 import { useToast } from '../../composables/useToast'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
@@ -306,14 +366,17 @@ const props = withDefaults(defineProps<{
   symbolError?: string
   latestValues: Record<string, number | boolean>
   hiddenChannels?: ReadonlySet<string>
+  snapshotPath?: string | null
 }>(), {
   symbolLoaded: true,
   symbolError: '',
+  snapshotPath: null,
 })
 
 const emit = defineEmits<{
   'visibility-change': [path: string, visible: boolean]
   'selection-removed': [path: string]
+  'snapshot-change': [path: string | null]
 }>()
 
 const catalog = useSymbolCatalog()
@@ -344,6 +407,10 @@ const writeSuccess = reactive<Record<string, number | boolean | undefined>>({})
 const expanded = shallowRef(new Set<string>())
 const searchItems = shallowRef<SymbolDescriptor[]>([])
 const selectedDescriptors = shallowRef(new Map<string, SymbolDescriptor>())
+const snapshotBusy = ref<string | null>(null)
+const snapshotDialogNode = ref<SymbolTreeNode | null>(null)
+const snapshotStartIndex = ref('0')
+const snapshotCount = ref('128')
 let searchExpansionSnapshot: Set<string> | null = null
 let searchRequest = 0
 
@@ -387,6 +454,82 @@ async function loadWorkspace(): Promise<void> {
     await refreshSelectedDescriptors()
   } catch (cause) {
     toast.error(cause instanceof Error ? cause.message : String(cause))
+  }
+}
+
+function isArraySnapshotNode(node: SymbolTreeNode): boolean {
+  if (node.kind !== 'branch' || node.browse?.snapshot_eligible !== true) return false
+  return Array.isArray(node.browse.array_dimensions) && node.browse.array_dimensions.length === 1
+}
+
+function arrayLength(node: SymbolTreeNode): number {
+  return node.browse?.array_dimensions?.[0] ?? node.childCount ?? 0
+}
+
+const snapshotRangeError = computed(() => {
+  if (!snapshotDialogNode.value) return ''
+  const total = arrayLength(snapshotDialogNode.value)
+  const start = Number(snapshotStartIndex.value)
+  const count = Number(snapshotCount.value)
+  if (!Number.isInteger(start) || start < 0 || start >= total) {
+    return tr(`起始索引必须在 0 到 ${Math.max(0, total - 1)} 之间。`, `Start index must be between 0 and ${Math.max(0, total - 1)}.`)
+  }
+  if (!Number.isInteger(count) || count < 1 || count > 4096) {
+    return tr('读取数量必须是 1 到 4096 之间的整数。', 'Read count must be an integer from 1 to 4096.')
+  }
+  if (start + count > total) {
+    return tr(`读取范围不能超过数组长度 ${total}。`, `The range cannot exceed array length ${total}.`)
+  }
+  return ''
+})
+
+function openArraySnapshotDialog(node: SymbolTreeNode): void {
+  const total = arrayLength(node)
+  snapshotDialogNode.value = node
+  snapshotStartIndex.value = '0'
+  snapshotCount.value = String(Math.min(128, total))
+}
+
+function closeArraySnapshotDialog(): void {
+  if (snapshotBusy.value) return
+  snapshotDialogNode.value = null
+}
+
+async function toggleArraySnapshot(node: SymbolTreeNode): Promise<void> {
+  if (props.snapshotPath === node.key) {
+    snapshotBusy.value = node.key
+    try {
+      await request('/api/dash/superwatch/array-snapshot/clear', { method: 'POST' })
+      emit('snapshot-change', null)
+    } catch (cause) {
+      toast.error(cause instanceof Error ? cause.message : String(cause))
+    } finally {
+      snapshotBusy.value = null
+    }
+    return
+  }
+  openArraySnapshotDialog(node)
+}
+
+async function confirmArraySnapshot(): Promise<void> {
+  const node = snapshotDialogNode.value
+  if (!node || snapshotRangeError.value) return
+  snapshotBusy.value = node.key
+  try {
+    await request('/api/dash/superwatch/array-snapshot/select', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: node.key,
+        start_index: Number(snapshotStartIndex.value),
+        count: Number(snapshotCount.value),
+      }),
+    })
+    emit('snapshot-change', node.key)
+    snapshotDialogNode.value = null
+  } catch (cause) {
+    toast.error(cause instanceof Error ? cause.message : String(cause))
+  } finally {
+    snapshotBusy.value = null
   }
 }
 
@@ -642,23 +785,50 @@ watch(tree, roots => {
 .variable-groups { min-height: 0; overflow: auto; }
 .variable-root-heading { margin: 0; padding: 7px 10px; color: var(--muted); background: var(--bg); font-size: 11px; font-weight: 600; }
 .branch-row {
+  align-items: center;
+  display: flex;
+  width: 100%;
+  min-height: 32px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.branch-row:hover { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
+.branch-toggle {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;
   align-items: center;
-  gap: 5px;
-  width: 100%;
+  flex: 1;
+  min-width: 0;
   min-height: 32px;
+  gap: 5px;
   padding-top: 4px;
-  padding-right: 10px;
+  padding-right: 8px;
   padding-bottom: 4px;
   border: 0;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
+  background: transparent;
   color: var(--fg);
   cursor: pointer;
   text-align: left;
 }
-.branch-row:hover { background: color-mix(in srgb, var(--accent) 5%, var(--surface)); }
+.snapshot-button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 28px;
+  width: 28px;
+  height: 28px;
+  margin-right: 5px;
+  padding: 0;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+.snapshot-button:hover, .snapshot-button.active { border-color: var(--accent); color: var(--accent); }
+.snapshot-button.active { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.snapshot-button:disabled { color: var(--muted); cursor: default; opacity: .5; }
+.array-snapshot-modal { width: min(420px, 100%); }
+.snapshot-modal-help { margin: 0; color: var(--muted); font: 11px/1.5 var(--mono, ui-monospace, Consolas, monospace); overflow-wrap: anywhere; }
+.snapshot-range-error { margin: 0; color: var(--danger); font-size: 11px; }
 .branch-spinner { animation: branch-spin 0.8s linear infinite; }
 @keyframes branch-spin { to { transform: rotate(360deg); } }
 .container-row {

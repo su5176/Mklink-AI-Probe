@@ -35,6 +35,7 @@ class SystemViewSession:
     _COMMAND_STOP = b"\x02"
     _COMMAND_GET_TASKLIST = b"\x04"
     _TASKLIST_RETRY_DELAY_S = 0.15
+    _STREAM_DRAIN_INTERVAL_S = 0.01
 
     def start(
         self,
@@ -166,7 +167,7 @@ class SystemViewSession:
             if prefetched:
                 chunks.append(prefetched)
                 total = len(prefetched)
-        deadline = time.time() + duration
+        deadline = time.monotonic() + max(0.0, float(duration))
         while True:
             budget = None if max_bytes is None else max(0, int(max_bytes) - total)
             if budget == 0:
@@ -179,9 +180,10 @@ class SystemViewSession:
                 chunks.append(chunk)
                 total += len(chunk)
             self._request_tasklist_after_startup()
-            if time.time() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            time.sleep(0.05)
+            time.sleep(min(self._STREAM_DRAIN_INTERVAL_S, remaining))
         # 收尾再 drain 一次，避免漏掉最后一段
         try:
             budget = None if max_bytes is None else max(0, int(max_bytes) - total)

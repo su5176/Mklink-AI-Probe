@@ -34,7 +34,7 @@ class FakeSocket {
   }
 }
 
-function setup(token?: string) {
+function setup(token?: string, serializeWorkerFrames = false) {
   const sockets: FakeSocket[] = []
   const worker = {
     postMessage: vi.fn(),
@@ -56,6 +56,7 @@ function setup(token?: string) {
       return socket as unknown as WebSocket
     },
     worker: worker as unknown as Worker,
+    serializeWorkerFrames,
     onState: state => states.push(state),
     onWorkerMessage: message => outputs.push(message),
   })
@@ -81,6 +82,28 @@ describe('StreamClient', () => {
     expect(worker.postMessage).toHaveBeenNthCalledWith(2, {
       type: 'frame', buffer, connectionGeneration: 1, frameTicket: 1,
     }, [buffer])
+  })
+
+  it('serializes frames when requested so range work can interleave', () => {
+    const { client, sockets, worker } = setup(undefined, true)
+    client.start()
+    sockets[0].open()
+    const first = new ArrayBuffer(16)
+    const second = new ArrayBuffer(16)
+    sockets[0].onmessage?.(new MessageEvent('message', { data: first }))
+    sockets[0].onmessage?.(new MessageEvent('message', { data: second }))
+    expect(worker.postMessage).toHaveBeenCalledTimes(2)
+    client.requestVisibleRange(9, 0, 100, 640)
+    expect(worker.postMessage).toHaveBeenLastCalledWith({
+      type: 'visible-range', requestId: 9, start: 0, end: 100, pixelWidth: 640,
+    })
+    worker.onmessage?.(new MessageEvent('message', { data: {
+      type: 'telemetry', acceptedFrames: 1, bufferedSamples: 1,
+      transportDroppedBatches: 0, backendDroppedBatches: 0,
+      backendDroppedItems: 0, backendDroppedBytes: 0, lastSequence: 1n,
+      acceptedConnectionGeneration: 1, acceptedFrameTicket: 1,
+    } }))
+    expect(worker.postMessage).toHaveBeenCalledTimes(4)
   })
 
   it('backs off across open-then-immediate-close loops until valid data arrives', () => {

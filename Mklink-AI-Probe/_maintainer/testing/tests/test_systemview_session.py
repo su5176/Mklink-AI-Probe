@@ -75,6 +75,31 @@ def test_systemview_session_retries_only_tasklist_after_startup_burst():
     assert b"\x05" not in bridge.raw_writes
 
 
+def test_systemview_short_reads_do_not_wait_in_fixed_50ms_steps(monkeypatch):
+    bridge = RecorderBridge(hello=b"")
+    session = SystemViewSession(bridge, channel=1)
+    session._running = True
+    session._started_at = 0.0
+    session._tasklist_requested = True
+    now = 0.0
+    sleeps = []
+
+    def monotonic():
+        return now
+
+    def sleep(duration):
+        nonlocal now
+        sleeps.append(duration)
+        now += duration
+
+    monkeypatch.setattr("mklink.systemview.time.monotonic", monotonic)
+    monkeypatch.setattr("mklink.systemview.time.sleep", sleep)
+
+    assert session.read_bytes(duration=0.033) == b""
+    assert sum(sleeps) == pytest.approx(0.033)
+    assert max(sleeps) <= session._STREAM_DRAIN_INTERVAL_S
+
+
 def test_systemview_session_releases_stream_when_recorder_handshake_fails():
     bridge = RecorderBridge(hello=b"NOPE")
     session = SystemViewSession(bridge, channel=1)

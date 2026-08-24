@@ -239,6 +239,7 @@ class Device:
         saved_port = str(config.get("com_port") or "").strip() or None
         candidate = self._port or self._preferred_port or saved_port
         attempted: set[str] = set()
+        candidate_attempts: dict[str, int] = {}
         discovery_lock = None
 
         try:
@@ -260,13 +261,26 @@ class Device:
                     if candidate is None:
                         break
 
-                attempted.add(candidate.strip().casefold())
+                candidate_key = candidate.strip().casefold()
+                attempt = candidate_attempts.get(candidate_key, 0)
                 bridge = MKLinkSerialBridge(candidate)
                 if bridge.connect():
                     self._bridge = bridge
                     self._port = candidate
                     break
                 bridge.close()
+
+                # USB CDC ports can be visible a short moment before the
+                # firmware REPL is ready. Retry the same candidate once so a
+                # transient enumeration race does not require a second user
+                # click. Only exhausted candidates are excluded from the next
+                # discovery pass.
+                if attempt == 0:
+                    candidate_attempts[candidate_key] = 1
+                    time.sleep(0.15)
+                    continue
+
+                attempted.add(candidate_key)
 
                 if not automatic:
                     break
@@ -1025,6 +1039,22 @@ class Device:
         finally:
             self.close()
 
+    def enter_bootloader(self) -> None:
+        """Ask the probe to enumerate its UF2 bootloader drive.
+
+        The command intentionally has no trailing prompt: entering UF2 mode
+        tears down the CDC connection.  Close the bridge immediately so the
+        caller can observe the drive re-enumeration without holding the serial
+        resource lock.
+        """
+        self._require_connected()
+        self._stop_active_probe_streams()
+        bridge = self._bridge
+        try:
+            bridge.send_command_nowait("cmd.enter_bootloader()")
+        finally:
+            self.close()
+
     def _get_mcu_profile(self) -> dict | None:
         from mklink.profiles import load_mcu_profiles, match_mcu_by_idcode, match_mcu_by_device
         profiles = load_mcu_profiles()
@@ -1379,7 +1409,14 @@ class Device:
         # SystemCoreClock must be read before SystemView switches the bridge
         # into binary stream mode; command/variable reads are unavailable there.
         if cpu_freq_hint:
-            self._systemview_parser._cpu_freq = cpu_freq_hint
+            set_cpu_freq = getattr(self._systemview_parser, "set_cpu_freq", None)
+            if callable(set_cpu_freq):
+                set_cpu_freq(
+                    cpu_freq_hint,
+                    lock=cpu_freq_source in {"SystemCoreClock", "hpm_core_clock"},
+                )
+            else:
+                self._systemview_parser._cpu_freq = cpu_freq_hint
             result.setdefault("cpu_freq_hint", cpu_freq_hint)
             if cpu_freq_source:
                 result.setdefault("cpu_freq_source", cpu_freq_source)

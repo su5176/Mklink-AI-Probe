@@ -4,84 +4,61 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-24T11:14:53+08:00`
-- 分支：`feature/eternal-chip-gui`
-- HEAD：`本地 master 9cba616（HIL v0.2 只读插件适配 + hil-lock 元数据 guard 修复）已整体合并进立芯分支，合并提交 afb4781；分支相对 master 仅剩立芯品牌 GUI、演示资产与分支记忆差异，mklink 核心运行时与 master 逐字节一致。`
-- 远端 HEAD：`用户授权将合并后的 feature/eternal-chip-gui 推送到 GitHub origin；master 分支本身仍领先 origin/master 两个提交（fbaac61、9cba616），本次未推送 master，未创建标签或 Release。`
-- 工作树：合并后门禁全部在分支重跑；生产构建产生的 dist 哈希残留已恢复/清理，工作树对 Git 干净（仅既有未跟踪缓存目录）。
-- 当前任务：本地 master 9cba616 全部改动（含 fbaac61 hil-lock 元数据串行化修复、9cba616 HIL v0.2 只读插件适配）合并进 feature/eternal-chip-gui 并推送 GitHub origin；立芯品牌界面与分支独有资产保持不变。
-- 状态：`master_synced_into_eternal_chip`
+- 更新时间：`2026-08-24T19:13:12+08:00`
+- 分支：`master`
+- HEAD：`v0.1.7 -> b0173dfcfba506d397ca373e3ce645ff19bca629`
+- 远端 HEAD：`GitHub/Gitee master、v0.1.7 和 updates 已同步`
+- 工作树：正式发布完成；仅保留最终发布证据和本地正式资产。
+- 当前任务：上游 PR #13（v0.1.7 探针/HIL/发布改进）已合并进 su5176/master（merge commit 282a13bc3）；随后把 origin/master 整体合并进 feature/eternal-chip-gui：保留立芯品牌 GUI 样式体系，接入 master 新增的配置页固件升级分区（HPMLink V4）与在线烧录读取/保存/清空按钮，gui/dist 由合并后源码重新生产构建。
+- 状态：`master_synced_into_eternal_chip_v0.1.7`
 
 ## 里程碑
 
-- **产品与分发** — `complete`。Python、Skill、Web GUI 和 Tauri 版本统一为 v0.1.6，标准 NSIS 使用内置 sidecar。
-- **烧录与兼容性** — `complete`。在线/脱机烧录、HPM ROM API、Pack/FLM、固件刷新、复合探针和扇区解析已集成。
-- **调试与数据流** — `complete`。Memory、RTT、SystemView、VOFA、串口和 Modbus 共用资源仲裁与轻量流通道。
-- **多实例与远程** — `complete`。每个桌面实例使用独立后端和探针连接；Site Agent 支持认证直连与 LAN STCP。
+- **v0.1.7 运行时** — `complete`。首次连接、在线读取回烧、RTT/SuperWatch 保存、RTOS Trace、MicroLink/HPMLink 固件升级、托盘和响应式界面修复已完成。
+- **桌面与 Web 一致性** — `complete`。Web 与 Tauri 共享 Vue 前端和 FastAPI 能力，客户端连接与后端生命周期互不干扰。
+- **SystemView Timeline** — `complete`。连续跟随、首屏稳定刷新、缩放跟随和可见区间累计缓存已在最新修复分支实现。
 
 ## 验证证据
 
-- **master 同步进立芯分支门禁**：合并提交 afb4781 把本地 master 9cba616 整体带入 feature/eternal-chip-gui；hil_lock.py 取 master 侧（分支旧版与 40f5b2b 逐字节一致，master 版为严格超集），记忆/交接文件按 master 新状态为基重写。分支相对 master 仅剩立芯品牌 GUI、demo-shots、mock-server、分支 dist 与记忆差异，mklink 核心与 master 逐字节一致（hil_lock、mcu_detect 等校验相同）。门禁在合并分支重跑：Python 全量 1304 passed、1 skipped，仅 test_pack_manager.py::test_cancel_closes_job_before_recovery_and_kills_real_worker 一次时序竞态失败（该文件与 master 逐字节相同，隔离复跑 6 次中 4 过 2 败，属子进程写 PID 文件存在性/内容竞态的环境抖动，非合并回归）；GUI 全量 56 文件/529 项全部通过；vue-tsc + Vite 生产构建与 Tauri cargo check 通过；git diff --check 干净，dist 哈希残留已恢复/清理。真机证据沿用 master 9cba616 已准入记录（真实 MicroKeenV4 识别/健康/debug.read/safe_state、plugin-review 11 OK、conformance 清洁），本次未执行任何新的真机动作。
-- **HIL-Infra v0.2 插件准入**：真实 MicroKeenV4 上完成 identify/capabilities/health/safe_state、双向 transport 锁互操作和无残留 lease；HIL plugin-review PR-01~11 为 11 OK、0 WARN、0 FAIL，runtime conformance 0 error/0 warning/0 waiver。插件单测 5 passed；补入与 master 本机原生源码制品 SHA-256 758E428F...77C07 的未跟踪 mklink-stcp.dll 并把 pytest basetemp 移到源码树外后，Python 全量 1305 passed、1 skipped；GUI 首轮 2 个套件级 mock 抖动，目标文件 67/67 通过后全量复跑 54 文件/525 项通过；Vite 生产构建及 cargo check 通过。未执行烧录、复位、供电、DUT 写入或激励。
-- **僵尸锁与探针电源/重启控制**：Windows PID 判定现同时检查 OpenProcess 与 GetExitCodeProcess；真实已退出子进程仍保留句柄时正确返回死亡，serial_MKLINK_AUTO_CONNECT.lock 回归可自动删除。Device/MCP/REST/GUI 新增 1800/3300/5000 mV 与 probe reboot；5V 在 Device、REST、MCP、GUI 四层要求逐次显式确认，reboot 后释放串口与 HIL 锁，活动 RTT/SystemView 在参数校验通过后先安全停止。最终 Python 1300 passed、1 skipped；GUI 54 文件/525 项、Vite 生产构建、Tauri cargo check 通过。真实 Playwright 验证 3.3V 请求 confirm_5v=false、取消 5V 不发请求、确认 5V 才发送 confirm_5v=true、reboot 需确认。浏览器使用模拟后端，未对硬件输出电压；项目无已确认 bench.yaml，维护者于 2026-08-16 明确豁免本次真机门禁，不得把该豁免表述为真机验证通过。
-- **双分支本地合并与隔离**：master 与 feature/eternal-chip-gui 均完成本地快进。立芯分支运行时 c9fc938 通过 Python 全量覆盖（首轮 1297 passed、1 skipped，PyPI 恢复后受影响文件 7/7 通过）、GUI 56 文件/529 项、生产构建、cargo check 和真实 Chromium + mock 验收。两分支 mklink 核心、Skill 与探针控制回归测试无差异；HIL 锁提交分别位于两条祖先链，立芯品牌提交 7ba8f57 不是 master 祖先。用户随后明确授权，两条分支通过 Git 原子推送同步到 GitHub origin。
-- **FLM 查找修复选择性合并**：从 origin/master 8f6a094 创建 fix/pdsc-device-algorithm，仅摘取原提交 68d4e4f 为 8da2d2d；差异只有 mklink/mcu_detect.py 与 mklink/mcu_profiles.json，无 GUI 或 HIL 锁文件。真实 D:\Keil_v5\ARM\PACK 中 Keil.STM32F4xx_DFP.pdsc 对 STM32F411CEUx/RETx 均命中 device 级 CMSIS/Flash/STM32F4xx_512.FLM。Python 全量先得 1282 passed、1 skipped，环境性失败随后逐项联网复跑通过；GUI 54 文件/521 项、Vite 生产构建、Tauri cargo check 均通过。Site Agent 打包补入与当前 stcp_bridge 源码哈希一致的本地 DLL 后 3 项通过，DLL 与测试产物均不提交。
-- **v0.1.6 运行时**：GUI 518 项、配置页 22 项和连接后端 12 项通过；Python 可比门禁 1262 项通过、1 项跳过。真实 Chrome、独立 Web 后端、下载器和 HPM5301 完成自动搜索、错误端口回退和再次连接闭环。
-- **烧录与数据流**：HPM 在线烧录自动运行、重复固件加载、浏览器文件刷新和客户 HEX 解析已验证；串口/RTT 高吞吐与下载器 V2/V3/V4 数据完整性完成真机验证。
-- **v0.1.6 正式分发**：七项资产哈希复算通过；正式 NSIS 已覆盖安装，健康与探针接口、内置 sidecar、零 Python 子进程、正常退出和动态端口释放通过。本地 Skill 指向 2f65f92c98；GitHub/Gitee Release、标签和 updates/latest.json 已核对一致。
-- **浏览器后端生命周期**：真实 Chrome 双标签验证：关闭一个标签时后端继续运行；关闭最后标签后约 3 秒正常退出，8765 可立即重绑定。关闭前下载器保持连接，随后新后端能重新连接同一下载器，确认 CMD 串口和 Device 已释放。GUI 521 项、生产构建和 Tauri cargo check 通过；Python 1274 项通过、1 项跳过，12 项仅因 Windows 缺少符号链接权限失败。
-- **源码与本地 Skill 同步**：Aladdin-Wang GitHub/Gitee master 与 su5176 PR #10 已同步；用户级 Skill、完整 GUI/MCP 依赖导入和 Skill 校验通过，快速启动网页已写入当前 MICROKEEN 卷。su5176 PR #10 于 2026-08-12 合并为 2f8e902。
-- **PR #10 合并门禁复核**：GitHub 合并前状态 CLEAN、MERGEABLE，头 4d7d617 相对基线 6360843 前进 35 个提交且未落后；仓库未配置远端状态检查。本机隔离复核通过 GUI 54 文件/521 项、Vite 生产构建、Tauri Rust 12 项与 cargo check。首次 Python 全量得到 1284 passed、1 skipped；3 项仅因隔离 worktree 缺少未入库 mklink-stcp.dll 报错，在补入与 PR 完全相同 stcp_bridge 源码树生成且 SHA-256 一致的 DLL 后定向 3 项全通过。旧 Device 连接测试仍 mock 已移除的 _resolve_port，已改为 mock 当前 load_config 入口以消除本地项目配置依赖；修正后的最终 Python 全量为 1288 passed、1 skipped。PR 中既有真实 Chrome 双标签、下载器重连和 HPM/串口/RTT 真机闭环继续作为实机证据。
-- **立芯恒方 GUI 分支验收**：GUI 精修后全量 56 文件/525 项通过，Vite 生产构建、Tauri cargo check 与立芯 GUI 规范校验通过；真实 Chromium 在 1440x1000、1024x768 与 390x844 下完成 porcelain/abyss、配置、仪表盘、主题面板和 About 视觉验收。主题选择、外围点击与 Esc 均能收起面板，Esc 会把焦点还给触发按钮；390px 下修复配置标题全局样式污染并移除可见滚动条轨道。Python 全量仍沿用本分支前次 1285 passed、1 skipped 及 3 项环境缺件 setup error 证据。未执行连接、烧录或其他真机动作。
-- **探针控制与僵尸锁同步验收**：c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit；随后明确授权并通过 Git 原子推送同步到 GitHub origin。
+- **master v0.1.7 同步进立芯分支门禁**：合并 feature/eternal-chip-gui + origin/master(282a13bc3)：冲突解决为 ConfigView.vue （立芯 config-panel-header 样式体系 + master 固件升级面板接入为第 5 配置分区）、FirmwareWorkspace.vue（立芯主题化 hex 配色 + master file-actions 读取/保存/清空按钮）、.gitignore 并集、记忆/交接按 master 新状态为基重写；gui/dist 删除后由 vue-tsc + Vite 生产构建重建（28s 通过）。GUI 全量 59 文件/586 项通过（首轮 1 项 creating-job latch 时序抖动，隔离复跑 74/74 后全量复跑全绿）。Python 全量 1383 passed、1 skipped，1 项 test_release_manifest.py::test_public_skill_archive_excludes_repository_maintenance 因归档取自 HEAD 提交树、而合并尚未提交（HEAD plugin.json 仍为 0.1.6）在提交前运行而失败，合并提交后定向复跑通过。git diff --check 干净、无残留冲突标记。真机证据沿用 master v0.1.7 已准入记录，本次未执行任何新的真机动作。
+- **v0.1.7 正式发布**：标签目标 b0173dfcfba506d397ca373e3ce645ff19bca629。工程目录虽保留 STM32F103RC 历史名，物理芯片、Keil 和在线烧录均按 STM32F103RE 验证。Keil 0 错误 0 警告；Python 1372 项通过、1 项跳过，12 项仅因 Windows 无目录 symlink 权限失败；GUI 57 文件/582 项、生产构建和 NSIS 打包通过。真机完成原生/在线/脱机烧录、AXF 符号、RAM 读写、RTT 双向、64 点 SuperWatch、VOFA、SystemView、受控 HardFault 与恢复、固件检查、探针重启和资源释放。受限 PATH 安装态健康，内置 sidecar 无 Python 子进程，发现 1 个串口和 MKLink U 盘，正常关闭后进程与 8765 端口释放。正式安装包 75042077 字节，SHA-256 1fad66d1c7fee1c8802da946a377aa34d03b7a5b946fc614c3384de16539a71e；GitHub/Gitee 各 7 个资产，master、标签、updates 和更新 JSON 均一致。
+- **HIL v0.2 上游同步**：选择性移植 su5176/master 的 fbaac61 与 9cba616，不导入上游项目记忆；acquire/release/renew 统一进入元数据 guard，同时保留同机死亡进程锁回收。无人值守协议只开放 observe/debug.read，memory/register/variable 在连接前验证目标参数和 VID/PID/序列号/locator。HIL/探针控制聚焦 27 项通过；Python 全量 1371 项通过、1 项跳过，12 项仅因 Windows 无目录 symlink 权限失败；GUI 57 文件/582 项及 TypeScript/Vite 生产构建通过。真机完成 identify/capabilities/health/safe_state/plugin-version、HPM5301 只读 4 字节、身份不匹配拒绝和锁释放闭环。
+- **Skill 上下文隔离**：维护与 Tauri 构建 Skill 在 OpenAI 配置中禁止隐式调用；跨模型公开 Skill 归档使用运行时内容白名单，拒绝维护内容混入。相关 Python 19 项通过；Python 全量 1351 项通过、1 项跳过，12 项仅因 Windows 无目录 symlink 权限失败；GUI 57 文件/582 项及 TypeScript/Vite 生产构建通过。白名单归档约 3.15 MB，相比 v0.1.6 发布包减少 44.6%。本地替换后可发现 Skill 从 3 个降为 1 个：发现元数据从 476 降至 359 o200k tokens（-24.6%），全部可加载 Skill 正文从 7,711 降至 5,385（-30.2%），额外维护 Skill 2,286 tokens 和维护说明语料 6,640 tokens 均完全移除；用户运行 Skill 正文仍保留 5,385 tokens。
+- **HPMLink V4 固件升级**：HPMLink_V4.3.7.uf2 为 1,520,128 字节、2,969 个合法 UF2 块；V4.3.6 HPM 下载器的 MICROKEEN 盘检测到 STARTUP_ANIMATION.zhrgb 后只选择 HPMLink_V4.3.7.uf2，自动进入 Bootloader、复制、重新枚举并回读 V4.3.7，返回 updated。升级后 FastAPI 实际连接/升级/断开路径返回 up_to_date 且固件仍为 HPMLink。Python 固件升级 14 项、GUI 相关 34 项、GUI 全量 582 项及生产构建通过；Python 全量 1357 项通过、1 项跳过，12 项仅因 Windows 无目录 symlink 权限失败。
 
 ## 架构决策
 
-- HIL v0.2 自动化最小面只开放 lifecycle 与 observe/debug.read；CAPABILITIES 可报告物理全能力，但 automation_verbs 只有 debug.read，未开放动作在解析 transport 前 fail-closed。
-- safe_state 对 one-shot probe 只证明真实设备身份仍可枚举、互操作 transport 锁可获取并已释放、无持续输出；不声称 DUT 已复位、断电或恢复业务状态。
-- Windows 串口锁 owner 只有在进程退出码为 STILL_ACTIVE 时才判定存活；访问拒绝或查询失败保持保守，不自动删除可能属于活动进程的锁。
-- VCC 只接受 1800/3300/5000 mV；5000 mV 每次都需显式 confirm_5v=True，GUI 另有危险确认；reset 复位目标 MCU，reboot_probe 重启探针并断开会话。
-- 历史端口是软偏好，可回退自动发现；当前会话手选端口首次保持严格约束，失败后切回自动搜索。
-- 运行时修改在 fix/feature 分支完成全量测试、生产构建、项目记忆和真机闭环后合并。
-- HPM 目标只使用 ROM API；ELF/DWARF 默认使用内置 pyelftools。
-- Dashboard 与烧录/调试操作共用资源租约；复位前停止 RTT、SuperWatch、VOFA 和 SystemView。
-- 串口和 RTT 终端使用独立 Worker 与有界缓冲；终端模式不维护隐藏日志。
-- 每个 Tauri 实例拥有独立 sidecar、动态端口和探针锁；正式发布默认只生成标准 NSIS。
-- 由命令主动打开的浏览器 GUI 使用标签页会话租约；最后标签消失后正常关闭后端并释放资源，显式 --no-browser 和 Tauri sidecar 保持常驻。
-- 立芯恒方作为软件界面品牌，MicroKeen 作为烧录器硬件品牌；GUI 保留现有信息架构并统一使用 porcelain、mica、aqua、abyss、graphite、aurora 六主题。
-- 主题入口使用受控弹层而非原生 details/select；选择主题、点击外围或按 Esc 后收起，Esc 关闭时恢复触发按钮焦点。
-- VCC 仅接受 1800、3300、5000 mV；5000 mV 必须在 GUI 和后端同时显式确认，避免误将 5V 加到 3.3V 系统。
-- reboot() 仅重启 MKLink 探针并主动关闭连接、释放串口与 HIL 锁；目标 MCU 复位继续使用 reset()/cmd.set_reset()。
+- 每个独立问题单独提交并推送，便于回退。
+- Web-entry 遇到 API-only 端口必须跳过并继续扫描，不能误杀 AI 或其他 GUI 后端。
+- HPM 目标使用设备端 ROM API，不加载 FLM；HPM Flash 映射基址为 0x80000000。
+- HPM 在线读取优先采用有限范围的 cmd.dump_memory 一次性二进制帧，按目标边界分块、校验 CRC/region error 并显式退出；cmd.read_flash 只作旧固件回退或诊断。
+- AI CLI、Web GUI 和 Tauri 各自持有连接与后端生命周期。
+- 普通用户只获得 mklink-ai-probe 运行时 Skill；维护与桌面构建 Skill 保留在源码仓库且只允许显式调用。
+- 正式 Skill 发布包必须由 prepare_release.py 从来源提交按公开白名单生成；外部预制包也必须通过同一白名单校验。
+- 探针固件选择必须同时匹配硬件代际和产品族：仅 V4 且 MICROKEEN 根目录存在 STARTUP_ANIMATION.zhrgb 时使用 HPMLink；其他情况继续使用 MicroLink。
+- HIL 锁的所有权校验、回收、创建、续租和释放由同一 guard 串行化并保留同机死亡进程回收；v0.2 无人值守面只开放 lifecycle 与 observe/debug.read，无效动作、目标、参数或设备身份必须在连接前拒绝。
 
 ## 真机环境
 
-- **probe**：维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。
-- **target**：ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。
-- **permission**：用户已授权本次 master→feature/eternal-chip-gui 同步合并、合并后门禁复跑与该分支的 GitHub origin 推送；不授权标签、Release、Gitee 同步或新的真机动作。真机证据沿用 master 9cba616 已准入记录（核心运行时逐字节一致）。历史 VCC/reboot 豁免仍不授权任何 5V 实机输出。
+- **probe**：维护机可使用 V2/V3/V4；HPMLink V4 下载器已升级并回读 V4.3.7。交接不记录端口或完整探针标识。
+- **target**：实际 STM32F103RE 可用于任意修改测试代码和破坏性烧录闭环；工程目录名 STM32F103RC 仅为历史命名。HPM5301 已完成 HIL 插件 4 字节只读闭环。
+- **permission**：维护者已授权 v0.1.7 正式签名、标签、GitHub/Gitee Release、双端 master 同步和 updates 分支发布；VCC 仍需逐次确认具体电压。
 
 ## 下一动作
 
-1. 确认是否把本地 master（9cba616，仍领先 origin/master 两个提交）也推送到 GitHub origin。
-2. 为 test_pack_manager.py 的 PID 文件写入竞态开独立修复分支（原子写或内容就绪等待），消除本机时序抖动。
-3. 需要补充硬件证据时，在额定电压已核对的目标板上分别验证 1.8V/3.3V，5V 仅使用明确可承受 5V 的负载，并验证探针重启后的重新枚举与锁释放。
-4. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
-5. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
+1. 后续功能或修复按新版本开发，不移动已发布的 v0.1.7 标签。
+2. 如要补齐串口、Modbus 或 VCC 真机项，先提供已确认的串口/RS-485 接线或明确 VCC 电压。
 
 ## 已知限制
 
-- test_pack_manager.py 的 cancel/parent-death 进程竞态测试在本机存在时序抖动：子进程 write_text 写 PID 文件非原子，父进程见文件即读可能得到空内容；与合并无关，待独立修复分支收敛。
-- 无人值守面首期没有开放 program/console/bus 写入，也没有为 RTT/UART 只读动作准入；扩大 allowed verbs 必须重新走 HIL plugin-review 和真机安全评审。
-- VCC 与探针 reboot 无本次提交对应的真机 HIL 证据；维护者已明确豁免，真实浏览器仅验证了受保护的请求路径。
-- 高事件率 SystemView 仍可能溢出目标 RTT 缓冲。
-- V4 脱机首次触发的瞬时空失败仍需冷启动复现。
-- 部分客户芯片修复缺少物理目标板编程证据。
-- 先楫定制店铺尚无权威链接，菜单项保持禁用。
-- USB Web Entry 和安装更新仍需更多平台与干净 Windows 验证。
-- 发布器默认仓库参数仍含旧备用名；下次发布前应修正或继续显式传入两端 Aladdin-Wang 仓库。
-- 本次按用户豁免未取得 VCC 输出与探针重启的真机闭环证据；软件协议、安全门禁和 mock 浏览器闭环已通过。
+- 当前 Windows 账户不能创建目录 symlink，相关安全测试需在有权限环境复测。
+- 串口 TX/RX 与 Modbus RTU 缺少已确认的物理回环/从站，不能把自动化测试替代为真机 PASS。
+- v0.1.7 安装包没有 Windows Authenticode 签名；桌面辅助控制通道不可用，桌面共享前端已通过浏览器交互、安装态通过进程和 API 独立验证。
+- HPM 旧固件若不支持 dump_memory，将按一次请求回退到较慢的 cmd.read_flash 文本读取；当前 V4.3.6 使用二进制路径。
+- 高事件率 SystemView 仍可能造成目标 RTT 缓冲 Overflow；前端不能恢复目标已丢失事件。
 
 ## 延续协议
 
-- 开始前用 Git、进程和硬件状态校正项目记忆。
-- 不提交安装包、日志、硬件标识、凭据或构建缓存。
-- 结束前执行 render、validate、diff 检查并保持工作树干净。
+- 开始前校正 Git、进程和硬件状态。
+- 不提交固件、Pack、FLM、日志、截图、硬件标识或构建缓存。
+- 结束前执行全量门禁、project-memory render/validate、git diff --check，并保持工作树干净。

@@ -1,6 +1,6 @@
 {
   "productName": "Mklink AI Probe",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "identifier": "com.microkeen.mklink-ai-probe",
   "build": {
     "beforeDevCommand": "npm run dev",

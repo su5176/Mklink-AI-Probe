@@ -3,6 +3,7 @@ import { computed, onActivated, onBeforeUnmount, onDeactivated, onMounted, ref, 
 import FlashActionBar from '../components/online-flash/FlashActionBar.vue'
 import FlashLogPanel from '../components/online-flash/FlashLogPanel.vue'
 import FlashMapPanel from '../components/online-flash/FlashMapPanel.vue'
+import MemoryReadPanel from '../components/online-flash/MemoryReadPanel.vue'
 import FirmwareWorkspace from '../components/online-flash/FirmwareWorkspace.vue'
 import ProbeSettingsPanel from '../components/online-flash/ProbeSettingsPanel.vue'
 import TargetPackPanel from '../components/online-flash/TargetPackPanel.vue'
@@ -16,7 +17,7 @@ import {
   type BrowserFirmwareFileHandle,
   type PickedFirmwareSource,
 } from '../lib/filePicker'
-import type { CustomFlmRecord, ImageInspection, JobAction, JobEvent, JobState, JobStreamEvent, JobSubscription, PackStatus, ProbeRecord, TargetRecord } from '../types/onlineFlash'
+import type { CustomFlmRecord, ImageInspection, JobAction, JobEvent, JobState, JobStreamEvent, JobSubscription, PackStatus, ProbeRecord, TargetMemoryRegion, TargetRecord } from '../types/onlineFlash'
 
 const STORAGE_KEY = 'mklink.onlineFlash.settings'
 const PROBE_DISCOVERY_ATTEMPTS = 6
@@ -55,6 +56,8 @@ const hpmBoards = [
 const hpmBoard = ref(saved.hpmBoard ?? '')
 const targets = ref<TargetRecord[]>([])
 const selectedTarget = ref<TargetRecord | null>(null)
+const targetMemoryRegions = ref<TargetMemoryRegion[]>([])
+const targetMemoryMapBusy = ref(false)
 const desiredPart = ref(saved.targetPart ?? '')
 const packStatus = ref<PackStatus | null>(null)
 const packBusy = ref(false)
@@ -76,6 +79,14 @@ const selectedSectorAddresses = ref<number[]>([])
 const inspectBusy = ref(false)
 const inspectError = ref('')
 const rows = ref<FormattedHexRow[]>([])
+const memoryReadRef = ref<InstanceType<typeof MemoryReadPanel> | null>(null)
+const memoryReadData = ref<Uint8Array | null>(null)
+const memoryReadAddress = ref<number | undefined>(undefined)
+const memoryReadProgress = ref(0)
+const memoryReadText = ref('')
+const memoryReadState = ref<'waiting' | 'reading' | 'done' | 'failed'>('waiting')
+const progressOwner = ref<'flash' | 'read'>('flash')
+const memoryReadBusy = computed(() => memoryReadState.value === 'reading')
 const paddingTop = ref(0)
 const paddingBottom = ref(0)
 const actions = ref<JobAction[]>([...CANONICAL_ACTIONS])
@@ -92,12 +103,14 @@ let inspectionGeneration = 0
 let viewportGeneration = 0
 let targetSearchGeneration = 0
 let targetSearchController: AbortController | null = null
+let targetMemoryMapToken = 0
 let packOperationToken = 0
 let customFlmToken = 0
 let autoInspectTimer: ReturnType<typeof setTimeout> | null = null
 let sourcePollTimer: ReturnType<typeof setTimeout> | null = null
 let sourcePollingEnabled = false
 let sourceFingerprint = ''
+let capturedReadSource = false
 let firmwareHandle: BrowserFirmwareFileHandle | null = null
 let stopNativeDropListener: (() => void) | null = null
 let disposed = false
@@ -161,6 +174,22 @@ function defaultBinAddress(partNumber: string): string {
   return isHpmPart(partNumber) ? '0x80000400' : ''
 }
 const hpmMode = computed(() => isHpmPart(selectedTarget.value?.part_number ?? ''))
+const memoryReadDisabled = computed(() => !probeId.value || !selectedTarget.value?.installed || active.value || packBusy.value || inspectBusy.value || targetMemoryMapBusy.value)
+const showingReadProgress = computed(() => progressOwner.value === 'read')
+const progressValue = computed(() => showingReadProgress.value ? memoryReadProgress.value : totalProgress.value)
+const progressLabel = computed(() => showingReadProgress.value ? tr('读取进度', 'Read progress') : tr('烧录总进度', 'Total Progress'))
+const progressState = computed(() => {
+  if (showingReadProgress.value) {
+    return memoryReadState.value === 'done'
+      ? tr('读取完成', 'Read complete')
+      : memoryReadState.value === 'failed'
+        ? tr('读取失败', 'Read failed')
+        : memoryReadBusy.value ? tr('正在读取...', 'Reading...') : ''
+  }
+  if (jobState.value === 'succeeded') return tr('烧录完成', 'Flash complete')
+  if (jobState.value === 'failed') return tr('烧录失败', 'Flash failed')
+  return undefined
+})
 
 function message(error: unknown): string {
   if (error instanceof OnlineFlashApiError) {
@@ -261,6 +290,7 @@ async function selectTarget(target: TargetRecord): Promise<void> {
     ? (defaultHpmBoard(target.part_number) || hpmBoard.value)
     : ''
   resetInspection()
+  clearMemoryWindow()
   if (targetChanged) baseAddress.value = defaultBinAddress(target.part_number)
   selectedTarget.value = null
   if (isHpmPart(target.part_number) && !target.installed) {
@@ -315,8 +345,27 @@ async function loadCustomFlms(partNumber = selectedTarget.value?.part_number || 
   }
 }
 
+async function loadTargetMemoryMap(partNumber = selectedTarget.value?.part_number || ''): Promise<void> {
+  const token = ++targetMemoryMapToken
+  targetMemoryRegions.value = []
+  if (!partNumber || isHpmPart(partNumber)) {
+    targetMemoryMapBusy.value = false
+    return
+  }
+  targetMemoryMapBusy.value = true
+  try {
+    const regions = await api.getTargetMemoryMap(partNumber)
+    if (token === targetMemoryMapToken && !disposed) targetMemoryRegions.value = regions
+  } catch {
+    if (token === targetMemoryMapToken) targetMemoryRegions.value = []
+  } finally {
+    if (token === targetMemoryMapToken) targetMemoryMapBusy.value = false
+  }
+}
+
 watch(() => selectedTarget.value?.part_number || '', partNumber => {
   void loadCustomFlms(partNumber)
+  void loadTargetMemoryMap(partNumber)
 })
 
 async function addCustomFlm(file: File): Promise<void> {
@@ -326,7 +375,7 @@ async function addCustomFlm(file: File): Promise<void> {
   customFlmError.value = ''
   try {
     await api.addCustomFlm(file, partNumber)
-    await loadCustomFlms(partNumber)
+    await Promise.all([loadCustomFlms(partNumber), loadTargetMemoryMap(partNumber)])
     resetInspection()
     scheduleAutoInspection()
   } catch (error) {
@@ -344,7 +393,7 @@ async function removeCustomFlm(algorithmId: string): Promise<void> {
   customFlmError.value = ''
   try {
     await api.removeCustomFlm(algorithmId, partNumber)
-    await loadCustomFlms(partNumber)
+    await Promise.all([loadCustomFlms(partNumber), loadTargetMemoryMap(partNumber)])
     resetInspection()
     scheduleAutoInspection()
   } catch (error) {
@@ -398,17 +447,20 @@ function resetInspection(): void {
   inspection.value = null; selectedSectorAddresses.value = []; rows.value = []; paddingTop.value = 0; paddingBottom.value = 0; inspectError.value = ''; preview.setSource(null)
 }
 function setFirmware(file: File | null, handle: BrowserFirmwareFileHandle | null = null): void {
+  capturedReadSource = false
   firmware.value = file
   firmwareHandle = handle
   firmwarePath.value = ''
   sourceFingerprint = file && handle ? `${file.size}:${file.lastModified}` : ''
   resetInspection()
+  clearMemoryWindow()
   persist()
   promptForBinAddress(file?.name ?? '')
   scheduleAutoInspection()
 }
 
 function setFirmwarePath(path: string): void {
+  capturedReadSource = false
   const suffix = path.split('.').pop()?.toLowerCase()
   if (suffix !== 'bin' && suffix !== 'hex') {
     inspectError.value = tr('固件只支持 BIN 或 HEX', 'Only BIN or HEX firmware is supported')
@@ -419,6 +471,7 @@ function setFirmwarePath(path: string): void {
   firmwarePath.value = path
   sourceFingerprint = ''
   resetInspection()
+  clearMemoryWindow()
   persist()
   void pollFirmwareSource(true)
   promptForBinAddress(path)
@@ -546,7 +599,13 @@ async function inspectImage(): Promise<void> {
   try {
     const result = firmwarePath.value
       ? await api.inspectImagePath(firmwarePath.value, selectedTarget.value.part_number, isBin.value ? parsedBase.value : null, controller.signal)
-      : await api.inspectImage(firmware.value!, selectedTarget.value.part_number, isBin.value ? parsedBase.value : null, controller.signal)
+      : await api.inspectImage(
+          firmware.value!,
+          selectedTarget.value.part_number,
+          isBin.value ? parsedBase.value : null,
+          controller.signal,
+          capturedReadSource,
+        )
     if (disposed || generation !== inspectionGeneration || controller.signal.aborted || inspectionController !== controller) throw new DOMException('Aborted', 'AbortError')
     if (result.end < result.start || (isBin.value && result.base_address !== parsedBase.value)) throw new Error(tr('服务端返回的镜像地址范围无效', 'The server returned an invalid image address range'))
     inspection.value = result
@@ -576,6 +635,54 @@ async function loadVisible(scrollTop: number, height: number): Promise<void> {
 }
 
 function appendLog(line: string): void { logs.value.push(line); if (logs.value.length > 5000) logs.value.splice(0, logs.value.length - 5000) }
+function onMemoryReadProgress(value: number, text: string, state: 'waiting' | 'reading' | 'done' | 'failed'): void {
+  if (state !== 'waiting') progressOwner.value = 'read'
+  memoryReadProgress.value = value
+  memoryReadText.value = text
+  memoryReadState.value = state
+}
+function onMemoryReadLog(line: string): void { appendLog(line) }
+function onMemoryReadData(payload: { address: number; data: Uint8Array }): void {
+  memoryReadAddress.value = payload.address
+  memoryReadData.value = payload.data
+  // Treat a completed target read as a temporary BIN source as well as a
+  // preview. This lets the existing inspection/job pipeline produce an
+  // image_id so the user can program the captured bytes without reloading a
+  // file manually.
+  const bytes = payload.data.slice()
+  const fileName = `read-0x${payload.address.toString(16).padStart(8, '0').toUpperCase()}-${bytes.length}.bin`
+  firmware.value = new File([bytes], fileName, { type: 'application/octet-stream' })
+  firmwareHandle = null
+  firmwarePath.value = ''
+  sourceFingerprint = ''
+  capturedReadSource = true
+  baseAddress.value = `0x${payload.address.toString(16).toUpperCase()}`
+  binAddressOpen.value = false
+  resetInspection()
+  persist()
+  void inspectImage()
+}
+function clearMemoryWindow(): void {
+  memoryReadRef.value?.clearMemory()
+  memoryReadData.value = null
+  memoryReadAddress.value = undefined
+  memoryReadProgress.value = 0
+  memoryReadText.value = ''
+  memoryReadState.value = 'waiting'
+  capturedReadSource = false
+}
+function clearDataWindow(): void {
+  firmware.value = null
+  firmwareHandle = null
+  firmwarePath.value = ''
+  sourceFingerprint = ''
+  binAddressOpen.value = false
+  resetInspection()
+  clearMemoryWindow()
+  persist()
+}
+function openMemoryReadDialog(): void { memoryReadRef.value?.openReadDialog() }
+function saveMemoryFile(): void { void memoryReadRef.value?.saveMemory() }
 function subscribe(after = lastSequence.value): void {
   subscription?.close(); streamDisconnected.value = false
   subscription = api.subscribeJob(jobId.value, after, receiveEvent, error => {
@@ -611,6 +718,7 @@ async function startJob(customActions = actions.value, sectorAddresses?: number[
       : []
   )
   if (sectorAddresses === undefined && orderedActions.includes('erase') && !geometryReliable.value && !hpmMode.value) return
+  progressOwner.value = 'flash'
   creatingJob.value = true
   try {
     logs.value = []; lastSequence.value = 0; totalProgress.value = 0
@@ -681,8 +789,9 @@ onBeforeUnmount(() => {
       <label v-if="hpmMode" class="hpm-setting"><span>{{ tr('HPM 板卡', 'HPM Board') }}</span><select v-model="hpmBoard" data-testid="hpm-board"><option v-for="item in hpmBoards" :key="item" :value="item">{{ item }}</option></select></label>
     </aside>
     <main class="workspace-zone firmware-zone" data-zone="firmware">
-      <FirmwareWorkspace :file="firmware" :source-path="firmwarePath" :native-drop-active="nativeDropActive" :base-address="baseAddress" :base-error="baseError" :inspection="inspection" :rows="rows" :padding-top="paddingTop" :padding-bottom="paddingBottom" :loading="inspectBusy" :error="inspectError" @file="setFirmware" @browse="browseFirmware" @drop-files="acceptFirmwareSources" @base="setBase" @scroll="loadVisible" />
-      <FlashActionBar :actions="actions" :can-start="canStart" :active="active" :stopping="stopping" :state="jobState" :total-progress="totalProgress" @actions="setActions" @start="startJob()" @stop="stopJob" />
+      <MemoryReadPanel ref="memoryReadRef" embedded :probe-id="probeId" :target-part="selectedTarget?.part_number || ''" :hpm="hpmMode" :board="hpmBoard || undefined" :frequency="frequency" :connect-mode="connectMode" :reset-mode="resetMode" :memory-regions="targetMemoryRegions" :memory-map-busy="targetMemoryMapBusy" :disabled="memoryReadDisabled" @progress="onMemoryReadProgress" @log="onMemoryReadLog" @data="onMemoryReadData" />
+      <FirmwareWorkspace :file="firmware" :source-path="firmwarePath" :native-drop-active="nativeDropActive" :base-address="baseAddress" :base-error="baseError" :inspection="inspection" :rows="rows" :padding-top="paddingTop" :padding-bottom="paddingBottom" :loading="inspectBusy" :error="inspectError" :memory-data="memoryReadData" :memory-address="memoryReadAddress" :read-disabled="memoryReadDisabled" :read-busy="memoryReadBusy" @file="setFirmware" @browse="browseFirmware" @drop-files="acceptFirmwareSources" @base="setBase" @scroll="loadVisible" @read="openMemoryReadDialog" @save="saveMemoryFile" @clear-data="clearDataWindow" />
+      <FlashActionBar :actions="actions" :can-start="canStart" :active="active" :stopping="stopping" :state="jobState" :total-progress="progressValue" :progress-label="progressLabel" :progress-state="progressState" @actions="setActions" @start="startJob()" @stop="stopJob" />
     </main>
     <aside class="workspace-zone flash-map-zone" data-zone="flash-map"><FlashMapPanel :segments="inspection?.segments || []" :sectors="inspection?.sectors || []" :selected-addresses="selectedSectorAddresses" :inspection-ready="!!inspection" :geometry-reliable="geometryReliable" :can-erase="canErase" @chip-erase="chipErase" @selected-erase="selectedErase" @range-erase="rangeErase" @select-all="selectedSectorAddresses = inspection?.sectors.map(sector => sector.address) || []" @clear-selection="selectedSectorAddresses = []" @toggle-sector="toggleSector" /></aside>
     <section class="workspace-zone logs-zone" data-zone="logs"><FlashLogPanel :lines="logs" :stream-disconnected="streamDisconnected" @clear="logs = []" @reconnect="subscribe(lastSequence)" /></section>

@@ -1,0 +1,7 @@
+interface:
+  display_name: "Build Mklink AI Probe Desktop"
+  short_description: "Explicit-only desktop maintainer workflow"
+  default_prompt: "Use $tauri-gui-builder for this authorized desktop build or qualification task."
+
+policy:
+  allow_implicit_invocation: false

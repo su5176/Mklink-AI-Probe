@@ -232,11 +232,13 @@ def test_raw_bytes_without_decodable_events_fail_with_sync_diagnostic():
     class Device:
         def __init__(self):
             self.stop_calls = 0
+            self.read_durations = []
 
         def systemview_start(self, *_args, **_kwargs):
             return {}
 
-        def systemview_read_bytes(self, **_kwargs):
+        def systemview_read_bytes(self, **kwargs):
+            self.read_durations.append(kwargs["duration"])
             time.sleep(0.002)
             return b"\x01" * 64
 
@@ -278,6 +280,9 @@ def test_raw_bytes_without_decodable_events_fail_with_sync_diagnostic():
     assert "sync" in status["progress_error"].lower()
     assert status["raw_bytes_without_events"] >= 128
     assert device.stop_calls == 1
+    assert device.read_durations
+    assert all(duration == pytest.approx(1.0 / 30.0)
+               for duration in device.read_durations)
     assert failure and failure[0] is not None
 
 

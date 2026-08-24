@@ -167,7 +167,7 @@ class TestDeviceConnectInitializesTarget:
              patch("mklink.device.initialize_target"):
             dev._connect()
 
-        assert created == ["COM46", "COM228"]
+        assert created == ["COM46", "COM46", "COM228"]
         discover.assert_called_once_with(exclude_ports={"com46"})
         assert events == [
             "discovery-lock-acquired",
@@ -189,6 +189,7 @@ class TestDeviceConnectInitializesTarget:
                 dev._connect()
 
         discover.assert_not_called()
+        assert bridge.connect.call_count == 2
 
 
 # ----------------------------------------------------------------------

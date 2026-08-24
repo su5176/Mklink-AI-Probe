@@ -26,7 +26,8 @@ class FakeBackend:
     def erase_sectors(self, addresses):
         self.calls.append(("erase_sectors", tuple(addresses)))
 
-    def program(self, image):
+    def program(self, image, progress_callback=None):
+        del progress_callback
         self.calls.append(("program", image))
 
     def verify(self, image):
@@ -37,6 +38,17 @@ class FakeBackend:
 
     def disconnect(self):
         self.calls.append(("disconnect", None))
+
+
+class ReadBackend(FakeBackend):
+    def memory_regions(self):
+        from mklink.cmsis_dap.models import MemoryRegion
+
+        return (MemoryRegion("flash", 0x08000000, 0x200000, True),)
+
+    def read_memory(self, address, size):
+        self.calls.append(("read", address, size))
+        return bytes((address + index) & 0xFF for index in range(size))
 
 
 def test_hpm_job_holds_debug_and_bridge_resources_until_disconnect():
@@ -63,6 +75,90 @@ def test_hpm_job_holds_debug_and_bridge_resources_until_disconnect():
     backend.allow_program.set()
     assert manager.wait(job_id, timeout=2).state is JobState.SUCCEEDED
     assert resources.get_active_lease(ResourceGroup.TARGET_DEBUG) is None
+    assert resources.get_active_lease(ResourceGroup.MKLINK_BRIDGE) is None
+    manager.shutdown()
+
+
+def test_read_memory_uses_resource_lock_and_splits_into_4k_chunks():
+    backend = ReadBackend()
+    resources = ResourceManager()
+    manager = OnlineFlashJobManager(lambda: backend, resources)
+    request = JobRequest(
+        actions=("connect", "disconnect"),
+        probe_id="probe",
+        target_part="STM32F103C8",
+        frequency=1_000_000,
+    )
+
+    data = manager.read_memory(request, 0x08000000, 4 * 1024 + 16)
+
+    assert len(data) == 4 * 1024 + 16
+    assert [call[0] for call in backend.calls] == ["connect", "read", "read", "disconnect"]
+    assert backend.calls[1][2] == 4 * 1024
+    assert backend.calls[2][2] == 16
+    assert resources.get_active_lease(ResourceGroup.TARGET_DEBUG) is None
+    manager.shutdown()
+
+
+def test_iter_memory_keeps_one_connection_for_sector_chunks():
+    backend = ReadBackend()
+    manager = OnlineFlashJobManager(lambda: backend, ResourceManager())
+    request = JobRequest(
+        actions=("connect", "disconnect"),
+        probe_id="probe",
+        target_part="STM32F103RE",
+    )
+
+    chunks = list(manager.iter_memory(request, 0x08000000, (2048, 2048, 2048)))
+
+    assert [len(chunk) for chunk in chunks] == [2048, 2048, 2048]
+    assert [call[0] for call in backend.calls] == [
+        "connect", "read", "read", "read", "disconnect",
+    ]
+    manager.shutdown()
+
+
+def test_iter_memory_releases_connection_when_stream_is_closed_early():
+    backend = ReadBackend()
+    resources = ResourceManager()
+    manager = OnlineFlashJobManager(lambda: backend, resources)
+    request = JobRequest(
+        actions=("connect", "disconnect"),
+        probe_id="probe",
+        target_part="STM32F103RE",
+    )
+    stream = manager.iter_memory(request, 0x08000000, (2048, 2048))
+
+    assert len(next(stream)) == 2048
+    stream.close()
+
+    assert [call[0] for call in backend.calls] == ["connect", "read", "disconnect"]
+    assert resources.get_active_lease(ResourceGroup.TARGET_DEBUG) is None
+    manager.shutdown()
+
+
+def test_read_memory_supports_hpm_and_holds_bridge_resource():
+    class HpmReadBackend(ReadBackend):
+        def memory_regions(self):
+            from mklink.cmsis_dap.models import MemoryRegion
+
+            return (MemoryRegion("hpm-xpi", 0x80000000, 0x100000, True, True),)
+
+    backend = HpmReadBackend()
+    resources = ResourceManager()
+    manager = OnlineFlashJobManager(lambda: backend, resources)
+    request = JobRequest(
+        actions=("connect", "disconnect"),
+        target_part="HPM5300",
+        board="hpm5300evk",
+        probe_id="probe",
+    )
+
+    data = manager.read_memory(request, 0x80000000, 4)
+
+    assert data == bytes([0, 1, 2, 3])
+    assert backend.calls[0][0] == "connect"
+    assert backend.calls[0][1]["board"] == "hpm5300evk"
     assert resources.get_active_lease(ResourceGroup.MKLINK_BRIDGE) is None
     manager.shutdown()
 
@@ -147,7 +243,8 @@ class BlockingBackend(FakeBackend):
         self.program_started = threading.Event()
         self.allow_program = threading.Event()
 
-    def program(self, image):
+    def program(self, image, progress_callback=None):
+        del progress_callback
         self.calls.append(("program", image))
         self.program_started.set()
         assert self.allow_program.wait(2)
@@ -194,8 +291,8 @@ class FailingBackend(FakeBackend):
         super().erase_chip()
         self._fail("erase")
 
-    def program(self, image):
-        super().program(image)
+    def program(self, image, progress_callback=None):
+        super().program(image, progress_callback=progress_callback)
         self._fail("program")
 
     def verify(self, image):
@@ -336,6 +433,7 @@ def test_full_job_releases_resource_and_records_snapshot():
         "custom_flm_paths": (),
         "custom_flm_digests": (),
         "custom_flm_regions": (),
+        "pack_flm_regions": (),
         "custom_flm_ram_start": None,
         "custom_flm_ram_size": None,
         "connect_mode": "under-reset",
@@ -354,6 +452,105 @@ def test_full_job_releases_resource_and_records_snapshot():
     assert "target_debug" not in resources.get_status()
 
 
+def test_program_progress_reports_real_bytes_and_updates_total_progress():
+    class ProgressiveBackend(FakeBackend):
+        def program(self, inspected, progress_callback=None):
+            self.calls.append(("program", inspected))
+            assert progress_callback is not None
+            progress_callback(0.25)
+            progress_callback(0.5)
+            progress_callback(1.0)
+
+    backend = ProgressiveBackend()
+    inspected = image()
+    manager = OnlineFlashJobManager(
+        lambda: backend,
+        ResourceManager(),
+        image_provider=lambda _image_id: inspected,
+    )
+
+    job_id = manager.start(JobRequest(
+        actions=("connect", "program", "disconnect"),
+        image_id=inspected.image_id,
+    ))
+    result = manager.wait(job_id, timeout=2)
+    events = manager.events(job_id)
+    manager.shutdown()
+
+    messages = [event.message for event in events if event.message.startswith("[PROGRAM]")]
+    assert "[PROGRAM] 256 / 1024 Bytes (25%)" in messages
+    assert "[PROGRAM] 512 / 1024 Bytes (50%)" in messages
+    assert "[PROGRAM] 1024 / 1024 Bytes (100%)" in messages
+    assert any(event.progress == pytest.approx(0.5) for event in events)
+    assert result.state is JobState.SUCCEEDED
+    assert result.total_progress == 1.0
+
+
+def test_verify_progress_reports_real_bytes_and_updates_total_progress():
+    class ProgressiveBackend(FakeBackend):
+        def verify(self, inspected, progress_callback=None):
+            self.calls.append(("verify", inspected))
+            assert progress_callback is not None
+            progress_callback(0.25)
+            progress_callback(0.5)
+            progress_callback(1.0)
+
+    backend = ProgressiveBackend()
+    inspected = image()
+    manager = OnlineFlashJobManager(
+        lambda: backend,
+        ResourceManager(),
+        image_provider=lambda _image_id: inspected,
+    )
+
+    job_id = manager.start(JobRequest(
+        actions=("connect", "verify", "disconnect"),
+        image_id=inspected.image_id,
+    ))
+    result = manager.wait(job_id, timeout=2)
+    events = manager.events(job_id)
+    manager.shutdown()
+
+    messages = [event.message for event in events if event.message.startswith("[VERIFY]")]
+    assert "[VERIFY] 256 / 1024 Bytes (25%)" in messages
+    assert "[VERIFY] 512 / 1024 Bytes (50%)" in messages
+    assert "[VERIFY] 1024 / 1024 Bytes (100%)" in messages
+    assert any(event.progress == pytest.approx(2 / 3) for event in events)
+    assert result.state is JobState.SUCCEEDED
+    assert result.total_progress == 1.0
+
+
+def test_hpm_erase_completion_is_deferred_until_program_starts():
+    class DeferredEraseBackend(FakeBackend):
+        erase_deferred = True
+
+        def program(self, inspected, progress_callback=None):
+            self.calls.append(("program", inspected))
+            assert progress_callback is not None
+            progress_callback(0.0)
+            progress_callback(1.0)
+
+    backend = DeferredEraseBackend()
+    inspected = image()
+    manager = OnlineFlashJobManager(
+        lambda: backend,
+        ResourceManager(),
+        image_provider=lambda _image_id: inspected,
+    )
+
+    job_id = manager.start(JobRequest(
+        actions=("connect", "erase", "program", "disconnect"),
+        image_id=inspected.image_id,
+        target_part="HPM5301",
+    ))
+    result = manager.wait(job_id, timeout=2)
+    messages = [event.message for event in manager.events(job_id) if event.message]
+    manager.shutdown()
+
+    assert result.state is JobState.SUCCEEDED
+    assert messages.index("erase in progress (completed by HPM ROM during program)") < messages.index("erase complete")
+    assert "[PROGRAM] 0 / 1024 Bytes (0%)" not in messages
+    assert messages.index("erase complete") < messages.index("[PROGRAM] 1024 / 1024 Bytes (100%)")
 @pytest.mark.parametrize(
     ("stage", "code"),
     [

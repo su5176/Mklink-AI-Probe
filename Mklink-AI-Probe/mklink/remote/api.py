@@ -728,6 +728,12 @@ def create_app(
         allow_origins=["*"],
         allow_methods=["*"],
         allow_headers=["*"],
+        expose_headers=[
+            "Content-Disposition",
+            "X-MKLink-Firmware-Name",
+            "X-MKLink-Firmware-Version",
+            "X-MKLink-Firmware-Source",
+        ],
     )
 
     # --- Shared state ---
@@ -756,6 +762,11 @@ def create_app(
     )
     app.state.browser_sessions = browser_sessions
     app.state.request_browser_session_exit = None
+    app.state.request_desktop_exit = None
+    # A pagehide beacon and a normal disconnect request can arrive together.
+    # Serialize the shared-device teardown so only one coroutine can stop
+    # dashboards and close the physical probe at a time.
+    device_disconnect_lock = asyncio.Lock()
 
     async def monitor_browser_sessions() -> None:
         interval = min(1.0, max(0.1, browser_sessions.timeout / 4.0))
@@ -1495,27 +1506,32 @@ def create_app(
             "elf_backend": device.axf_status.get("elf_backend"),
         }
 
+    async def _disconnect_shared_device() -> dict[str, object]:
+        """Stop bridge dashboards and release the GUI-owned Device."""
+        async with device_disconnect_lock:
+            from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
+
+            stopped = []
+            for name in BRIDGE_DASHBOARD_TYPES:
+                manager = dashboard_managers.get(name)
+                if manager is not None and _dashboard_worker_alive(manager):
+                    await run_in_threadpool(manager.stop)
+                    if _dashboard_worker_alive(manager):
+                        raise DashboardStopPending(name)
+                    stopped.append(name)
+                _state["resource_manager"].release(f"user:dashboard:{name}")
+
+            device = _state["device"]
+            if device:
+                remember_device_connection(_state, device)
+                await run_in_threadpool(device.close)
+                _state["device"] = None
+                _state["dispatcher"] = None
+            return {"status": "disconnected", "stopped": stopped}
+
     @app.post("/api/device/disconnect")
     async def disconnect_device():
-        from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
-
-        stopped = []
-        for name in BRIDGE_DASHBOARD_TYPES:
-            manager = dashboard_managers.get(name)
-            if manager is not None and _dashboard_worker_alive(manager):
-                await run_in_threadpool(manager.stop)
-                if _dashboard_worker_alive(manager):
-                    raise DashboardStopPending(name)
-                stopped.append(name)
-            _state["resource_manager"].release(f"user:dashboard:{name}")
-
-        device = _state["device"]
-        if device:
-            remember_device_connection(_state, device)
-            await run_in_threadpool(device.close)
-            _state["device"] = None
-            _state["dispatcher"] = None
-        return {"status": "disconnected", "stopped": stopped}
+        return await _disconnect_shared_device()
 
     @app.get("/api/device/status")
     async def device_status():
@@ -1552,6 +1568,93 @@ def create_app(
             return check.to_dict()
         except Exception as e:
             return {"status": "skipped", "error": str(e)}
+
+    @app.post("/api/probe/firmware-upgrade")
+    async def probe_firmware_upgrade(confirm: bool = Body(default=False)):
+        """Upgrade the connected probe through its UF2 bootloader drive."""
+        if confirm is not True:
+            raise HTTPException(status_code=400, detail="firmware upgrade requires confirm=true")
+        from mklink import firmware_check as _fc
+
+        device = None
+        try:
+            async with _exclusive_probe_control("firmware-upgrade") as (device, stopped):
+                root = _fc._resolve_firmware_root()
+                result = await run_in_threadpool(
+                    _fc.upgrade_probe_firmware,
+                    device,
+                    root,
+                    confirm=True,
+                )
+                result["stopped"] = stopped
+                return result
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error)) from error
+        finally:
+            if device is not None and not device.connected:
+                _state["device"] = None
+                _state["dispatcher"] = None
+
+    @app.get("/api/probe/firmware-download")
+    async def probe_firmware_download(
+        model: str = Query(...),
+        family: str = Query(default="microlink"),
+    ):
+        """Download the newest model/family UF2 with provider fallback."""
+        from fastapi.responses import Response
+        from mklink import firmware_check as _fc
+
+        normalized_model = model.strip().upper()
+        if normalized_model not in {"V3", "V4"}:
+            raise HTTPException(status_code=400, detail="firmware model must be V3 or V4")
+        normalized_family = family.strip().lower()
+        if normalized_family not in {"microlink", "hpmlink"}:
+            raise HTTPException(
+                status_code=400,
+                detail="firmware family must be microlink or hpmlink",
+            )
+        if normalized_family == "hpmlink" and normalized_model != "V4":
+            raise HTTPException(
+                status_code=400,
+                detail="HPMLink firmware is only available for V4",
+            )
+        root = _fc._resolve_firmware_root()
+        candidate = await run_in_threadpool(
+            _fc.latest_firmware,
+            normalized_model,
+            root,
+            family=normalized_family,
+        )
+        if candidate is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"未找到 {normalized_model} 系列固件",
+            )
+        temporary = False
+        path = None
+        try:
+            path, temporary, source = await run_in_threadpool(
+                _fc._materialize_firmware,
+                candidate,
+            )
+            content = await run_in_threadpool(path.read_bytes)
+        except OSError as error:
+            raise HTTPException(status_code=502, detail=str(error)) from error
+        finally:
+            if temporary and path is not None:
+                path.unlink(missing_ok=True)
+        return Response(
+            content=content,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{candidate.name}"',
+                "Cache-Control": "no-store",
+                "X-MKLink-Firmware-Name": candidate.name,
+                "X-MKLink-Firmware-Version": candidate.version_str,
+                "X-MKLink-Firmware-Source": source,
+                "X-MKLink-Firmware-Family": candidate.family,
+            },
+        )
 
     # ===================================================================
     # REST API — Device Operations (convenience wrappers)
@@ -2113,6 +2216,48 @@ def create_app(
         managers = get_managers()
         items = await run_in_threadpool(managers["superwatch"].list_watches)
         return {"items": items}
+
+    @app.get("/api/dash/superwatch/array-snapshot")
+    async def superwatch_array_snapshot():
+        managers = get_managers()
+        return await run_in_threadpool(
+            managers["superwatch"].get_array_snapshot,
+        )
+
+    @app.post("/api/dash/superwatch/array-snapshot/select")
+    async def superwatch_array_snapshot_select(
+        name: str = Body(..., embed=True),
+        start_index: int = Body(..., embed=True),
+        count: int = Body(..., embed=True),
+    ):
+        managers = get_managers()
+        manager = managers["superwatch"]
+
+        def prepare_and_select():
+            if manager._runtime is None and _state["device"] and _state["device"].connected:
+                manager.prepare(_state["device"])
+            return manager.select_array_snapshot(
+                name,
+                start_index=start_index,
+                count=count,
+            )
+
+        from mklink.symbol_catalog import SymbolCatalogError
+
+        try:
+            result = await run_in_threadpool(prepare_and_select)
+        except SymbolCatalogError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if result.get("error"):
+            raise HTTPException(status_code=400, detail=result["error"])
+        return result
+
+    @app.post("/api/dash/superwatch/array-snapshot/clear")
+    async def superwatch_array_snapshot_clear():
+        managers = get_managers()
+        return await run_in_threadpool(
+            managers["superwatch"].clear_array_snapshot,
+        )
 
     @app.get("/api/dash/superwatch/inspect")
     async def superwatch_inspect(name: str):
@@ -2784,6 +2929,19 @@ def create_app(
             payload["desktop_instance_id"] = _state["desktop_instance_id"]
         return payload
 
+    @app.post("/api/desktop/shutdown")
+    async def desktop_shutdown(instance_id: str = Body(..., embed=True)):
+        expected = _state["desktop_instance_id"]
+        if not expected:
+            raise HTTPException(status_code=404, detail="Desktop shutdown is unavailable")
+        if instance_id != expected:
+            raise HTTPException(status_code=403, detail="Desktop instance does not match")
+        request_exit = app.state.request_desktop_exit
+        if not callable(request_exit):
+            raise HTTPException(status_code=503, detail="Desktop shutdown is not ready")
+        request_exit()
+        return {"status": "shutting_down"}
+
     @app.get("/api/site-agent/status")
     async def site_agent_status():
         return site_agent.status()
@@ -2863,6 +3021,12 @@ def create_app(
         if browser_sessions is None:
             return {"enabled": False}
         clients = browser_sessions.release(_browser_session_client(client_id))
+        # pagehide sends this request before the tab disappears. Release the
+        # physical probe immediately instead of waiting for the backend's
+        # close-grace timer; unexpected websocket loss still keeps the grace
+        # period for transient browser reconnects.
+        if clients == 0:
+            await _disconnect_shared_device()
         return {"enabled": True, "clients": clients}
 
     @app.websocket("/ws/browser-session")
@@ -3089,6 +3253,8 @@ def run_server(
             instance_id=desktop_instance_id,
         )
         config = uvicorn.Config(app, log_level="info")
-        uvicorn.Server(config).run(sockets=[listener])
+        server = uvicorn.Server(config)
+        app.state.request_desktop_exit = lambda: setattr(server, "should_exit", True)
+        server.run(sockets=[listener])
     finally:
         listener.close()

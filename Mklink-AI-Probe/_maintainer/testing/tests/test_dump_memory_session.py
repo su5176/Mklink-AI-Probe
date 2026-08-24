@@ -1,11 +1,15 @@
 import binascii
 import struct
 
+import pytest
+
 from mklink._types import DeviceState
 from mklink.dump_memory import (
     DumpMemoryStreamSession,
+    DumpMemoryReadError,
     FLAG_SAMPLE_DROPPED,
     MAGIC,
+    read_dump_memory_range_once,
     read_dump_memory_once,
 )
 
@@ -15,6 +19,21 @@ def _old_frame(timestamp_us, payload, *, flags=0):
     length = 19 + len(region) + 6
     body = MAGIC + struct.pack("<QHB", timestamp_us, length, 1) + region + struct.pack("<H", flags)
     return body + struct.pack("<I", binascii.crc32(body) & 0xFFFFFFFF)
+
+
+def _b1_frame(timestamp_us, payload, *, block_index, block_count, total_size, flags=0):
+    block_crc = binascii.crc32(payload) & 0xFFFFFFFF
+    body = bytearray()
+    body.extend(MAGIC)
+    body.extend(struct.pack("<QH", timestamp_us, 0))
+    body.extend(struct.pack("<B", 1))
+    body.extend(struct.pack("<H", flags))
+    body.extend(struct.pack("<IHHHI", total_size, 2048, block_index, block_count, block_crc))
+    body.extend(struct.pack("<BH", 0, len(payload)))
+    body.extend(payload)
+    frame_length = len(body) + 4
+    struct.pack_into("<H", body, 16, frame_length)
+    return bytes(body) + struct.pack("<I", binascii.crc32(body) & 0xFFFFFFFF)
 
 
 class FakeBridge:
@@ -102,3 +121,37 @@ def test_one_shot_dump_reads_payload_and_stops_stream_cleanly():
     )
     assert ("write", b"RTTView.stop()\n") in bridge.calls
     assert bridge.calls[-1] == ("exit",)
+
+
+def test_one_shot_dump_collects_all_b1_blocks():
+    payload = bytes(range(256)) * 16
+    bridge = FakeBridge([
+        _b1_frame(1, payload[:2048], block_index=0, block_count=2, total_size=len(payload)),
+        _b1_frame(2, payload[2048:], block_index=1, block_count=2, total_size=len(payload)),
+    ])
+
+    assert read_dump_memory_range_once(
+        bridge, 0x80000000, len(payload), timeout=0.1, poll_interval=0,
+    ) == payload
+    assert ("write", b"cmd.dump_memory(0x80000000, 1, -1.0)\n") in bridge.calls
+    assert bridge.calls[-1] == ("exit",)
+
+
+def test_one_shot_dump_discards_stale_b1_blocks_from_previous_request():
+    payload = b"fresh" * 410
+    bridge = FakeBridge([
+        _b1_frame(1, b"stale" * 410, block_index=0, block_count=2, total_size=4096),
+        _b1_frame(2, payload[:2048], block_index=0, block_count=2, total_size=len(payload)),
+        _b1_frame(3, payload[2048:], block_index=1, block_count=2, total_size=len(payload)),
+    ])
+
+    assert read_dump_memory_range_once(
+        bridge, 0x80000000, len(payload), timeout=0.1, poll_interval=0,
+    ) == payload
+
+
+def test_one_shot_dump_rejects_firmware_error_flags():
+    bridge = FakeBridge([_old_frame(1, b"abcd", flags=0x0004)])
+
+    with pytest.raises(DumpMemoryReadError, match="error flags"):
+        read_dump_memory_range_once(bridge, 0x80000000, 4, timeout=0.1, poll_interval=0)

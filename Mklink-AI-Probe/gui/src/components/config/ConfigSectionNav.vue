@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { Cable, FileCode, Radio, Server } from '@lucide/vue'
+import { Cable, FileCode, Radio, Server, Upload } from '@lucide/vue'
 import { computed } from 'vue'
 import { tr } from '../../composables/useLanguage'
 
-export type ConfigSection = 'local' | 'files' | 'remote' | 'serve'
+export type ConfigSection = 'local' | 'files' | 'remote' | 'serve' | 'firmware'
 
 defineProps<{ modelValue: ConfigSection }>()
 
@@ -16,6 +16,7 @@ const sections = computed(() => [
   { id: 'files' as const, label: tr('文件来源', 'File Sources'), icon: FileCode },
   { id: 'remote' as const, label: tr('远程连接', 'Remote Connection'), icon: Radio },
   { id: 'serve' as const, label: tr('启动服务', 'Start Service'), icon: Server },
+  { id: 'firmware' as const, label: tr('固件升级', 'Firmware Update'), icon: Upload },
 ])
 </script>
 

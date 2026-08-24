@@ -179,6 +179,7 @@ class SystemViewParser:
         self._ram_base = 0                 # INIT 带出
         self._id_shift = 2                 # INIT 带出（SEGGER 默认 2）
         self._cpu_freq = 0                 # INIT 带出，用于 µs 换算
+        self._cpu_freq_override: int | None = None
         self._task_names: dict[int, str] = {}
         self._isr_names: dict[int, str] = {}
         self._current_task: int | None = None   # 跟踪当前运行任务（STOP_EXEC 无 task id）
@@ -204,6 +205,20 @@ class SystemViewParser:
     @property
     def cpu_freq(self) -> int:
         return self._cpu_freq
+
+    def set_cpu_freq(self, freq: int, *, lock: bool = False) -> None:
+        """Set a host-side CPU frequency hint.
+
+        A runtime symbol read is more authoritative than the frequency carried
+        by a stale INIT packet. ``lock=True`` keeps that value when INIT is
+        decoded later in the stream.
+        """
+        value = int(freq)
+        if value <= 0:
+            return
+        self._cpu_freq = value
+        if lock:
+            self._cpu_freq_override = value
 
     def task_name(self, task_id: int) -> str | None:
         return self._task_names.get(task_id)
@@ -394,7 +409,10 @@ class SystemViewParser:
     def _post_process(self, ev: dict) -> None:
         kind = ev["kind"]
         if kind == "init":
-            self._cpu_freq = ev.get("cpu_freq", 0) or self._cpu_freq
+            if self._cpu_freq_override is None:
+                self._cpu_freq = ev.get("cpu_freq", 0) or self._cpu_freq
+            else:
+                self._cpu_freq = self._cpu_freq_override
             self._ram_base = ev.get("ram_base", 0)
             # Zero is valid: HPM FreeRTOS reports ram_base=0/id_shift=0.
             id_shift = ev.get("id_shift")
@@ -421,6 +439,11 @@ class SystemViewParser:
             # SEGGER 的 STOP_EXEC 不带 task id——用跟踪到的当前任务补全，便于上层画甘特
             if self._current_task is not None:
                 ev["task_id"] = self._current_task
+        elif kind == "overflow":
+            # The target dropped one or more records, so the cached task context
+            # is no longer authoritative.  Do not let a later task-stop event
+            # inherit the task that was running before the loss boundary.
+            self._current_task = None
 
         # 给任务/ISR 事件补 name
         if "task_id" in ev:

@@ -4,4 +4,5 @@
 /Mklink-AI-Probe/gui/node_modules/
 /Mklink-AI-Probe/gui/src-tauri/target/
 /Mklink-AI-Probe/output/playwright/
+/Mklink-AI-Probe/release/
 /.worktrees/

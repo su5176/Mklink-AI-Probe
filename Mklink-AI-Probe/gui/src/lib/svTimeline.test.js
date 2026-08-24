@@ -126,7 +126,36 @@ describe('SvTimeline continuous filtering', () => {
     expect(timeline._contextColor('Task', 0)).toBe('#task')
   })
 
-  it('zooms with an ordinary wheel event over the plot and then pans by dragging', () => {
+  it('draws subpixel task intervals instead of leaving a busy timeline blank', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    const fillRect = vi.fn()
+    const strokeRect = vi.fn()
+    const task = { tid: 1, name: 'main', type: 'Task', color: '#123456' }
+    Object.assign(timeline, {
+      _renderPaused: false,
+      ctx: {
+        clearRect: vi.fn(), fillRect, strokeRect, fillText: vi.fn(),
+        setLineDash: vi.fn(), beginPath: vi.fn(), moveTo: vi.fn(), lineTo: vi.fn(),
+        stroke: vi.fn(), closePath: vi.fn(),
+      },
+      W: 240, H: 80, plotX0: 40, plotX1: 240, plotW: 200,
+      rulerH: 42, laneH: 28, viewStart: 0, viewEnd: 1_000,
+      hidden: new Set(), hover: null, markerTime: null, unit: 'us',
+      intervals: [{ tid: 1, name: 'main', start: 500, end: 500.1 }],
+      tasks: [task], lanes: [task], taskOf: new Map([[1, task]]),
+      _drawLaneBackgrounds: vi.fn(), _drawRuler: vi.fn(), _drawMarker: vi.fn(),
+      _fmtIntervalLabel: vi.fn(() => '0.1 us'), _labelWidth: vi.fn(() => 40),
+    })
+
+    timeline._draw()
+
+    expect(fillRect).toHaveBeenCalledWith(140, 45, 0.8, 22)
+    expect(strokeRect).not.toHaveBeenCalled()
+    expect(timeline._fmtIntervalLabel).not.toHaveBeenCalled()
+    expect(timeline._labelWidth).not.toHaveBeenCalled()
+  })
+
+  it('zooms with a modified wheel event over the plot and then pans by dragging', () => {
     const timeline = Object.create(SvTimeline.prototype)
     const canvas = document.createElement('canvas')
     canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 240, height: 80, right: 240, bottom: 80, x: 0, y: 0, toJSON: () => ({}) })
@@ -140,15 +169,17 @@ describe('SvTimeline continuous filtering', () => {
     })
 
     timeline._bind()
-    const wheel = new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true })
+    const wheel = new WheelEvent('wheel', { deltaY: -100, ctrlKey: true, bubbles: true, cancelable: true })
     Object.defineProperties(wheel, {
       clientX: { value: 140 },
       clientY: { value: 20 },
+      ctrlKey: { value: true },
     })
     canvas.dispatchEvent(wheel)
 
     expect(wheel.defaultPrevented).toBe(true)
-    expect(timeline.follow).toBe(false)
+    expect(timeline.follow).toBe(true)
+    expect(timeline.followSpan).toBe(800)
     expect(timeline.viewEnd - timeline.viewStart).toBeCloseTo(800)
     const zoomedStart = timeline.viewStart
 
@@ -166,23 +197,136 @@ describe('SvTimeline continuous filtering', () => {
     timeline.plotX0 = 40
     timeline.plotX1 = 240
 
-    expect(timeline._shouldZoomWheel(20)).toBe(false)
-    expect(timeline._shouldZoomWheel(140)).toBe(true)
+    expect(timeline._shouldZoomWheel(20, { ctrlKey: true })).toBe(false)
+    expect(timeline._shouldZoomWheel(140, { ctrlKey: false })).toBe(false)
+    expect(timeline._shouldZoomWheel(140, { ctrlKey: true })).toBe(true)
+  })
+
+  it('leaves an ordinary wheel event available for page scrolling', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    const canvas = document.createElement('canvas')
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 240, height: 80, right: 240, bottom: 80, x: 0, y: 0, toJSON: () => ({}) })
+    Object.assign(timeline, {
+      roots: { canvas }, canvas, W: 240, H: 80,
+      plotX0: 40, plotX1: 240, plotW: 200,
+      tMin: 0, tMax: 1_000, viewStart: 0, viewEnd: 1_000,
+      dragging: false, follow: true,
+      _resize: vi.fn(), _draw: vi.fn(), _updateStatus: vi.fn(),
+      _hitTest: vi.fn(() => null), _showTip: vi.fn(), _hideTip: vi.fn(),
+    })
+
+    timeline._bind()
+    const wheel = new WheelEvent('wheel', { deltaY: 100, bubbles: true, cancelable: true })
+    Object.defineProperties(wheel, { clientX: { value: 140 }, clientY: { value: 20 } })
+    canvas.dispatchEvent(wheel)
+
+    expect(wheel.defaultPrevented).toBe(false)
+    expect(timeline.follow).toBe(true)
+    expect(timeline.viewStart).toBe(0)
+    expect(timeline.viewEnd).toBe(1_000)
+    timeline.destroy()
+  })
+
+  it('keeps live follow for a click and disables it only after dragging', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    const canvas = document.createElement('canvas')
+    canvas.getBoundingClientRect = () => ({ left: 0, top: 0, width: 240, height: 80, right: 240, bottom: 80, x: 0, y: 0, toJSON: () => ({}) })
+    Object.assign(timeline, {
+      roots: { canvas }, canvas, W: 240, H: 80,
+      plotX0: 40, plotX1: 240, plotW: 200,
+      tMin: 0, tMax: 1_000, viewStart: 0, viewEnd: 1_000,
+      dragging: false, follow: true,
+      _resize: vi.fn(), _draw: vi.fn(), _updateStatus: vi.fn(),
+      _hitTest: vi.fn(() => null), _showTip: vi.fn(), _hideTip: vi.fn(),
+      setFollowMode: vi.fn(function (enabled) { this.follow = enabled }),
+    })
+
+    timeline._bind()
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 140, clientY: 30, button: 0, bubbles: true, cancelable: true }))
+    window.dispatchEvent(new MouseEvent('mouseup', { clientX: 140, clientY: 30 }))
+    expect(timeline.follow).toBe(true)
+    expect(timeline.setFollowMode).not.toHaveBeenCalled()
+
+    canvas.dispatchEvent(new MouseEvent('mousedown', { clientX: 140, clientY: 30, button: 0, bubbles: true, cancelable: true }))
+    window.dispatchEvent(new MouseEvent('mousemove', { clientX: 120, clientY: 30 }))
+    expect(timeline.follow).toBe(false)
+    expect(timeline.setFollowMode).toHaveBeenCalledWith(false)
+    window.dispatchEvent(new MouseEvent('mouseup', { clientX: 120, clientY: 30 }))
+    timeline.destroy()
   })
 
   it('keeps the inspected live frame stable until follow mode resumes', () => {
     const timeline = Object.create(SvTimeline.prototype)
     timeline.follow = false
     timeline._hadIntervals = true
+    timeline.viewStart = 100
+    timeline.viewEnd = 200
     timeline.intervals = [{ tid: 1, name: 'main', start: 100, end: 200 }]
     timeline._acceptData = vi.fn()
 
     timeline.setPrefilteredIntervals([{ tid: 2, name: 'Idle', start: 300, end: 400 }])
-    expect(timeline._acceptData).not.toHaveBeenCalled()
+    expect(timeline._acceptData).toHaveBeenCalledOnce()
+    expect(timeline._acceptData).toHaveBeenLastCalledWith(
+      [{ tid: 2, name: 'Idle', start: 300, end: 400 }],
+      { render: false, preserveDataRange: true },
+    )
 
     timeline.follow = true
     timeline.setPrefilteredIntervals([{ tid: 2, name: 'Idle', start: 300, end: 400 }])
-    expect(timeline._acceptData).toHaveBeenCalledOnce()
+    expect(timeline._acceptData).toHaveBeenCalledTimes(2)
+  })
+
+  it('preserves a manual view range while accepting new intervals', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      follow: false,
+      viewStart: 100,
+      viewEnd: 200,
+      _hadIntervals: true,
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(() => false),
+      _draw: vi.fn(),
+      _updateStatus: vi.fn(),
+      hidden: new Set(),
+      PALETTE: ['#1'],
+      _taskOrder: [],
+      _taskMeta: new Map(),
+      _explicitContexts: [],
+    })
+
+    timeline.setPrefilteredIntervals([{ tid: 1, name: 'main', start: 150, end: 180 }])
+
+    expect(timeline.getViewRange()).toEqual({ start: 100, end: 200 })
+    expect(timeline._draw).not.toHaveBeenCalled()
+  })
+
+  it('keeps accumulated data bounds when the live viewport advances', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      PALETTE: ['#1'],
+      hidden: new Set(),
+      follow: true,
+      windowSize: 100,
+      viewStart: null,
+      viewEnd: null,
+      _hadIntervals: false,
+      _explicitContexts: [],
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(() => false),
+      _draw: vi.fn(),
+      _updateStatus: vi.fn(),
+      _taskOrder: [],
+      _taskMeta: new Map(),
+    })
+
+    timeline.setPrefilteredIntervals([{ tid: 1, name: 'main', start: 900, end: 950 }])
+    expect([timeline.tMin, timeline.tMax]).toEqual([900, 950])
+    timeline.setPrefilteredIntervals([])
+    expect(timeline._hadIntervals).toBe(true)
+    timeline.setPrefilteredIntervals([{ tid: 1, name: 'main', start: 950, end: 1_000 }])
+
+    expect([timeline.tMin, timeline.tMax]).toEqual([900, 1_000])
+    expect(timeline._targetFollowRange()).toEqual({ start: 900, end: 1_000 })
   })
 
   it('positions an interval tooltip without throwing at the viewport edge', () => {
@@ -230,91 +374,179 @@ describe('SvTimeline continuous filtering', () => {
     expect(timeline._draw).not.toHaveBeenCalled()
   })
 
-  it('caps live follow animation draws at 30 FPS', () => {
-    const callbacks = []
-    vi.stubGlobal('requestAnimationFrame', vi.fn(callback => {
-      callbacks.push(callback)
-      return callbacks.length
-    }))
+  it('keeps the live window aligned to the newest event', () => {
     const timeline = Object.create(SvTimeline.prototype)
     Object.assign(timeline, {
       follow: true,
       windowSize: 100,
-      followEase: 0.22,
-      _followRaf: 0,
-      _lastFollowRender: Number.NEGATIVE_INFINITY,
       tMin: 0,
-      tMax: 1_000,
+      tMax: 131,
+    })
+
+    expect(timeline._targetFollowRange()).toEqual({ start: 31, end: 131 })
+    timeline.tMax = 199.999
+    expect(timeline._targetFollowRange()).toEqual({ start: 99.999, end: 199.999 })
+    timeline.tMax = 200.001
+    expect(timeline._targetFollowRange()).toEqual({ start: 100.001, end: 200.001 })
+  })
+
+  it('moves the live ruler continuously as new data arrives', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0)
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      PALETTE: ['#1'],
+      hidden: new Set(),
+      follow: true,
+      windowSize: 100,
+      _hadIntervals: false,
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(),
       viewStart: 0,
       viewEnd: 100,
       _draw: vi.fn(),
       _updateStatus: vi.fn(),
+      _drawLive: vi.fn(() => true),
     })
 
-    timeline._scheduleFollow()
-    callbacks.shift()(0)
-    callbacks.shift()(8)
-    callbacks.shift()(34)
+    timeline.setData([{ tid: 1, name: 'main', start: 10, end: 30 }])
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-70, 30])
+    now.mockReturnValue(10)
+    timeline.setData([{ tid: 1, name: 'main', start: 10, end: 90 }])
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-70, 30])
+    expect(timeline._followTarget).toEqual({ start: -10, end: 90 })
+    timeline.renderFrame(110)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-10, 90])
+    now.mockReturnValue(120)
+    timeline.setData([{ tid: 1, name: 'main', start: 10, end: 101 }])
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-10, 90])
+    expect(timeline._followTarget).toEqual({ start: 1, end: 101 })
+    timeline.renderFrame(220)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([1, 101])
 
-    expect(timeline._draw).toHaveBeenCalledTimes(2)
-    vi.unstubAllGlobals()
+    expect(timeline._drawLive).toHaveBeenCalledTimes(3)
+    now.mockRestore()
   })
 
-  it('shares one 30 FPS budget between live data and follow animation', () => {
-    const callbacks = []
-    vi.stubGlobal('requestAnimationFrame', vi.fn(callback => {
-      callbacks.push(callback)
-      return callbacks.length
-    }))
+  it('draws each live update in a continuously advancing window', () => {
     const timeline = Object.create(SvTimeline.prototype)
     Object.assign(timeline, {
+      PALETTE: ['#1'],
+      hidden: new Set(),
       follow: true,
       windowSize: 100,
-      followEase: 0.22,
-      _followRaf: 0,
-      _lastLiveRender: Number.NEGATIVE_INFINITY,
-      tMin: 0,
-      tMax: 1_000,
       viewStart: 0,
       viewEnd: 100,
+      _hadIntervals: true,
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(() => false),
+      _drawLive: vi.fn(() => true),
       _draw: vi.fn(),
       _updateStatus: vi.fn(),
     })
 
-    timeline._drawLive(0)
-    timeline._scheduleFollow()
-    callbacks.shift()(8)
-
-    expect(timeline._draw).toHaveBeenCalledTimes(1)
-    vi.unstubAllGlobals()
+    timeline.setData([{ tid: 1, name: 'main', start: 40, end: 60 }])
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([0, 100])
+    expect(timeline._followTarget).toEqual({ start: -40, end: 60 })
+    timeline.renderFrame((timeline._followTransitionAt || 0) + 100)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-40, 60])
+    timeline.setData([{ tid: 1, name: 'main', start: 101, end: 120 }])
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([-40, 60])
+    expect(timeline._followTarget).toEqual({ start: 20, end: 120 })
+    timeline.renderFrame((timeline._followTransitionAt || 0) + 100)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([20, 120])
+    expect(timeline._drawLive).toHaveBeenCalledTimes(2)
   })
 
-  it('cancels follow rendering while paused and resumes without changing follow mode', () => {
+  it('interpolates the live view on animation frames', () => {
     const timeline = Object.create(SvTimeline.prototype)
     Object.assign(timeline, {
       follow: true,
       windowSize: 100,
-      _followRaf: 7,
+      viewStart: 0,
+      viewEnd: 100,
+      _followTarget: { start: 20, end: 120 },
+      _followTransitionAt: 0,
+      _renderPaused: false,
+      _draw: vi.fn(),
+    })
+
+    timeline.renderFrame(50)
+    expect(timeline.viewStart).toBeGreaterThan(0)
+    expect(timeline.viewStart).toBeLessThan(20)
+    expect(timeline.viewEnd).toBeGreaterThan(100)
+    expect(timeline._draw).toHaveBeenCalledOnce()
+
+    timeline.renderFrame(100)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([20, 120])
+    expect(timeline._followTarget).toBeNull()
+  })
+
+  it('restarts follow interpolation from the displayed frame for each data batch', () => {
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0)
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      PALETTE: ['#1'],
+      hidden: new Set(),
+      follow: true,
+      windowSize: 100,
+      _hadIntervals: false,
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(),
+      _drawLive: vi.fn(() => true),
+      _draw: vi.fn(),
+      _updateStatus: vi.fn(),
+      viewStart: 0,
+      viewEnd: 100,
+      _taskOrder: [],
+      _taskMeta: new Map(),
+      _explicitContexts: [],
+    })
+
+    timeline.setData([{ tid: 1, name: 'main', start: 0, end: 100 }])
+    now.mockReturnValue(10)
+    timeline.setData([{ tid: 1, name: 'main', start: 0, end: 120 }])
+    timeline.renderFrame(60)
+    now.mockReturnValue(70)
+    timeline.renderFrame(70)
+    const displayed = { start: timeline.viewStart, end: timeline.viewEnd }
+
+    timeline.setData([{ tid: 1, name: 'main', start: 0, end: 140 }])
+
+    expect(timeline._followFrom).toEqual(displayed)
+    expect(timeline._followTransitionAt).toBe(70)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([displayed.start, displayed.end])
+
+    timeline.renderFrame(120)
+    expect(timeline.viewStart).toBeGreaterThan(displayed.start)
+    expect(timeline.viewStart).toBeLessThan(40)
+    expect(timeline.viewEnd).toBeGreaterThan(displayed.end)
+    expect(timeline.viewEnd).toBeLessThan(140)
+
+    timeline.renderFrame(170)
+    expect([timeline.viewStart, timeline.viewEnd]).toEqual([40, 140])
+    expect(timeline._followFrom).toBeNull()
+    now.mockRestore()
+  })
+
+  it('pauses live rendering and resumes without changing follow mode', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      follow: true,
+      windowSize: 100,
       _lastLiveRender: 0,
       _draw: vi.fn(),
       _updateStatus: vi.fn(),
-      _scheduleFollow: vi.fn(),
       _layout: vi.fn(),
     })
-    const cancel = vi.fn()
-    vi.stubGlobal('cancelAnimationFrame', cancel)
 
     timeline.pauseRendering()
-    expect(cancel).toHaveBeenCalledWith(7)
     expect(timeline._drawLive(100)).toBe(false)
     expect(timeline.follow).toBe(true)
 
     timeline.resumeRendering()
     expect(timeline._layout).toHaveBeenCalledOnce()
     expect(timeline._draw).toHaveBeenCalledOnce()
-    expect(timeline._scheduleFollow).toHaveBeenCalledOnce()
     expect(timeline.follow).toBe(true)
-    vi.unstubAllGlobals()
   })
 
   it('does not draw while an initially paused timeline is constructed or resized', () => {
@@ -349,5 +581,86 @@ describe('SvTimeline continuous filtering', () => {
     expect(canvas.width).toBe(321)
     expect(canvas.height).toBe(123)
     timeline.destroy()
+  })
+})
+
+describe('SvTimeline lane layout', () => {
+  it('does not clear the canvas repeatedly for a fractional device pixel ratio', () => {
+    const canvas = document.createElement('canvas')
+    Object.defineProperty(canvas, 'clientWidth', { configurable: true, value: 320 })
+    let backingWidth = 320
+    let widthWrites = 0
+    Object.defineProperty(canvas, 'width', {
+      configurable: true,
+      get: () => backingWidth,
+      set: value => { backingWidth = Math.trunc(value); widthWrites++ },
+    })
+    const dpr = vi.spyOn(window, 'devicePixelRatio', 'get').mockReturnValue(1.00000003)
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      canvas,
+      ctx: { setTransform: vi.fn() },
+      hidden: new Set(),
+      laneCapacity: 2,
+      tasks: [{ tid: 1 }, { tid: 2 }],
+      rulerH: 42,
+      laneH: 28,
+      padR: 6,
+      renderPaused: false,
+    })
+
+    timeline._layout()
+    timeline._layout()
+
+    expect(widthWrites).toBe(0)
+    expect(backingWidth).toBe(320)
+    dpr.mockRestore()
+  })
+
+  it('forces the current live frame to redraw after the canvas is resized', () => {
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      PALETTE: ['#1'],
+      hidden: new Set(),
+      follow: true,
+      windowSize: 100,
+      viewStart: 0,
+      viewEnd: 100,
+      _hadIntervals: true,
+      _filterContinuous: intervals => intervals,
+      _layout: vi.fn(() => true),
+      _drawLive: vi.fn(() => true),
+      _updateStatus: vi.fn(),
+    })
+
+    timeline.setData([{ tid: 1, name: 'main', start: 10, end: 30 }])
+
+    expect(timeline._drawLive).toHaveBeenCalledWith(undefined, true)
+  })
+
+  it('starts compact and grows only when more task lanes appear', () => {
+    const canvas = document.createElement('canvas')
+    Object.defineProperty(canvas, 'clientWidth', { configurable: true, value: 320 })
+    const timeline = Object.create(SvTimeline.prototype)
+    Object.assign(timeline, {
+      canvas,
+      ctx: { setTransform: vi.fn() },
+      hidden: new Set(),
+      laneCapacity: 2,
+      tasks: [{ tid: 1 }, { tid: 2 }],
+      rulerH: 42,
+      laneH: 28,
+      padR: 6,
+      renderPaused: false,
+    })
+
+    timeline._layout()
+    expect(timeline.H).toBe(102)
+    timeline.tasks = [{ tid: 1 }, { tid: 2 }, { tid: 3 }]
+    timeline._layout()
+    expect(timeline.H).toBe(130)
+    timeline.tasks = [{ tid: 1 }]
+    timeline._layout()
+    expect(timeline.H).toBe(130)
   })
 })

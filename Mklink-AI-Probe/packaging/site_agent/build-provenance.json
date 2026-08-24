@@ -5,7 +5,7 @@
     "producer": "N5",
     "state": "pending"
   },
-  "product_version": "0.1.6",
+  "product_version": "0.1.7",
   "upstream_git_sha": "98baf3930ed97ae284cc0801559f30df95e13eff",
   "upstream_merge_sha": "02444752f18cc9814fa09822ca1ebddb77f4c2e8"
 }

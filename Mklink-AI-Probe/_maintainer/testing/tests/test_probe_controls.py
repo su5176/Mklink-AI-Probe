@@ -247,12 +247,25 @@ def test_mcp_exposes_guarded_power_and_probe_reboot(monkeypatch):
 
     mcp_server._register_flash_tools(mcp)
 
-    assert mcp.tools["set_power_on"](5000, confirm_5v=True) == {
+    with pytest.raises(ValueError, match="explicit user confirmation"):
+        mcp.tools["set_power_on"](3300)
+    assert calls == []
+
+    assert mcp.tools["set_power_on"](3300, confirm_user=True) == {
+        "power_on": True,
+        "voltage_mv": 3300,
+    }
+    assert mcp.tools["set_power_on"](
+        5000,
+        confirm_user=True,
+        confirm_5v=True,
+    ) == {
         "power_on": True,
         "voltage_mv": 5000,
     }
     assert mcp.tools["reboot_probe"]() == {"rebooted": True, "connected": False}
     assert calls == [
+        ("power", 3300, False),
         ("power", 5000, True),
         ("reboot",),
         ("reset-holder",),

@@ -216,6 +216,21 @@ describe('useOnlineFlashApi', () => {
     expect(new Headers(options?.headers).get('Content-Type')).toBe('application/json')
   })
 
+  it('loads target flash sector geometry independently of firmware inspection', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(JSON.stringify([{
+      name: 'flash', start: 0x08000000, length: 0x80000, sector_size: 0x800,
+    }]), { status: 200 }))
+    const api = await onlineFlashApi()
+
+    const regions = await api.getTargetMemoryMap('STM32F103 RC')
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/online-flash/targets/STM32F103%20RC/memory-map',
+      expect.any(Object),
+    )
+    expect(regions[0]?.sector_size).toBe(0x800)
+  })
+
   it('uses multipart FormData without forcing a JSON content type', async () => {
     vi.mocked(fetch).mockImplementation(async () => new Response('{}', { status: 200 }))
     const api = await onlineFlashApi()
@@ -549,6 +564,9 @@ function viewFetch(targets = [installedTarget]) {
     const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
     if (url.endsWith('/probes')) return json([probeFixture])
     if (url.includes('/targets?')) return json(targets)
+    if (url.includes('/targets/') && url.endsWith('/memory-map')) return json([{
+      name: 'flash', start: 0x08000000, length: 0x80000, sector_size: 0x800,
+    }])
     if (url.endsWith('/packs/status')) return json({ last_error: null, index_available: true, target_count: targets.length })
     if (url.includes('/algorithms?')) return json(algorithms)
     if (url.endsWith('/algorithms') && options?.method === 'POST') {
@@ -574,6 +592,10 @@ function viewFetch(targets = [installedTarget]) {
       segments: [{ start: 0x80000000, end: 0x80000020 }], base_address: 0x80000000,
       sector_operations_available: true,
       sectors: [{ address: 0x80000000, size: 0x1000 }],
+    })
+    if (url.endsWith('/memory/read-stream')) return new Response(new Uint8Array(32).fill(0x41), {
+      status: 200,
+      headers: { 'Content-Type': 'application/octet-stream' },
     })
     if (url.includes('/preview?')) return json({
       address: 0x80000000, length: 32, data_base64: btoa('\x41'.repeat(32)), present: Array(32).fill(true),
@@ -639,6 +661,85 @@ describe('online flash task workspace behavior', () => {
 
     expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value)
       .toBe('attach')
+    wrapper.unmount()
+  })
+
+  it('loads the selected target memory map before a firmware file is chosen', async () => {
+    const fetchMock = viewFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => (
+      String(url).endsWith('/targets/DEVICE_A/memory-map')
+    ))).toBe(true))
+    expect(wrapper.find('[data-testid="firmware-input"]').exists()).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('makes the flashing job available after reading target memory', async () => {
+    const fetchMock = viewFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/targets/DEVICE_A/memory-map'))).toBe(true))
+
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="memory-read-submit"]').attributes('disabled')).toBeUndefined())
+    const readButton = wrapper.get('[data-testid="memory-read-submit"]')
+    await readButton.trigger('click')
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="memory-read-address"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="memory-read-address"]').setValue('0x80000000')
+    await wrapper.get('[data-testid="memory-read-end-address"]').setValue('0x80000020')
+    await wrapper.get('[data-testid="memory-read-confirm"]').trigger('click')
+
+    await vi.waitFor(() => expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/images/inspect'))).toBe(true))
+    const inspectRequest = fetchMock.mock.calls.find(([url]) => String(url).endsWith('/images/inspect'))
+    expect((inspectRequest?.[1]?.body as FormData).get('captured_from_target')).toBe('true')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined())
+    expect(wrapper.text()).toContain('read-0x80000000-32.bin')
+    wrapper.unmount()
+  })
+
+  it('keeps flash progress and logs visible after programming captured memory', async () => {
+    const fetchMock = viewFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="memory-read-submit"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="memory-read-submit"]').trigger('click')
+    await wrapper.get('[data-testid="memory-read-address"]').setValue('0x80000000')
+    await wrapper.get('[data-testid="memory-read-end-address"]').setValue('0x80000020')
+    await wrapper.get('[data-testid="memory-read-confirm"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined())
+    expect(wrapper.get('.progress-title').text()).toBe('读取进度')
+    expect(wrapper.get('[data-testid="job-state"]').text()).toBe('读取完成')
+
+    await wrapper.get('[data-testid="start-job"]').trigger('click')
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
+    expect(wrapper.get('.progress-title').text()).toBe('烧录总进度')
+    expect(wrapper.get('[data-testid="job-state"]').text()).not.toBe('读取完成')
+
+    FakeEventSource.instances[0].emit('progress', {
+      job_id: 'job-1', sequence: 3, timestamp: 2, event: 'progress',
+      message: '[PROGRAM] 16 / 32 Bytes (50%)', state: 'programming', progress: 0.5,
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('[data-testid="total-progress"]').attributes('value')).toBe('0.5')
+    expect(wrapper.get('[data-testid="log-viewport"]').text()).toContain('[PROGRAM] 16 / 32 Bytes (50%)')
+
+    FakeEventSource.instances[0].emit('state', {
+      job_id: 'job-1', sequence: 4, timestamp: 3, event: 'state',
+      message: '', state: 'succeeded', progress: 1,
+    })
+    await wrapper.vm.$nextTick()
+    expect(wrapper.get('.progress-title').text()).toBe('烧录总进度')
+    expect(wrapper.get('[data-testid="job-state"]').text()).toBe('烧录完成')
+    expect(wrapper.get('[data-testid="total-progress-label"]').text()).toBe('100%')
     wrapper.unmount()
   })
 
@@ -815,6 +916,28 @@ describe('online flash task workspace behavior', () => {
     await vi.waitFor(() => expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith('/images/inspect'))).toBe(true))
     expect(wrapper.find('[data-testid="inspect-image"]').exists()).toBe(false)
     expect(wrapper.text()).toContain('已自动检查')
+    wrapper.unmount()
+  })
+
+  it('clears a user-selected HEX file and its preview from the shared data window', async () => {
+    const fetchMock = viewFetch()
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+
+    await chooseFirmware(wrapper, 'firmware.hex')
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已自动检查'))
+
+    const clear = wrapper.get('[data-testid="memory-read-clear"]')
+    expect(clear.attributes('disabled')).toBeUndefined()
+    await clear.trigger('click')
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).not.toContain('firmware.hex')
+    expect(wrapper.text()).not.toContain('已自动检查')
+    expect(wrapper.find('.metadata').exists()).toBe(false)
+    expect(wrapper.get('[data-testid="memory-read-clear"]').attributes('disabled')).toBeDefined()
     wrapper.unmount()
   })
 
@@ -1174,7 +1297,7 @@ describe('online flash task workspace behavior', () => {
     })
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('[data-testid="job-state"]').text()).toContain('FAILED')
+    expect(wrapper.get('[data-testid="job-state"]').text()).toContain('烧录失败')
     expect(wrapper.text()).toContain('Failed to connect to MKLink on COM48')
     expect(source.closed).toBe(true)
     wrapper.unmount()
@@ -1291,12 +1414,12 @@ describe('online flash task workspace behavior', () => {
     FakeEventSource.instances[0].emit('state', {
       job_id: 'job-1', sequence: 9, timestamp: 2, event: 'state', message: '', state: 'succeeded', progress: 1,
     })
-    await vi.waitFor(() => expect(wrapper.get('[data-testid="job-state"]').text()).toContain('SUCCEEDED'))
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="job-state"]').text()).toContain('烧录完成'))
     resolveStop(new Response(JSON.stringify({ state: 'stopped', job_id: 'job-1' }), { status: 200 }))
     for (let index = 0; index < 10; index += 1) await Promise.resolve()
     await wrapper.vm.$nextTick()
 
-    expect(wrapper.get('[data-testid="job-state"]').text()).toContain('SUCCEEDED')
+    expect(wrapper.get('[data-testid="job-state"]').text()).toContain('烧录完成')
     expect(wrapper.find('.waiting').exists()).toBe(false)
     wrapper.unmount()
   })
@@ -1450,6 +1573,9 @@ describe('online flash component quality', () => {
     expect(onlineFlashViewSource).toMatch(/height:calc\(100dvh/)
     expect(onlineFlashViewSource).toMatch(/min-height:0/)
     expect(firmwareWorkspaceSource).toMatch(/\.hex-scroll\{min-height:0;height:auto;flex:1/)
+    expect(onlineFlashViewSource).toContain('@progress="onMemoryReadProgress"')
+    expect(onlineFlashViewSource).toContain('@log="onMemoryReadLog"')
+    expect(onlineFlashViewSource).toContain(':total-progress="progressValue"')
   })
 
   function mockLogGeometry(viewport: ReturnType<typeof mount>['element'], values: { top: number; height: number; total: number }) {
@@ -1580,8 +1706,29 @@ describe('online flash component quality', () => {
     expect(wrapper.emitted('dropFiles')?.[0]).toEqual([[file]])
   })
 
+  it('shows read data in the HEX window and emits save and clear actions', async () => {
+    const wrapper = mount(FirmwareWorkspace, { props: {
+      file: null, baseAddress: '', baseError: '', inspection: null, rows: [],
+      paddingTop: 0, paddingBottom: 0, loading: false, error: '',
+      memoryData: new Uint8Array([0x41, 0x42, 0x43]), memoryAddress: 0x1000,
+    } })
+
+    expect(wrapper.get('[data-testid="memory-read-submit"] .lucide-upload').exists()).toBe(true)
+    expect(wrapper.get('.metadata').text()).toContain('0x00001003')
+    expect(wrapper.get('.hex-row').text()).toContain('414243')
+    await wrapper.get('[data-testid="memory-read-save"]').trigger('click')
+    await wrapper.get('[data-testid="memory-read-clear"]').trigger('click')
+    expect(wrapper.emitted('save')).toHaveLength(1)
+    expect(wrapper.emitted('clearData')).toHaveLength(1)
+  })
+
   it('wraps the action bar controls for narrow layouts', () => {
     expect(actionBarSource).toContain('flex-wrap:wrap')
     expect(actionBarSource).toContain('max-width:100%')
+  })
+
+  it('keeps the BIN base-address label and input on one stable line', () => {
+    expect(firmwareWorkspaceSource).toMatch(/\.base-field\{[^}]*flex:0 0 auto[^}]*white-space:nowrap/s)
+    expect(firmwareWorkspaceSource).toMatch(/\.base-field input\{[^}]*flex:0 0 92px[^}]*min-width:92px/s)
   })
 })

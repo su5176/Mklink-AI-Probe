@@ -54,6 +54,7 @@ const MAX_CONSECUTIVE_FAILS: u32 = 3;
 const DEFAULT_SIDECAR_PORT: u16 = 8765;
 const LAST_SIDECAR_PORT: u16 = 8799;
 const SIDECAR_START_TIMEOUT_SECS: u64 = 20;
+const SIDECAR_SHUTDOWN_TIMEOUT_SECS: u64 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,6 +263,15 @@ fn site_agent_bind_addresses() -> Vec<String> {
     site_agent_network::local_bind_addresses()
 }
 
+#[tauri::command]
+fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if target.as_os_str().is_empty() {
+        return Err("file path is empty".into());
+    }
+    std::fs::write(&target, contents).map_err(|error| error.to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn which_exists(name: &str) -> bool {
     use std::os::windows::process::CommandExt;
@@ -433,8 +443,61 @@ fn spawn_registered_sidecar(
     )
 }
 
+fn request_sidecar_shutdown(port: u16, instance_id: &str) -> bool {
+    use std::io::{Read, Write};
+
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = match std::net::TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    ) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let timeout = std::time::Duration::from_secs(SIDECAR_SHUTDOWN_TIMEOUT_SECS);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let body = serde_json::json!({ "instance_id": instance_id }).to_string();
+    let request = format!(
+        "POST /api/desktop/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        port,
+        body.len(),
+        body,
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.take(8192).read_to_end(&mut response).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "))
+}
+
+fn wait_for_child_exit(child: &mut Child) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SIDECAR_SHUTDOWN_TIMEOUT_SECS);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+    child.try_wait().is_ok_and(|status| status.is_some())
+}
+
 fn terminate_sidecar_tree(state: &Sidecar) -> Result<(), String> {
-    let child = state.child.lock().map_err(|e| e.to_string())?.take();
+    let port = *state.port.lock().map_err(|e| e.to_string())?;
+    let mut child = state.child.lock().map_err(|e| e.to_string())?.take();
+    let graceful_exit = port.is_some_and(|port| {
+        request_sidecar_shutdown(port, &state.instance_id)
+            && child.as_mut().is_none_or(wait_for_child_exit)
+    });
     *state.port.lock().map_err(|e| e.to_string())? = None;
     let _ = std::fs::remove_file(&state.runtime_info_path);
 
@@ -449,7 +512,9 @@ fn terminate_sidecar_tree(state: &Sidecar) -> Result<(), String> {
     }
 
     if let Some(mut child) = child {
-        let _ = child.kill();
+        if !graceful_exit {
+            let _ = child.kill();
+        }
         let _ = child.wait();
     }
     Ok(())
@@ -755,6 +820,7 @@ pub fn run() {
             site_agent_generate_token_and_copy,
             site_agent_stcp_credentials_configure,
             site_agent_bind_addresses,
+            write_file,
         ])
         .setup(move |app| {
             let site_agent_root = app.path().app_local_data_dir()?.join("site-agent");
@@ -773,7 +839,21 @@ pub fn run() {
             let exit_item = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &exit_item])?;
             let tray_shutdown = shutdown.clone();
+            // TrayIconBuilder does not inherit the window icon automatically.
+            // Reuse the generated bundle icon so Windows never creates an
+            // empty tray item when the app starts from the installer.
+            let tray_icon = app
+                .default_window_icon()
+                .cloned()
+                .map(tauri::image::Image::to_owned)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Tauri default window icon is missing",
+                    )
+                })?;
             TrayIconBuilder::new()
+                .icon(tray_icon)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -807,24 +887,21 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Keep the unified sidecar alive in the tray while Site Agent is enabled.
+            // Closing the main window is a real application exit. The sidecar
+            // owns the Device and its serial/HIL locks, so it must be stopped
+            // even when Site Agent is configured. Users can start the desktop
+            // app again when they need the agent; a hidden window must never
+            // leave a probe locked unexpectedly.
             let cleanup_handle = app.handle().clone();
             let cleanup_shutdown = shutdown.clone();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if let tauri::WindowEvent::CloseRequested { api: _, .. } = event {
                         let state: State<Sidecar> = cleanup_handle.state();
-                        let keep_running = configured_site_agent_root(state.inner())
-                            .ok()
-                            .and_then(|root| site_agent_config::load(&root).ok())
-                            .is_some_and(|config| config.enabled);
-                        if keep_running {
-                            api.prevent_close();
-                            if let Some(window) = cleanup_handle.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
-                            return;
-                        }
+                        // The close request is allowed to continue after the
+                        // owned sidecar has been asked to shut down. This
+                        // keeps the serial release on the same synchronous
+                        // path as tray Exit and process shutdown.
                         eprintln!("[tauri] window closing, cleaning up sidecar...");
                         cleanup_shutdown.store(true, Ordering::Relaxed);
                         if terminate_sidecar_tree(state.inner()).is_ok() {

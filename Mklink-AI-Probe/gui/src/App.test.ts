@@ -117,11 +117,16 @@ describe('App version footer', () => {
       target: '_blank',
       rel: 'noopener noreferrer',
     })
+    expect(xianji.attributes()).toMatchObject({
+      href: 'https://item.taobao.com/item.htm?ft=t&id=1074695414484',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+    })
     expect(docs.text()).toBe('在线文档')
     expect(store.text()).toBe('淘宝店铺')
     expect(official.text()).toBe('官方智沐店铺')
-    expect(xianji.text()).toContain('先楫定制店铺')
-    expect(xianji.attributes('disabled')).toBeDefined()
+    expect(xianji.text()).toBe('先楫定制店铺')
+    expect(xianji.attributes('disabled')).toBeUndefined()
     expect(wrapper.text()).not.toContain('microboot.readthedocs.io')
     expect(wrapper.text()).not.toContain('item.taobao.com')
     wrapper.unmount()

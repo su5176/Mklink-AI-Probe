@@ -1,6 +1,6 @@
 ---
 name: tauri-gui-builder
-description: Build and qualify the Mklink AI Probe Tauri v2 Windows desktop app, bundled Python sidecar, and standard NSIS installer.
+description: Maintainer-only workflow to build and qualify the Mklink AI Probe Tauri v2 Windows app, bundled Python sidecar, and standard NSIS installer. Invoke explicitly in a source checkout; never use for ordinary end-user GUI startup or hardware debugging.
 ---
 
 # Mklink AI Probe Tauri Builder

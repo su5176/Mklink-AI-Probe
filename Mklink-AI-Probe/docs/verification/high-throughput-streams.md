@@ -149,6 +149,5 @@ dependency findings; neither was introduced by this qualification task.
 
 ## Existing bounded synthetic evidence
 
-The earlier RTT/SuperWatch soaks and their explicit limitations are retained in
-[task8-rtt-superwatch-synthetic.md](task8-rtt-superwatch-synthetic.md). They
-must not be used to fill the HIL matrix above.
+The earlier RTT/SuperWatch synthetic soaks remain available in Git history.
+They must not be used to fill the HIL matrix above.

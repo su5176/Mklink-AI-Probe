@@ -32,6 +32,7 @@ Tools are registered with ``@mcp.tool()`` and grouped by capability
 from __future__ import annotations
 
 from contextlib import contextmanager
+import atexit
 import logging
 import sys
 import threading
@@ -125,6 +126,12 @@ def _reset_device() -> None:
                 log.exception("error closing device during reset")
         _holder["device"] = None
         _holder["kwargs"] = {}
+
+
+# MCP hosts normally terminate the stdio child after the conversation ends.
+# Keep the explicit `disconnect` tool for normal sessions, but also close the
+# cached Device when the host exits without sending that final tool call.
+atexit.register(_reset_device)
 
 
 # --------------------------------------------------------------------------
@@ -381,15 +388,28 @@ def _register_flash_tools(mcp: Any) -> None:
         return {"reset": True}
 
     @mcp.tool()
-    def set_power_on(voltage_mv: int, confirm_5v: bool = False) -> dict:
+    def set_power_on(
+        voltage_mv: int,
+        confirm_5v: bool = False,
+        confirm_user: bool = False,
+    ) -> dict:
         """Enable MKLink VCC output at exactly 1.8 V, 3.3 V, or 5 V.
 
         Args:
             voltage_mv: One of 1800, 3300, or 5000 millivolts.
+            confirm_user: Must be True for every request, and only after the
+                user explicitly approves this exact voltage for this call.
+                Never reuse an earlier confirmation or infer consent.
             confirm_5v: Must be True for every 5000 mV request, and only after
                 the user has verified that the connected target is 5 V
                 tolerant.  Applying 5 V to a 3.3 V target can destroy it.
         """
+        if confirm_user is not True:
+            raise ValueError(
+                "VCC output requires explicit user confirmation for this "
+                "voltage; ask the user, then pass confirm_user=True only "
+                "after they approve this request"
+            )
         dev = _connected_device()
         dev.set_power_on(voltage_mv, confirm_5v=confirm_5v)
         return {"power_on": True, "voltage_mv": voltage_mv}
@@ -1341,7 +1361,10 @@ def run() -> None:
     if mcp is None:
         mcp = build_server()
     with _isolate_stdio_protocol():
-        mcp.run(transport="stdio")
+        try:
+            mcp.run(transport="stdio")
+        finally:
+            _reset_device()
 
 
 __all__ = ["build_server", "run", "configure_device"]

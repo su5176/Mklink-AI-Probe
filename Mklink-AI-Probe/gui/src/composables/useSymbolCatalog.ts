@@ -129,10 +129,20 @@ async function loadBrowseChildren(node: SymbolBrowseNode): Promise<void> {
   if (browseLoading.value.has(node.key)) return
   setBrowseLoading(node.key, true)
   try {
-    const page = await fetchBrowse(
+    let page = await fetchBrowse(
       node.path,
       node.kind === 'range' ? node.range_start : null,
     )
+    // Stopping/restarting a dashboard can rebind the device catalog while a
+    // lazy branch request is in flight. Refresh once and retry the same path
+    // so the user does not have to discover and manually click "retry".
+    if (!sameIdentity(page)) {
+      await ensureLoaded(true)
+      page = await fetchBrowse(
+        node.path,
+        node.kind === 'range' ? node.range_start : null,
+      )
+    }
     if (!sameIdentity(page)) throw new Error('Symbol catalog changed while loading; retry')
     const next = new Map(browseChildren.value)
     next.set(node.key, page.nodes)

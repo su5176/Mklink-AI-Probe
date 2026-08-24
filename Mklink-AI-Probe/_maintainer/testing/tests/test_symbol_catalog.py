@@ -18,6 +18,7 @@ from mklink.elf_backend import ElfSection
 from mklink.c_layout import CLayoutError
 from mklink.symbol_catalog import (
     SymbolCatalog,
+    SymbolCatalogError,
     SymbolValueError,
     decode_descriptor,
     encode_descriptor,
@@ -148,6 +149,27 @@ def test_catalog_pages_large_array_without_losing_later_elements(tmp_path):
     assert len(tail) == 44
     assert tail[0].descriptor.path == "values[256]"
     assert tail[-1].descriptor.path == "values[299]"
+
+
+def test_catalog_resolves_bounded_one_dimensional_snapshot_slice(tmp_path):
+    axf = tmp_path / "app.axf"
+    axf.write_bytes(b"axf")
+    catalog = SymbolCatalog.from_dwarf(
+        _dwarf_fixture(),
+        axf_path=str(axf),
+        ram_ranges=[(0x20000000, 0x20010000)],
+    )
+
+    root = next(item for item in catalog.browse_roots() if item.path == "buffer")
+    assert root.snapshot_eligible is True
+    assert root.array_dimensions == (8,)
+    descriptors = catalog.array_descriptors("buffer", start_index=2, count=3)
+    assert [item.path for item in descriptors] == ["buffer[2]", "buffer[3]", "buffer[4]"]
+    assert [item.address for item in descriptors] == [0x20000064, 0x20000066, 0x20000068]
+    with pytest.raises(SymbolCatalogError, match="range exceeds"):
+        catalog.array_descriptors("buffer", start_index=7, count=2)
+    with pytest.raises(SymbolCatalogError, match="not an array"):
+        catalog.array_descriptors("controller", start_index=0, count=1)
 
 
 def test_catalog_pages_struct_arrays_by_direct_element(tmp_path):

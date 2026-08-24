@@ -786,7 +786,15 @@ export class StreamDecoder {
       this.suspendedContexts = []
       this.updateSystemViewContext(CONTEXT_SCHEDULER, 0)
       this.openSystemViewContext(CONTEXT_SCHEDULER, 0, ticks, event)
-    } else if (event.kind === 'overflow' || event.kind === 'trace_stop') {
+    } else if (event.kind === 'overflow') {
+      // An Overflow means records between the previous event and this marker
+      // are missing. Do not turn the open context into a complete interval:
+      // doing so renders a long, fabricated task run (HPM can lose seconds of
+      // task-switch records while the probe reports one marker). The marker
+      // remains in the event ring, and the next explicit context event starts
+      // a new trustworthy interval.
+      this.abandonSystemViewContext()
+    } else if (event.kind === 'trace_stop') {
       this.closeCurrentSystemViewInterval(ticks)
       this.abandonSystemViewContext()
     } else if (event.kind === 'idle') {
@@ -998,7 +1006,10 @@ export class StreamDecoder {
       startTicks: startTicks.buffer,
       endTicks: endTicks.buffer,
       events,
-      contexts: this.buildSystemViewContextSummaries(rangeStart, rangeEnd),
+      // Context statistics describe the retained trace, not just the pixels
+      // currently visible in the timeline. Keeping this independent from the
+      // viewport prevents Runtime counts from restarting as follow advances.
+      contexts: this.buildSystemViewContextSummaries(),
     }
     this.post(output, [
       output.taskIds, output.contextTypes, output.starts, output.ends,
@@ -1006,27 +1017,20 @@ export class StreamDecoder {
     ])
   }
 
-  private buildSystemViewContextSummaries(
-    rangeStart: bigint,
-    rangeEnd: bigint,
-  ): SystemViewContextSummary[] {
+  private buildSystemViewContextSummaries(): SystemViewContextSummary[] {
     const durations = new Map<string, number[]>()
     const intervalRing = this.systemViewIntervals as SystemViewIntervalRing
     const addInterval = (type: number, id: number, start: bigint, end: bigint) => {
-      const clippedStart = start < rangeStart ? rangeStart : start
-      const clippedEnd = end > rangeEnd ? rangeEnd : end
-      if (clippedEnd <= clippedStart) return
+      if (end <= start) return
       this.updateSystemViewContext(type, id)
       const key = this.contextKey(type, id)
       const values = durations.get(key) || []
-      values.push(safeTickDifference(clippedEnd, clippedStart))
+      values.push(safeTickDifference(end, start))
       durations.set(key, values)
     }
     for (let logical = 0; logical < intervalRing.length; logical++) {
       const start = intervalRing.startTickAt(logical)
-      if (start > rangeEnd) break
       const end = intervalRing.endTickAt(logical)
-      if (end < rangeStart) continue
       addInterval(
         intervalRing.contextTypeAt(logical), intervalRing.taskIdAt(logical), start, end,
       )

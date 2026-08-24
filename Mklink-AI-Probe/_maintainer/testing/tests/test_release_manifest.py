@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -37,6 +38,7 @@ def release_inputs(tmp_path):
             json.dumps({"version": "0.1.0"}),
         )
         archive.writestr(f"{root}/scripts/skill_update.py", "# updater\n")
+
     portable = tmp_path / "MKLink-Site-Agent-v0.1.0-windows-x86_64-portable.zip"
     portable.write_bytes(b"portable")
     portable_manifest = tmp_path / "portable.manifest.json"
@@ -132,6 +134,73 @@ def test_prepare_release_rejects_nested_repository_skill_layout(
             nsis=nsis,
             updater_signature=signature,
             skill_archive=nested,
+            site_agent_archive=portable,
+            site_agent_manifest=portable_manifest,
+        )
+
+
+def test_public_skill_archive_excludes_repository_maintenance(
+    release_module, tmp_path,
+):
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=release_module.REPO_ROOT,
+        text=True,
+    ).strip()
+    archive_path = tmp_path / "public-skill.zip"
+
+    release_module._build_skill_archive(
+        version="0.1.7",
+        source_commit=source_commit,
+        output=archive_path,
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        root = "Mklink-AI-Probe-v0.1.7/"
+        files = {
+            info.filename.removeprefix(root)
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
+    assert {
+        "SKILL.md",
+        "agents/openai.yaml",
+        "gui/dist/index.html",
+        "scripts/skill_update.py",
+    } <= files
+    assert not any(
+        path == name or path.startswith(f"{name}/")
+        for path in files
+        for name in (
+            "_maintainer",
+            "commands",
+            "docs",
+            "native",
+            "skills",
+            "site-agent-gui",
+        )
+    )
+    assert {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}.isdisjoint(files)
+
+
+def test_prepare_release_rejects_maintenance_content(
+    release_module, tmp_path,
+):
+    nsis, signature, skill, portable, portable_manifest = release_inputs(tmp_path)
+    with zipfile.ZipFile(skill, "a") as archive:
+        archive.writestr(
+            "Mklink-AI-Probe-v0.1.0/skills/maintaining-mklink-ai-probe/SKILL.md",
+            "maintainer only",
+        )
+
+    with pytest.raises(ValueError, match="non-user content"):
+        release_module.prepare_release(
+            version="0.1.0",
+            source_commit="a" * 40,
+            output_dir=tmp_path / "release",
+            nsis=nsis,
+            updater_signature=signature,
+            skill_archive=skill,
             site_agent_archive=portable,
             site_agent_manifest=portable_manifest,
         )

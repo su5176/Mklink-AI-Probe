@@ -162,6 +162,7 @@ class JobRequest:
     custom_flm_paths: Tuple[str, ...] = ()
     custom_flm_digests: Tuple[str, ...] = ()
     custom_flm_regions: Tuple[Tuple[int, int], ...] = ()
+    pack_flm_regions: Tuple[Tuple[int, int], ...] = ()
     custom_flm_ram_start: Optional[int] = None
     custom_flm_ram_size: Optional[int] = None
     frequency: int = 1_000_000

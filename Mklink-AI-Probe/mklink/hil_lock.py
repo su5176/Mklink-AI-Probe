@@ -52,24 +52,29 @@ def _sanitize(name: str) -> str:
 
 @contextmanager
 def _exclusive_guard(path: Path, timeout_s: float = 10.0):
-    """与 hil_core.lockd 相同的元操作 guard（owner 校验/删/建原子区）。"""
+    """Serialize lock-file ownership checks and metadata updates."""
     path.parent.mkdir(parents=True, exist_ok=True)
     handle = path.open("a+b")
     acquired = False
     try:
         handle.seek(0, os.SEEK_END)
         if handle.tell() == 0:
-            handle.write(b"\0"); handle.flush()
+            handle.write(b"\0")
+            handle.flush()
         deadline = time.monotonic() + timeout_s
         while True:
             try:
                 handle.seek(0)
                 if os.name == "nt":
                     import msvcrt
+
                     msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-                else:  # pragma: no cover
+                else:  # pragma: no cover - exercised by Linux CI
                     import fcntl
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB,
+                    )
                 acquired = True
                 break
             except (OSError, BlockingIOError):
@@ -83,12 +88,33 @@ def _exclusive_guard(path: Path, timeout_s: float = 10.0):
                 handle.seek(0)
                 if os.name == "nt":
                     import msvcrt
+
                     msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-                else:  # pragma: no cover
+                else:  # pragma: no cover - exercised by Linux CI
                     import fcntl
+
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         finally:
             handle.close()
+
+
+def _local_holder_is_dead(holder: dict) -> bool:
+    """Return true only when a same-host lock owner is confirmed dead."""
+    if holder.get("hostname") != socket.gethostname():
+        return False
+    try:
+        pid = int(holder.get("pid", 0))
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+
+    # Reuse the conservative platform-specific check used by local serial
+    # cleanup. Inspection failures count as alive, so an active lock is never
+    # reclaimed merely because its process cannot be queried.
+    from mklink.local_resources import _pid_exists
+
+    return not _pid_exists(pid)
 
 
 class HilFileLock:
@@ -130,7 +156,9 @@ class HilFileLock:
         with _exclusive_guard(self.guard_path):
             for _ in range(4):  # guard 内回收并排他创建
                 try:
-                    fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                    fd = os.open(
+                        self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    )
                 except FileExistsError:
                     holder = self._read()
                     if holder is None:
@@ -139,7 +167,10 @@ class HilFileLock:
                         except OSError:
                             pass
                         continue
-                    if float(holder.get("expires_at", 0) or 0) < time.time():
+                    expired = (
+                        float(holder.get("expires_at", 0) or 0) < time.time()
+                    )
+                    if expired or _local_holder_is_dead(holder):
                         try:
                             self.path.unlink()
                             continue
@@ -177,14 +208,14 @@ class HilFileLock:
         if lease_s is not None:
             self.lease_s = float(lease_s)
         tmp = self.path.with_name(self.path.name + f".renew-{self.owner_id[:8]}")
-        tmp.write_text(json.dumps(self._payload()), encoding="utf-8")
         with _exclusive_guard(self.guard_path):
+            tmp.write_text(json.dumps(self._payload()), encoding="utf-8")
             for attempt in range(5):  # Windows 杀毒/索引器可能短暂持锁
                 try:
                     current = self._read()
                     if current is None or current.get("owner_id") != self.owner_id:
                         tmp.unlink()
-                        return False
+                        return False  # 所有权已丢失（过期被回收）
                     os.replace(tmp, self.path)
                     return True
                 except OSError:

@@ -41,19 +41,39 @@
           </button>
           <button
             type="button"
-            class="device-quick-action mcu-reset-action"
-            :disabled="!deviceStatus.connected || connecting || disconnecting || resetting"
-            :title="tr('复位 MCU', 'Reset MCU')"
-            :aria-label="tr('复位 MCU', 'Reset MCU')"
+            class="device-quick-action reset-action"
+            :disabled="!deviceStatus.connected || connecting || disconnecting || resetting || rebootingProbe"
+            :title="tr('重启 MCU', 'Restart MCU')"
             data-testid="mcu-reset-action"
             @click="quickReset"
           >
             <LoaderCircle v-if="resetting" class="spinning" :size="14" aria-hidden="true" />
             <RotateCcw v-else :size="14" aria-hidden="true" />
+            <span>{{ resetting ? tr('重启中...', 'Restarting...') : tr('重启 MCU', 'Restart MCU') }}</span>
+          </button>
+          <button
+            type="button"
+            class="device-quick-action reset-action"
+            :disabled="!deviceStatus.connected || connecting || disconnecting || resetting || rebootingProbe"
+            :title="tr('重启 MKLink 探针', 'Reboot MKLink probe')"
+            data-testid="reboot-probe"
+            @click="quickRebootProbe"
+          >
+            <LoaderCircle v-if="rebootingProbe" class="spinning" :size="14" aria-hidden="true" />
+            <RefreshCw v-else :size="14" aria-hidden="true" />
+            <span>{{ rebootingProbe ? tr('重启中...', 'Rebooting...') : tr('重启 MKLink', 'Reboot MKLink') }}</span>
           </button>
           <div v-if="connectionError" class="device-quick-error" role="alert">
+            <button
+              class="device-quick-error-close"
+              type="button"
+              :title="tr('关闭错误提示', 'Dismiss error')"
+              :aria-label="tr('关闭错误提示', 'Dismiss error')"
+              data-testid="dismiss-connection-error"
+              @click="clearConnectionError"
+            ><X :size="14" aria-hidden="true" /></button>
             <span>{{ connectionError }}</span>
-            <button type="button" @click="goConnect">{{ tr('打开配置', 'Open Config') }}</button>
+            <button class="device-quick-error-config" type="button" @click="goConnect">{{ tr('打开配置', 'Open Config') }}</button>
           </div>
         </div>
       </div>
@@ -73,7 +93,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { LoaderCircle, RotateCcw, Unplug, Usb } from '@lucide/vue'
+import { LoaderCircle, RefreshCw, RotateCcw, Unplug, Usb, X } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMklinkApi } from '../composables/useMklinkApi'
 import { useResourceStatus } from '../composables/useResourceStatus'
@@ -91,7 +111,7 @@ import { tr } from '../composables/useLanguage'
 
 const route = useRoute()
 const router = useRouter()
-const { deviceStatus, resetDevice } = useMklinkApi()
+const { deviceStatus, resetDevice, rebootProbe } = useMklinkApi()
 const toast = useToast()
 const {
   connecting,
@@ -99,12 +119,14 @@ const {
   connectionError,
   quickConnect,
   quickDisconnect,
+  clearConnectionError,
 } = useDashboardSetup()
 const { refresh: refreshResource, getBridgeOwner } = useResourceStatus()
 const dashboardTabs = new Set(['rtt', 'superwatch', 'memory', 'symbols', 'hardfault', 'serial', 'modbus', 'systemview'])
 const routeTab = Array.isArray(route.query.tab) ? route.query.tab[0] : route.query.tab
 const tab = ref(typeof routeTab === 'string' && dashboardTabs.has(routeTab) ? routeTab : 'rtt')
 const resetting = ref(false)
+const rebootingProbe = ref(false)
 
 const bridgeOwner = computed(() => getBridgeOwner())
 const bridgeOwnerLabel = computed(() => {
@@ -124,11 +146,12 @@ refreshResource()
 setInterval(refreshResource, 3000)
 
 function goConnect() {
+  clearConnectionError()
   router.push({ name: 'config' })
 }
 
 async function quickReset() {
-  if (!deviceStatus.value.connected || resetting.value) return
+  if (!deviceStatus.value.connected || resetting.value || rebootingProbe.value) return
   resetting.value = true
   try {
     await resetDevice()
@@ -139,6 +162,30 @@ async function quickReset() {
     ))
   } finally {
     resetting.value = false
+    await refreshResource()
+  }
+}
+
+async function quickRebootProbe() {
+  if (!deviceStatus.value.connected || resetting.value || rebootingProbe.value) return
+  if (!window.confirm(tr(
+    '重启 MKLink 探针会中断当前调试和数据流，并释放串口连接。确认继续？',
+    'Rebooting the MKLink probe interrupts debugging and data streams and releases the serial connection. Continue?',
+  ))) return
+
+  rebootingProbe.value = true
+  try {
+    await rebootProbe()
+    toast.success(tr(
+      'MKLink 已重启，请等待探针重新枚举后再连接',
+      'MKLink rebooted. Wait for the probe to enumerate before reconnecting.',
+    ))
+  } catch (cause) {
+    toast.error(tr('MKLink 重启失败: ', 'Failed to reboot MKLink: ') + (
+      cause instanceof Error ? cause.message : String(cause)
+    ))
+  } finally {
+    rebootingProbe.value = false
     await refreshResource()
   }
 }
@@ -229,8 +276,7 @@ async function quickReset() {
 }
 .device-quick-action.connected { border-color: var(--border); background: transparent; color: var(--muted); }
 .device-quick-action:disabled { cursor: wait; opacity: 0.65; }
-.mcu-reset-action { width: 30px; justify-content: center; padding: 4px; }
-.mcu-reset-action:disabled { cursor: not-allowed; }
+.reset-action:disabled { cursor: not-allowed; }
 .device-quick-error {
   position: absolute;
   z-index: 20;
@@ -245,8 +291,11 @@ async function quickReset() {
   background: var(--surface);
   color: var(--danger);
   font-size: 12px;
+  padding-right: 30px;
 }
-.device-quick-error button { justify-self: end; border: 0; background: transparent; color: var(--accent); cursor: pointer; }
+.device-quick-error button { border: 0; background: transparent; color: var(--accent); cursor: pointer; }
+.device-quick-error-close { position: absolute; top: 5px; right: 5px; display: inline-flex; padding: 3px; color: var(--muted) !important; }
+.device-quick-error-config { justify-self: end; }
 .spinning { animation: device-spin 0.8s linear infinite; }
 @keyframes device-spin { to { transform: rotate(360deg); } }
 .status-dot {

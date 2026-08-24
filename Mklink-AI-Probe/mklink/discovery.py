@@ -8,7 +8,6 @@ MKLink Serial Bridge — COM 口发现和磁盘管理。
 from __future__ import annotations
 
 import os
-import time
 import serial
 from serial.tools import list_ports
 
@@ -17,11 +16,14 @@ from mklink._types import (
     KNOWN_MKLINK_VID_PIDS,
     MKLINK_IDENTITY_COMMAND,
     MKLINK_IDENTITY_TOKEN,
+    PROMPT,
 )
 
 # MICROKEEN 磁盘名称
 _MICROKEEN_DISK_NAME = "MICROKEEN"
 _FLM_DIR_NAME = "FLM"
+_PROBE_SYNC_TIMEOUT = 0.15
+_PROBE_IDENTITY_TIMEOUT = 0.35
 
 
 def _normalize_flm_name(flm_name: str) -> str:
@@ -41,51 +43,41 @@ def _is_mklink_identity_response(response: bytes) -> bool:
 
 
 def _probe_port(port_device: str) -> bool:
-    """对单个端口执行2步确认探测，返回是否为 MKLink 虚拟串口。
-
-    Step 1: 被动监听 — 打开串口后不发送数据，等待缓冲区中的 "hello microkeen"
-    Step 2: 主动探测 — 发送回车 \\n，检查是否回显 ">>>"
-    """
+    """快速确认端口是否为 MKLink CMD 接口。"""
     ser = None
     try:
-        ser = serial.Serial(port_device, DEFAULT_BAUDRATE, timeout=1)
+        ser = serial.Serial(
+            port_device,
+            DEFAULT_BAUDRATE,
+            timeout=_PROBE_SYNC_TIMEOUT,
+        )
         ser.reset_input_buffer()
         ser.reset_output_buffer()
 
-        # Step 1: 被动监听（不发数据），等待设备主动上报
-        time.sleep(0.8)
-        resp = ser.read(1024)
-        if b"hello microkeen" in resp.lower():
-            ser.close()
+        # 主机接收缓存重置不会清除探针 REPL 中尚未换行的输入。
+        # 先结束残留行，避免身份命令被拼接到半条旧命令后面。
+        ser.write(b"\n")
+        ser.flush()
+        sync_response = ser.read_until(PROMPT.encode("ascii"), 1024)
+        if b"hello microkeen" in sync_response.lower():
             return True
 
-        # Step 2: 主动探测，执行唯一的无副作用命令。只看到通用的
-        # ">>>" 不足以识别 CMD 口，目标板 UART 也可能输出相同文本。
+        # 只看到通用的提示符不足以识别 CMD 口，目标板 UART 也可能
+        # 输出相同文本；必须执行唯一、无副作用的身份命令。
         ser.reset_input_buffer()
+        ser.timeout = _PROBE_IDENTITY_TIMEOUT
         ser.write((MKLINK_IDENTITY_COMMAND + "\n").encode("ascii"))
-        time.sleep(0.5)
-        resp = ser.read(1024)
-        if _is_mklink_identity_response(resp):
-            ser.close()
-            return True
-
-        ser.close()
+        ser.flush()
+        response = ser.read_until(PROMPT.encode("ascii"), 1024)
+        return _is_mklink_identity_response(response)
+    except (serial.SerialException, OSError):
         return False
-
-    except serial.SerialException:
+    finally:
         if ser and ser.is_open:
             try:
                 ser.close()
             except Exception:
                 pass
-        return False
-    except OSError:
-        if ser and ser.is_open:
-            try:
-                ser.close()
-            except Exception:
-                pass
-        return False
 
 
 def find_mklink_cdc_port(
@@ -95,9 +87,8 @@ def find_mklink_cdc_port(
 ) -> str | None:
     """自动扫描并识别 MicroLink 的 USB CDC 虚拟串口。
 
-    优先使用 USB 设备描述符匹配，然后对每个端口执行2步确认探测：
-      Step 1 — 被动监听 "hello microkeen"（设备主动上报）
-      Step 2 — 发送回车后检测 ">>>" 提示符
+    优先使用 USB 设备描述符匹配，然后清理设备端残留输入并执行唯一
+    身份命令；读取在看到 ">>>" 提示符时立即返回。
     逐端口顺序探测，不并发。
     """
     excluded = {str(port).strip().casefold() for port in (exclude_ports or set())}
@@ -133,7 +124,7 @@ def find_mklink_cdc_port(
         if port_info.vid and (port_info.vid, port_info.pid) in KNOWN_MKLINK_VID_PIDS:
             return port_info.device
 
-    # 单轮扫描，每端口2步确认
+    # 单轮扫描，每端口执行残留行清理和身份确认
     # Probe physical USB serial ports first. Bluetooth RFCOMM opens can block
     # for tens of seconds and cannot be an MKLink CDC interface.
     probe_candidates = [

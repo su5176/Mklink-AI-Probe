@@ -67,6 +67,27 @@ def test_browser_session_endpoints_are_enabled_only_for_browser_owned_server():
         ).json() == {"enabled": True, "clients": 0}
 
 
+def test_last_browser_session_release_closes_the_shared_device():
+    app = create_app(
+        auth_token=None, project_root=".", browser_session_timeout=15,
+    )
+    device = SimpleNamespace(connected=True, close=lambda: None)
+    app.state.mklink_state["device"] = device
+    app.state.mklink_state["dispatcher"] = object()
+
+    with patch.object(device, "close") as close, TestClient(app) as client:
+        assert client.post(
+            "/api/browser-session/heartbeat", json={"client_id": "tab"},
+        ).json() == {"enabled": True, "clients": 1}
+        assert client.post(
+            "/api/browser-session/release", json={"client_id": "tab"},
+        ).json() == {"enabled": True, "clients": 0}
+
+    close.assert_called_once_with()
+    assert app.state.mklink_state["device"] is None
+    assert app.state.mklink_state["dispatcher"] is None
+
+
 def test_browser_session_websockets_keep_backend_until_the_last_tab_closes():
     app = create_app(
         auth_token=None, project_root=".", browser_session_timeout=15,
@@ -103,6 +124,35 @@ def test_app_shutdown_closes_the_shared_device_and_clears_resource_leases():
     assert state["device"] is None
     assert state["dispatcher"] is None
     assert state["resource_manager"].get_status() == {}
+
+
+def test_desktop_shutdown_requires_the_owning_instance_and_requests_exit():
+    app = create_app(
+        auth_token=None, project_root=".", desktop_instance_id="instance-a",
+    )
+    requested = []
+    app.state.request_desktop_exit = lambda: requested.append(True)
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/desktop/shutdown", json={"instance_id": "instance-b"},
+        )
+        accepted = client.post(
+            "/api/desktop/shutdown", json={"instance_id": "instance-a"},
+        )
+
+    assert rejected.status_code == 403
+    assert accepted.json() == {"status": "shutting_down"}
+    assert requested == [True]
+
+
+def test_desktop_shutdown_is_hidden_from_non_desktop_servers():
+    app = create_app(auth_token=None, project_root=".")
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/desktop/shutdown", json={"instance_id": "instance-a"},
+        )
+    assert response.status_code == 404
 
 
 def test_project_browser_exposes_native_roots_on_each_desktop_platform():

@@ -79,6 +79,10 @@ export function useDashboardSetup() {
     }
   }
 
+  function clearConnectionError(): void {
+    connectionError.value = ''
+  }
+
   async function parseSelectedSymbols(): Promise<boolean> {
     const path = symbolPath.value.trim()
     if (!isSymbolFilePath(path)) return false
@@ -143,6 +147,7 @@ export function useDashboardSetup() {
     hasSymbolSource: computed(() => isSymbolFilePath(symbolPath.value)),
     quickConnect,
     quickDisconnect,
+    clearConnectionError,
     loadSymbolFile,
     parseSelectedSymbols,
   }

@@ -32,3 +32,18 @@ def test_mcp_stdio_keeps_prints_out_of_jsonrpc_stdout(monkeypatch):
         "[SERIAL] idcode = 0x2BA01477",
     ]
     assert sys.stdout is protocol_stdout
+
+
+def test_mcp_stdio_resets_device_when_transport_exits(monkeypatch):
+    calls = []
+
+    class FakeMcp:
+        def run(self, *, transport):
+            assert transport == "stdio"
+
+    monkeypatch.setattr(mcp_server, "mcp", FakeMcp())
+    monkeypatch.setattr(mcp_server, "_reset_device", lambda: calls.append("reset"))
+
+    mcp_server.run()
+
+    assert calls == ["reset"]

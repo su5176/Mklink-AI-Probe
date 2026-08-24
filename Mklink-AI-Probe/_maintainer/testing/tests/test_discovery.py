@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from mklink import discovery
+from mklink._types import MKLINK_IDENTITY_COMMAND, MKLINK_IDENTITY_TOKEN
 
 
 def port(
@@ -104,6 +105,56 @@ def test_identity_response_rejects_a_generic_target_uart_prompt():
         b">>> print('__mklink_probe_7f3a__')\r\n"
         b"__mklink_probe_7f3a__\r\n>>> "
     )
+
+
+def test_probe_port_terminates_a_partial_repl_line_before_identity(monkeypatch):
+    class ProbeSerial:
+        def __init__(self, *_args, timeout, **_kwargs):
+            self.timeout = timeout
+            self.is_open = True
+            self.writes = []
+            self.responses = [
+                b"SyntaxError: invalid syntax\r\n>>> ",
+                (
+                    MKLINK_IDENTITY_COMMAND.encode("ascii")
+                    + b"\r\n"
+                    + MKLINK_IDENTITY_TOKEN.encode("ascii")
+                    + b"\r\n>>> "
+                ),
+            ]
+
+        def reset_input_buffer(self):
+            pass
+
+        def reset_output_buffer(self):
+            pass
+
+        def write(self, data):
+            self.writes.append(data)
+
+        def flush(self):
+            pass
+
+        def read_until(self, _expected, _size):
+            return self.responses.pop(0)
+
+        def close(self):
+            self.is_open = False
+
+    opened = []
+
+    def open_serial(*args, **kwargs):
+        instance = ProbeSerial(*args, **kwargs)
+        opened.append(instance)
+        return instance
+
+    monkeypatch.setattr(discovery.serial, "Serial", open_serial)
+
+    assert discovery._probe_port("TEST_CMD")
+    assert opened[0].writes == [
+        b"\n",
+        (MKLINK_IDENTITY_COMMAND + "\n").encode("ascii"),
+    ]
 
 
 def test_microkeen_disk_reads_volume_labels_without_console_process(monkeypatch):

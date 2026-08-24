@@ -17,6 +17,13 @@ export interface TargetRecord {
   source: string
 }
 
+export interface TargetMemoryRegion {
+  name: string
+  start: number
+  length: number
+  sector_size: number
+}
+
 export interface PackStatus {
   last_error: string | null
   index_available: boolean
@@ -84,6 +91,20 @@ export interface JobRequest {
   reset_mode?: string
   base_address?: number | null
   sector_addresses?: number[]
+  board?: string | null
+  hpm_flash_cfg?: [string, string, string, string] | null
+}
+
+export interface ReadMemoryRequest {
+  address: string
+  size: number
+  probe_id: string
+  target_part: string
+  preempt_ai?: boolean
+  frequency?: number
+  connect_mode?: string
+  reset_mode?: string
+  chunk_sizes?: number[]
   board?: string | null
   hpm_flash_cfg?: [string, string, string, string] | null
 }

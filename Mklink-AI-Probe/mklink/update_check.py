@@ -16,8 +16,8 @@ from typing import Iterable, Mapping, Sequence
 
 
 DEFAULT_MANIFEST_URLS = (
-    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
     "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/updates/latest.json",
+    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
 )
 USER_AGENT = "Mklink-AI-Probe-Runtime-Updater"
 _CHECK_LOCK = threading.Lock()

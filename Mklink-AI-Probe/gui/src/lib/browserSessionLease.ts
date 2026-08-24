@@ -15,6 +15,24 @@ function createClientId(): string {
     ?? `mklink-${Date.now()}-${Math.random().toString(16).slice(2)}`
 }
 
+function releaseBrowserDevice(clientId: string): void {
+  const body = new Blob([JSON.stringify({ client_id: clientId })], {
+    type: 'application/json',
+  })
+  // The backend releases the shared Device when the last browser session is
+  // released. Keep this as one request so disconnect and session accounting
+  // cannot race two concurrent Device.close() calls during pagehide.
+  if (navigator.sendBeacon?.('/api/browser-session/release', body)) return
+  // sendBeacon can be unavailable (or return false when its queue is full).
+  // keepalive gives Chromium/WebView2 a second reliable page-close path.
+  void fetch('/api/browser-session/release', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true,
+  }).catch(() => undefined)
+}
+
 export function startBrowserSessionLease(enabled = !IS_TAURI): () => void {
   if (!enabled) return () => undefined
 
@@ -40,10 +58,7 @@ export function startBrowserSessionLease(enabled = !IS_TAURI): () => void {
     if (retryTimer !== null) clearTimeout(retryTimer)
     socket?.close(1000, 'browser page closed')
     socket = null
-    navigator.sendBeacon?.(
-      '/api/browser-session/release',
-      new Blob([JSON.stringify({ client_id: clientId })], { type: 'application/json' }),
-    )
+    releaseBrowserDevice(clientId)
   }
 
   window.addEventListener('pagehide', stop)

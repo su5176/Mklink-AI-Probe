@@ -183,3 +183,33 @@ def test_dashboard_preserves_cpu_clock_source_from_start_result():
 
     assert freq == 360_000_000
     assert mgr._cpu_freq_source == "hpm_core_clock"
+
+
+def test_dashboard_runtime_cpu_clock_overrides_project_default_and_init():
+    mgr = SystemViewStreamManager()
+
+    class FakeDevice:
+        _dwarf_info = object()
+
+        @staticmethod
+        def _systemview_defaults():
+            return {
+                "cpu_freq": 816_000_000,
+                "cpu_freq_source": "project_info",
+            }
+
+    mgr._parser = mgr._create_parser(FakeDevice())
+    assert mgr._parser.cpu_freq == 816_000_000
+
+    freq = mgr._apply_cpu_freq_hint(
+        FakeDevice(),
+        {"cpu_freq_hint": 360_000_000, "cpu_freq_source": "hpm_core_clock"},
+    )
+
+    assert freq == 360_000_000
+    assert mgr._parser.cpu_freq == 360_000_000
+    assert mgr._cpu_freq_source == "hpm_core_clock"
+
+    mgr._note_init_cpu_freq([{"kind": "init", "cpu_freq": 816_000_000}])
+    assert mgr._parser.cpu_freq == 360_000_000
+    assert mgr._cpu_freq_source == "hpm_core_clock"

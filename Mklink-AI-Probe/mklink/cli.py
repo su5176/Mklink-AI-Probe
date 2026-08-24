@@ -3577,7 +3577,10 @@ def _cli_gui(args):
     # 2. 创建 FastAPI app（挂载了 Vue 静态文件）
     from mklink.remote.api import create_app, run_server
     browser_session_timeout = args.browser_session_timeout
-    if browser_session_timeout is None and not args.no_browser:
+    # --no-browser only suppresses automatic tab opening. The Vue app still
+    # owns the browser session, so closing the last tab must release the probe
+    # and let this backend exit instead of retaining COM indefinitely.
+    if browser_session_timeout is None:
         browser_session_timeout = 15
     app = create_app(
         project_root=project_root,

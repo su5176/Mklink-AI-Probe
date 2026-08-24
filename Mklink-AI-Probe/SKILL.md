@@ -95,7 +95,7 @@ description: |
 - **符号/AXF 默认使用内置 pyelftools**：`load_symbols`/`read_variable`/`write_variable`/`memory_map`/函数断点/`decode_hardfault` 源码行不依赖用户电脑的编译工具链。AI **默认使用内置 pyelftools**，不得因 `readelf_available:false` 阻止 AXF 操作。**仅在用户明确指定** `elf_backend=external` 时，才调用本机 `readelf`/`addr2line`；仅设置工具路径不会自动启用 external。内置解析遇到不支持的文件时先报告原因，取得用户同意后才能切换外部兼容后端。
 - **未知 MCU 禁止直接改 `custom` 兜底**：烧录前若项目 MCU 不在 `mcu_profiles.json`，先调用 MCP `detect_mcu_profile` 或 CLI `python -m mklink mcu-detect`。多内部 FLM 候选时把候选报给用户选择，再用 `flm`/`--flm` 固化；找不到本地 FLM/Pack 时停止并提示安装或解包 Keil/Arm Pack。HPMicro 是明确例外，见下一条。
 - **HPMicro 禁止寻找或加载 FLM**：`HPM*` 型号使用探针设备端 HPM ROM API。MCP `flash` 传 `.bin`、精确 `target_part`、`base_address`，并传 `board`（推荐）或四字 `hpm_flash_cfg`；返回 `algorithm_source: "hpm-rom-api"`。在线、脱机和 CLI 都不得为 HPM 下载 Pack 或调用 `load.flm`。
-- **VCC 输出属于硬件激励**：`set_power_on` 只允许 1800/3300/5000 mV。每次 5000 mV 调用前必须让用户明确确认当前原理图、供电路径和负载可承受 5 V，并传 `confirm_5v=True`；不得根据历史确认或默认值自动输出 5 V。3.3 V 系统误接 5 V 可能永久损坏硬件。
+- **VCC 输出属于硬件激励**：`set_power_on` 只允许 1800/3300/5000 mV。每次调用都必须先让用户明确确认本次要输出的具体电压，并传 `confirm_user=True`；不得复用历史确认或由 AI 推断同意。5000 mV 还必须让用户确认当前原理图、供电路径和负载可承受 5 V，并额外传 `confirm_5v=True`。3.3 V 系统误接 5 V 可能永久损坏硬件。
 - **区分两类复位**：`reset` 只复位目标 MCU；`reboot_probe` 重启 MKLink 探针本身，会断开当前会话并释放串口/HIL 锁，调用后需等待 USB 重新枚举再连接。
 
 ## MCP tool 速查（55 tools，按能力域）
@@ -105,7 +105,7 @@ description: |
 | 健康 | `ping` | 无需连接，首调确认 server 活着 |
 | 项目配置 | `detect_mcu_profile` | 新 MCU 发现、FLM 候选选择、profile 固化 |
 | 连接 | `discover_probes` · `connect` · `disconnect` · `device_status` | connect 传 `axf=` 才能读变量 |
-| Flash / 探针控制 | `flash` · `erase_chip` · `erase_sector` · `reset` · `set_power_on` · `reboot_probe` | `reset` 复位目标；5 V 必须逐次确认；`reboot_probe` 会断连 |
+| Flash / 探针控制 | `flash` · `erase_chip` · `erase_sector` · `reset` · `set_power_on` · `reboot_probe` | `reset` 复位目标；VCC 任意电压均须逐次确认，5 V 另须耐压确认；`reboot_probe` 会断连 |
 | 内存 | `read_memory` · `write_memory` · `flush_memory` | flush_memory **自动分块**（CLI 不分块会 FAIL） |
 | 变量/寄存器 | `read_variable` · `write_variable` · `read_register` | 需先 connect(axf=) 或 load_symbols |
 | 调试 | `halt` · `resume` · `step` · `set_breakpoint` · `clear_breakpoint` · `clear_all_breakpoints` · `read_core_registers` | FPB 硬件断点 |

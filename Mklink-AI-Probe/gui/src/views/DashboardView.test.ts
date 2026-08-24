@@ -1,5 +1,5 @@
 import { flushPromises, shallowMount } from '@vue/test-utils'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { readFileSync } from 'node:fs'
 import DashboardView from './DashboardView.vue'
 import { setLanguage } from '../composables/useLanguage'
@@ -22,7 +22,9 @@ const apiMock = vi.hoisted(() => ({
   connectDevice: vi.fn(),
   disconnectDevice: vi.fn(),
   resetDevice: vi.fn(),
+  rebootProbe: vi.fn(),
 }))
+const confirmMock = vi.hoisted(() => vi.fn())
 const toastMock = vi.hoisted(() => ({
   success: vi.fn(),
   error: vi.fn(),
@@ -43,6 +45,7 @@ vi.mock('../composables/useMklinkApi', () => ({
     parseAxf: vi.fn(),
     flashDevice: vi.fn(),
     resetDevice: apiMock.resetDevice,
+    rebootProbe: apiMock.rebootProbe,
     eraseDevice: vi.fn(),
     haltDevice: vi.fn(),
     resumeDevice: vi.fn(),
@@ -63,12 +66,18 @@ vi.mock('../composables/useResourceStatus', () => ({
 const dashStub = { template: '<div />', props: ['deviceConnected'] }
 
 describe('DashboardView layout classes', () => {
+  beforeEach(() => {
+    confirmMock.mockReturnValue(true)
+    vi.stubGlobal('confirm', confirmMock)
+  })
+
   afterEach(() => {
     routerMock.query = {}
     apiMock.deviceStatus.value.connected = true
     apiMock.deviceStatus.value.mcu = 'STM32F103RC'
     apiMock.deviceStatus.value.axf = { loaded: true }
     vi.clearAllMocks()
+    vi.unstubAllGlobals()
     setLanguage('zh')
   })
 
@@ -104,6 +113,38 @@ describe('DashboardView layout classes', () => {
     expect(apiMock.connectDevice).toHaveBeenCalledWith(expect.objectContaining({ restore_last: true }))
   })
 
+  it('dismisses the current connection error and shows a later failure again', async () => {
+    apiMock.deviceStatus.value.connected = false
+    apiMock.connectDevice
+      .mockRejectedValueOnce(new Error('first failure'))
+      .mockRejectedValueOnce(new Error('second failure'))
+    const wrapper = shallowMount(DashboardView, {
+      global: {
+        stubs: {
+          RttViewTab: dashStub,
+          HardFaultTab: dashStub,
+          SymbolsTab: dashStub,
+          MemoryTab: dashStub,
+          SuperWatchTab: dashStub,
+          SerialMonitorTab: dashStub,
+          ModbusTab: dashStub,
+          SystemViewTab: dashStub,
+        },
+      },
+    })
+
+    await wrapper.get('[data-testid="device-quick-action"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.device-quick-error').text()).toContain('first failure')
+
+    await wrapper.get('[data-testid="dismiss-connection-error"]').trigger('click')
+    expect(wrapper.find('.device-quick-error').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="device-quick-action"]').trigger('click')
+    await flushPromises()
+    expect(wrapper.get('.device-quick-error').text()).toContain('second failure')
+  })
+
   it('resets the connected MCU from the dashboard header', async () => {
     apiMock.resetDevice.mockResolvedValueOnce({ status: 'ok' })
     const wrapper = shallowMount(DashboardView, {
@@ -122,6 +163,8 @@ describe('DashboardView layout classes', () => {
     })
 
     const reset = wrapper.get('[data-testid="mcu-reset-action"]')
+    expect(reset.text()).toContain('重启 MCU')
+    expect(wrapper.get('[data-testid="reboot-probe"]').text()).toContain('重启 MKLink')
     expect(reset.attributes('disabled')).toBeUndefined()
     await reset.trigger('click')
     await flushPromises()
@@ -145,6 +188,38 @@ describe('DashboardView layout classes', () => {
       },
     })
     expect(disconnected.get('[data-testid="mcu-reset-action"]').attributes('disabled')).toBeDefined()
+    expect(disconnected.get('[data-testid="reboot-probe"]').attributes('disabled')).toBeDefined()
+  })
+
+  it('confirms MKLink reboot and reports reconnect guidance', async () => {
+    apiMock.rebootProbe.mockResolvedValueOnce({ status: 'rebooted', connected: false })
+    const wrapper = shallowMount(DashboardView, {
+      global: {
+        stubs: {
+          RttViewTab: dashStub,
+          HardFaultTab: dashStub,
+          SymbolsTab: dashStub,
+          MemoryTab: dashStub,
+          SuperWatchTab: dashStub,
+          SerialMonitorTab: dashStub,
+          ModbusTab: dashStub,
+          SystemViewTab: dashStub,
+        },
+      },
+    })
+
+    confirmMock.mockReturnValueOnce(false)
+    await wrapper.get('[data-testid="reboot-probe"]').trigger('click')
+    await flushPromises()
+    expect(apiMock.rebootProbe).not.toHaveBeenCalled()
+
+    confirmMock.mockReturnValueOnce(true)
+    await wrapper.get('[data-testid="reboot-probe"]').trigger('click')
+    await flushPromises()
+    expect(confirmMock).toHaveBeenCalledTimes(2)
+    expect(apiMock.rebootProbe).toHaveBeenCalledOnce()
+    expect(toastMock.success).toHaveBeenCalledWith(expect.stringContaining('MKLink 已重启'))
+    expect(toastMock.success).toHaveBeenCalledWith(expect.stringContaining('重新枚举后再连接'))
   })
 
   it('reports MCU reset failures', async () => {

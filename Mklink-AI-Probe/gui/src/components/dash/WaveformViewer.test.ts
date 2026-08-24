@@ -194,6 +194,7 @@ window.__rttTestProbe = {
     count: rawLogStoredCount, total: rawLogLineCount, lines: rawLogSnapshot()
   }; },
   saveRawLog: saveRawLog,
+  exportCSV: exportCSV,
   syncStatus: syncDashboardStatus,
   collectionState: function() { return {
     state: collectionState, paused: paused, renderPaused: renderPaused
@@ -209,6 +210,7 @@ window.__rttTestProbe = {
   panelYRange: function(panel) { return getPanelYRange(panel); },
   setSplitChannel: setSplitChannel,
   clearSplitChannel: clearSplitChannel,
+  setArraySnapshot: setArraySnapshot,
   setBufferCapacity: setBufferCapacity,
   serializeState: serializeState,
   deserializeState: deserializeState,
@@ -330,6 +332,31 @@ describe('WaveformViewer VOFA binary transport', () => {
       'controller.target': 20,
     }])
     wrapper.unmount()
+  })
+
+  it('treats an array snapshot as a normal SuperWatch channel', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch')
+    try {
+      runtime.viewer.configureBinaryChannels([{ name: 'gain' }])
+      runtime.viewer.acceptBinaryBatch({
+        sequence: 1n, timestampNs: 1_000_000_000n, itemCount: 2, channelCount: 1,
+        layout: 'sample-major-float32', values: Float32Array.of(2, 3).buffer,
+        times: Float64Array.of(1, 2).buffer,
+      })
+      expect(runtime.probe.setArraySnapshot({
+        name: 'samples', type_name: 'uint16_t', element_size: 2,
+        start_index: 4, count: 3, sequence: 8, values: [1, 5, 2],
+      })).toBe(true)
+      expect(runtime.probe.fields().samples.isArraySnapshot).toBe(true)
+      expect(runtime.probe.fields().samples.arrayValues).toEqual([1, 5, 2])
+      expect(runtime.probe.setSplitChannel('samples')).toBe(true)
+      expect(runtime.probe.splitChannel()).toBe('samples')
+      runtime.probe.clearSplitChannel()
+      runtime.probe.setArraySnapshot(null)
+      expect(runtime.probe.fields().samples).toBeUndefined()
+    } finally {
+      runtime.cleanup()
+    }
   })
 
   it('stops SuperWatch transport without clearing the retained viewer state', async () => {
@@ -1038,6 +1065,12 @@ describe('VOFA viewer hot path source guard', () => {
     expect(viewerCss).not.toMatch(/(^|\n)\s*footer\s*\{/)
   })
 
+  it('keeps waveform header styles scoped to the viewer', () => {
+    expect(viewerCss).not.toMatch(/(^|\n)\s*header(?:\s+h1)?\s*\{/)
+    expect(viewerCss).toContain('.waveform-viewer header {')
+    expect(viewerCss).toContain('.waveform-viewer header h1 {')
+  })
+
   it('keeps desktop SuperWatch live status and controls in stable rows', () => {
     expect(componentSource).toContain('<div class="header-status">')
     expect(viewerCss).toContain('.waveform-viewer.superwatch-desktop header')
@@ -1050,6 +1083,14 @@ describe('VOFA viewer hot path source guard', () => {
       '    width: 104px;\n    overflow: hidden;',
     )
     expect(viewerCss).toContain('flex-wrap: nowrap')
+    expect(viewerCss).toContain(
+      '.waveform-viewer.superwatch-desktop #control-toolbar > *,\n' +
+      '  .waveform-viewer.superwatch-desktop #trigger-toolbar > * {\n' +
+      '    flex: 0 0 auto;\n' +
+      '    white-space: nowrap;',
+    )
+    expect(viewerCss).toContain('#interval-group > * { flex: 0 0 auto; }')
+    expect(viewerCss).toContain('#trigger-enable-btn,\n#trigger-force-btn {\n  flex: 0 0 auto;')
     expect(viewerCss).toContain('flex: 1 1 140px')
     expect(viewerCss).toContain('text-overflow: ellipsis')
   })
@@ -2218,6 +2259,34 @@ describe('VOFA viewer hot path source guard', () => {
     } finally {
       click.mockRestore()
       vi.unstubAllGlobals()
+      runtime.cleanup()
+    }
+  })
+
+  it('routes SuperWatch CSV and raw-log exports through the desktop save bridge', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch')
+    const nativeSave = vi.fn().mockResolvedValue(true)
+    ;(window as any).__MKLINK_SAVE_FILE__ = nativeSave
+    try {
+      runtime.viewer.configureBinaryChannels([{ name: 'gain' }])
+      runtime.probe.setRawLogOpen(true)
+      runtime.viewer.acceptBinaryBatch({
+        sequence: 1n, timestampNs: 1_000_000_000n,
+        itemCount: 2, channelCount: 1, layout: 'sample-major-float32',
+        values: Float32Array.of(1, 1.25).buffer,
+        times: Float64Array.of(1_000, 2_000).buffer,
+      })
+
+      runtime.probe.saveRawLog()
+      runtime.probe.exportCSV()
+      await Promise.resolve()
+
+      expect(nativeSave).toHaveBeenCalledTimes(2)
+      expect(nativeSave.mock.calls[0][0]).toMatch(/^superwatch-raw-\d{8}-\d{6}\.txt$/)
+      expect(nativeSave.mock.calls[0][1]).toContain('gain=1.25')
+      expect(nativeSave.mock.calls[1][0]).toBe('jscope_export.csv')
+      expect(nativeSave.mock.calls[1][1]).toContain('timestamp,gain')
+    } finally {
       runtime.cleanup()
     }
   })

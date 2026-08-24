@@ -39,9 +39,13 @@
               target="_blank"
               rel="noopener noreferrer"
             >{{ tr('官方智沐店铺', 'Official Zhi Mu Store') }}</a>
-            <button class="store-menu-item store-menu-pending" data-testid="xianji-store-link" type="button" disabled>
-              {{ tr('先楫定制店铺（链接待添加）', 'Xianji Custom Store (link pending)') }}
-            </button>
+            <a
+              class="store-menu-item"
+              data-testid="xianji-store-link"
+              href="https://item.taobao.com/item.htm?ft=t&id=1074695414484"
+              target="_blank"
+              rel="noopener noreferrer"
+            >{{ tr('先楫定制店铺', 'Xianji Custom Store') }}</a>
           </div>
         </details>
       </nav>

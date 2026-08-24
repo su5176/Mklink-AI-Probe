@@ -11,6 +11,7 @@ import pytest
 
 from mklink.cmsis_dap.backend import HpmRomBackend, PyOcdBackend, RoutingFlashBackend
 from mklink.cmsis_dap.backend import (
+    _expand_pack_flm_regions,
     _install_custom_flm_regions,
     _relocate_pack_flm_regions,
 )
@@ -98,6 +99,64 @@ def assert_error(code: FlashErrorCode, call) -> FlashError:
         call()
     assert raised.value.code is code
     return raised.value
+
+
+def test_hpm_rom_backend_reads_via_dump_memory(monkeypatch) -> None:
+    class Device:
+        _bridge = object()
+
+        def close(self):
+            pass
+
+    device = Device()
+    backend = HpmRomBackend(device_factory=lambda **_kwargs: device)
+    backend.connect(
+        probe="probe",
+        target="HPM5300",
+        frequency=1_000_000,
+        board="hpm5300evk",
+    )
+    calls = []
+
+    def read_range(bridge, address, size, *, timeout):
+        calls.append((bridge, address, size, timeout))
+        return bytes((address + index) & 0xFF for index in range(size))
+
+    monkeypatch.setattr("mklink.dump_memory.read_dump_memory_range_once", read_range)
+    assert backend.read_memory(0x80000000, 0x8001) == bytes(
+        (0x80000000 + index) & 0xFF for index in range(0x8001)
+    )
+    assert [item[1:3] for item in calls] == [
+        (0x80000000, 0x1000),
+        (0x80001000, 0x1000),
+        (0x80002000, 0x1000),
+        (0x80003000, 0x1000),
+        (0x80004000, 0x1000),
+        (0x80005000, 0x1000),
+        (0x80006000, 0x1000),
+        (0x80007000, 0x1000),
+        (0x80008000, 1),
+    ]
+    assert backend.memory_regions()[0].start == 0x80000000
+    backend.disconnect()
+
+
+def test_pyocd_backend_reads_exact_bytes_from_target() -> None:
+    class Target(FakeTarget):
+        def __init__(self):
+            super().__init__((FakeRegion(0x08000000, 0x100),))
+
+        def read_memory_block8(self, address, size):
+            return bytes((address + offset) & 0xFF for offset in range(size))
+
+    session = FakeSession(Target())
+    backend = PyOcdBackend(
+        session_factory=lambda _probe, _options: session,
+        probe_provider=lambda: [FakeProbe("probe")],
+    )
+    backend.connect(probe="probe", target="STM32F103C8", frequency=1_000_000)
+    assert backend.read_memory(0x08000010, 4) == bytes([0x10, 0x11, 0x12, 0x13])
+    backend.disconnect()
 
 
 def test_hpm_rom_backend_programs_without_flm_and_verifies_by_readback(
@@ -195,6 +254,42 @@ def test_hpm_rom_backend_rejects_hex_and_reports_verify_mismatch(tmp_path: Path)
         FlashErrorCode.FILE_FORMAT_ERROR,
         lambda: backend.program(ImageInspection("hex", file_path=str(firmware), format="hex")),
     )
+
+
+def test_hpm_rom_backend_verify_reports_progress(tmp_path: Path) -> None:
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"abcdefgh")
+    reported = []
+
+    class Device:
+        def read_memory(self, address, size):
+            return firmware.read_bytes()[address - 0x80000400 : address - 0x80000400 + size]
+
+        def close(self):
+            pass
+
+    backend = HpmRomBackend(
+        device_factory=lambda **_kwargs: Device(),
+        port_resolver=lambda _probe: "probe-port",
+        verify_chunk_size=4,
+    )
+    backend.connect("probe", "HPM5300", 1_000_000, board="hpm5300evk")
+    backend.verify(
+        ImageInspection(
+            "image",
+            file_path=str(firmware),
+            format="bin",
+            size=8,
+            start=0x80000400,
+            end=0x80000408,
+            segments=(ImageSegment(0x80000400, 0x80000408),),
+            base_address=0x80000400,
+        ),
+        progress_callback=reported.append,
+    )
+
+    assert reported == [0.0, 0.5, 1.0]
+    backend.disconnect()
 
 
 def test_routing_backend_selects_hpm_rom_only_for_hpm_targets() -> None:
@@ -657,6 +752,53 @@ def test_pack_flm_relocation_rejects_out_of_bounds_relative_algorithm() -> None:
     assert algorithm.flash_start == 0x80000
 
 
+def test_pack_flm_expansion_requires_an_algorithm_covering_the_requested_range() -> None:
+    from pyocd.core.memory_map import FlashRegion, MemoryMap
+
+    algorithm = type("Algorithm", (), {
+        "flash_start": 0x08000000,
+        "flash_size": 0x80000,
+    })()
+    original = FlashRegion(
+        name="IROM1",
+        start=0x08000000,
+        length=0x40000,
+        flm=algorithm,
+    )
+    target = type("Target", (), {"memory_map": MemoryMap(original)})()
+
+    _expand_pack_flm_regions(target, ((0x08000000, 0x80000),))
+
+    expanded = target.memory_map.get_region_for_address(0x0807FFFF)
+    assert expanded is not None
+    assert expanded.length == 0x80000
+    assert expanded.flm is algorithm
+    assert original.length == 0x40000
+
+    with pytest.raises(FlashError) as raised:
+        _expand_pack_flm_regions(target, ((0x08000000, 0x100000),))
+    assert raised.value.code is FlashErrorCode.TARGET_NOT_SUPPORTED
+
+
+def test_pack_flm_expansion_accepts_an_existing_runtime_flash_range() -> None:
+    from pyocd.core.memory_map import FlashRegion, MemoryMap
+
+    region = FlashRegion(
+        name="flash",
+        start=0x08000000,
+        length=0x80000,
+        algo={"pc_program_page": 0x20000100},
+        blocksize=0x800,
+    )
+    target = type("Target", (), {"memory_map": MemoryMap(region)})()
+
+    _expand_pack_flm_regions(target, ((0x08000000, 0x80000),))
+
+    accepted = target.memory_map.get_region_for_address(0x0807FFFF)
+    assert accepted is not None
+    assert accepted.length == 0x80000
+
+
 def test_pack_connect_relocates_flm_before_create_flash(tmp_path: Path) -> None:
     from pyocd.core.memory_map import FlashRegion, MemoryMap
 
@@ -976,6 +1118,34 @@ def test_program_bin_passes_base_and_hex_does_not(tmp_path: Path) -> None:
         ("create", session),
         ("program", str(ihex), {}),
     ]
+    backend.disconnect()
+
+
+def test_program_forwards_pyocd_progress_callback(tmp_path: Path) -> None:
+    reported = []
+
+    class Programmer:
+        def __init__(self, _session, *, progress):
+            progress(0.5)
+
+        def program(self, _path, **_kwargs):
+            pass
+
+    binary = tmp_path / "firmware.bin"
+    binary.write_bytes(b"bin")
+    backend, _session = connected_backend(programmer_factory=Programmer)
+
+    backend.program(
+        ImageInspection(
+            "bin",
+            file_path=str(binary),
+            format="bin",
+            base_address=0x80000000,
+        ),
+        progress_callback=reported.append,
+    )
+
+    assert reported == [0.5]
     backend.disconnect()
 
 

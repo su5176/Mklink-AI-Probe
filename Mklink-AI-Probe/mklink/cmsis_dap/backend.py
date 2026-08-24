@@ -68,9 +68,62 @@ def _relocate_pack_flm_regions(target: Any) -> None:
         region.flm = relocated
 
 
+def _expand_pack_flm_regions(
+    target: Any,
+    requested_regions: Tuple[Tuple[int, int], ...],
+) -> None:
+    if not requested_regions:
+        return
+    target.memory_map = target.memory_map.clone()
+    for start, size in requested_regions:
+        same_start = [
+            region
+            for region in target.memory_map
+            if bool(getattr(region, "is_flash", False)) and int(region.start) == start
+        ]
+        if len(same_start) == 1 and size <= int(same_start[0].length):
+            continue
+        matches = []
+        for region in same_start:
+            algorithm = getattr(region, "flm", None)
+            algorithm_start = getattr(algorithm, "flash_start", None)
+            algorithm_size = getattr(algorithm, "flash_size", None)
+            if (
+                isinstance(algorithm_start, int)
+                and not isinstance(algorithm_start, bool)
+                and isinstance(algorithm_size, int)
+                and not isinstance(algorithm_size, bool)
+                and algorithm_start <= start
+                and start + size <= algorithm_start + algorithm_size
+            ):
+                matches.append(region)
+        if len(matches) != 1:
+            raise FlashError(
+                FlashErrorCode.TARGET_NOT_SUPPORTED,
+                "requested Flash range is not backed by one Pack algorithm",
+            )
+        region = matches[0]
+        expanded = region.clone_with_changes(length=size)
+        target.memory_map.remove_region(region)
+        target.memory_map.add_region(expanded)
+
+
+def _prepare_pack_flm_regions(
+    target: Any,
+    requested_regions: Tuple[Tuple[int, int], ...],
+) -> None:
+    _relocate_pack_flm_regions(target)
+    _expand_pack_flm_regions(target, requested_regions)
+
+
 class _PackFlmDelegate:
-    def __init__(self, next_delegate: Any = None) -> None:
+    def __init__(
+        self,
+        next_delegate: Any = None,
+        expanded_regions: Tuple[Tuple[int, int], ...] = (),
+    ) -> None:
         self._next_delegate = next_delegate
+        self._expanded_regions = expanded_regions
 
     def will_init_target(self, target: Any, init_sequence: Any) -> None:
         callback = getattr(self._next_delegate, "will_init_target", None)
@@ -80,7 +133,7 @@ class _PackFlmDelegate:
             "create_flash",
             (
                 "mklink_pack_flm_relocation",
-                lambda: _relocate_pack_flm_regions(target),
+                lambda: _prepare_pack_flm_regions(target, self._expanded_regions),
             ),
         )
 
@@ -220,6 +273,12 @@ def _enable_custom_flm_verify(algorithm: Any) -> None:
 class HpmRomBackend:
     """Program HPMicro XPI Flash through the MKLink device-side ROM API."""
 
+    # The HPM ROM flash call performs erase and program as one operation. The
+    # job manager uses this marker to keep the erase stage pending until the
+    # programming stage starts.
+    erase_deferred = True
+    READ_CHUNK_SIZE = 4 * 1024
+
     def __init__(
         self,
         device_factory: Optional[Callable[..., Any]] = None,
@@ -248,6 +307,7 @@ class HpmRomBackend:
         custom_flm_paths: Tuple[str, ...] = (),
         custom_flm_digests: Tuple[str, ...] = (),
         custom_flm_regions: Tuple[Tuple[int, int], ...] = (),
+        pack_flm_regions: Tuple[Tuple[int, int], ...] = (),
         custom_flm_ram_start: Optional[int] = None,
         custom_flm_ram_size: Optional[int] = None,
         connect_mode: str = "halt",
@@ -260,6 +320,7 @@ class HpmRomBackend:
             custom_flm_paths,
             custom_flm_digests,
             custom_flm_regions,
+            pack_flm_regions,
             custom_flm_ram_start,
             custom_flm_ram_size,
             connect_mode,
@@ -322,20 +383,31 @@ class HpmRomBackend:
         del addresses
         self._require_device()
 
-    def program(self, image: ImageInspection) -> None:
+    def program(
+        self,
+        image: ImageInspection,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> None:
         with self._lock:
             device = self._require_device()
             path, base = self._validated_bin(image)
             try:
+                flash_options = {
+                    "target_part": self._target,
+                    "base_address": base,
+                    "board": self._board,
+                    "hpm_flash_cfg": self._flash_cfg,
+                    "swd_clock": self._frequency,
+                    "verify": False,
+                    "reset_after": False,
+                }
+                if progress_callback is not None:
+                    flash_options["progress_callback"] = (
+                        lambda percent: progress_callback(float(percent) / 100.0)
+                    )
                 result = device.flash(
                     str(path),
-                    target_part=self._target,
-                    base_address=base,
-                    board=self._board,
-                    hpm_flash_cfg=self._flash_cfg,
-                    swd_clock=self._frequency,
-                    verify=False,
-                    reset_after=False,
+                    **flash_options,
                 )
                 if not isinstance(result, Mapping) or result.get("success") is not True:
                     raise FlashError(FlashErrorCode.PROGRAM_FAIL, "HPM ROM programming failed")
@@ -344,13 +416,20 @@ class HpmRomBackend:
             except Exception as error:
                 raise FlashError(FlashErrorCode.PROGRAM_FAIL, str(error)) from error
 
-    def verify(self, image: ImageInspection) -> None:
+    def verify(
+        self,
+        image: ImageInspection,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> None:
         with self._lock:
             device = self._require_device()
             path, base = self._validated_bin(image)
             try:
                 with path.open("rb") as stream:
                     offset = 0
+                    total = path.stat().st_size
+                    if progress_callback is not None:
+                        progress_callback(0.0)
                     while True:
                         expected = stream.read(self._verify_chunk_size)
                         if not expected:
@@ -367,12 +446,70 @@ class HpmRomBackend:
                                 {"address": base + offset + mismatch},
                             )
                         offset += len(expected)
+                        if progress_callback is not None:
+                            progress_callback(offset / total if total else 1.0)
             except FlashError:
                 raise
             except FileNotFoundError:
                 raise FlashError(FlashErrorCode.FILE_NOT_FOUND, "firmware snapshot file was not found") from None
             except Exception as error:
                 raise FlashError(FlashErrorCode.VERIFY_FAIL, str(error)) from error
+
+    def read_memory(self, address: int, size: int) -> bytes:
+        if type(address) is not int or address < 0:
+            raise ValueError("address must be a non-negative integer")
+        if type(size) is not int or size <= 0:
+            raise ValueError("size must be a positive integer")
+        self._require_device()
+        region = MemoryRegion("hpm-xpi", 0x80000000, 0x10000000, True, True, None)
+        if address < region.start or address + size > region.end:
+            raise FlashError(
+                FlashErrorCode.IMAGE_OUT_OF_RANGE,
+                "requested HPM Flash range is outside the XPI memory map",
+            )
+        bridge = getattr(self._device, "_bridge", None)
+        if bridge is None:
+            raise FlashError(
+                FlashErrorCode.CONNECT_FAIL,
+                "HPM device bridge is unavailable",
+            )
+        from mklink.dump_memory import (
+            DumpMemoryUnsupported,
+            read_dump_memory_range_once,
+        )
+
+        try:
+            # HPM XPI Flash is organized in 4 KiB sectors. Keep host requests
+            # sector-sized while the dump protocol handles its 2 KiB frames.
+            parts = []
+            for offset in range(0, size, self.READ_CHUNK_SIZE):
+                part_size = min(self.READ_CHUNK_SIZE, size - offset)
+                parts.append(
+                    read_dump_memory_range_once(
+                        bridge, address + offset, part_size, timeout=10.0,
+                    )
+                )
+            return b"".join(parts)
+        except DumpMemoryUnsupported:
+            # Older probe firmware may expose only the text API.  It is slower,
+            # but preserves compatibility for small or diagnostic reads.
+            from mklink.memory_access import parse_read_ram_response
+
+            raw = bridge.send_command(
+                f"cmd.read_flash(0x{address:08X}, {size})",
+                timeout=max(10.0, size / 1200.0),
+            )
+            data = parse_read_ram_response(raw)
+            if len(data) != size:
+                raise FlashError(
+                    FlashErrorCode.CONNECT_FAIL,
+                    f"HPM read_flash returned {len(data)} bytes for {size}",
+                )
+            return data
+
+    def memory_regions(self) -> Tuple[MemoryRegion, ...]:
+        self._require_device()
+        return (MemoryRegion("hpm-xpi", 0x80000000, 0x10000000, True, True, None),)
 
     def reset_run(self, reset_mode: Optional[str] = None) -> None:
         del reset_mode
@@ -467,6 +604,7 @@ class PyOcdBackend:
         custom_flm_paths: Tuple[str, ...] = (),
         custom_flm_digests: Tuple[str, ...] = (),
         custom_flm_regions: Tuple[Tuple[int, int], ...] = (),
+        pack_flm_regions: Tuple[Tuple[int, int], ...] = (),
         custom_flm_ram_start: Optional[int] = None,
         custom_flm_ram_size: Optional[int] = None,
         connect_mode: str = "halt",
@@ -521,6 +659,28 @@ class PyOcdBackend:
                         "custom FLM region metadata is invalid",
                     )
                 resolved_regions.append((start, size))
+            resolved_pack_regions = []
+            for raw_region in pack_flm_regions:
+                if not isinstance(raw_region, tuple) or len(raw_region) != 2:
+                    raise FlashError(
+                        FlashErrorCode.PACK_INTEGRITY_ERROR,
+                        "Pack FLM region metadata is invalid",
+                    )
+                start, size = raw_region
+                if (
+                    not isinstance(start, int)
+                    or isinstance(start, bool)
+                    or start < 0
+                    or not isinstance(size, int)
+                    or isinstance(size, bool)
+                    or size <= 0
+                    or start + size > 0x1_0000_0000
+                ):
+                    raise FlashError(
+                        FlashErrorCode.PACK_INTEGRITY_ERROR,
+                        "Pack FLM region metadata is invalid",
+                    )
+                resolved_pack_regions.append((start, size))
             resolved_flms = []
             for value, expected_digest in zip(custom_flm_paths, custom_flm_digests):
                 flm_path = Path(value).expanduser()
@@ -600,7 +760,7 @@ class PyOcdBackend:
                 session = factory(resolved_probe, options)
                 delegate = getattr(session, "delegate", None)
                 if resolved_pack is not None:
-                    delegate = _PackFlmDelegate(delegate)
+                    delegate = _PackFlmDelegate(delegate, tuple(resolved_pack_regions))
                 if resolved_flms:
                     delegate = _CustomFlmDelegate(
                         tuple(resolved_flms),
@@ -661,7 +821,11 @@ class PyOcdBackend:
             except Exception as exc:
                 raise self._mapped_error(exc, FlashErrorCode.ERASE_FAIL) from None
 
-    def program(self, image: ImageInspection) -> None:
+    def program(
+        self,
+        image: ImageInspection,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> None:
         with self._lock:
             session = self._require_session()
             try:
@@ -682,14 +846,12 @@ class PyOcdBackend:
                     else image.start
                 )
                 region = self._flash_region_for_address(session.target, image_start)
+                programmer_options: dict[str, Any] = {}
+                if progress_callback is not None:
+                    programmer_options["progress"] = progress_callback
                 if str(getattr(region, "name", "")).startswith("mklink_custom_flm_"):
-                    programmer = factory(
-                        session,
-                        smart_flash=False,
-                        keep_unwritten=False,
-                    )
-                else:
-                    programmer = factory(session)
+                    programmer_options.update(smart_flash=False, keep_unwritten=False)
+                programmer = factory(session, **programmer_options)
                 kwargs = {}
                 if image.format.lower() == "bin":
                     kwargs["base_address"] = image.base_address
@@ -707,12 +869,23 @@ class PyOcdBackend:
                 self._close_after_failure()
                 raise self._mapped_error(exc, FlashErrorCode.PROGRAM_FAIL) from None
 
-    def verify(self, image: ImageInspection) -> None:
+    def verify(
+        self,
+        image: ImageInspection,
+        progress_callback: Optional[Callable[[float], None]] = None,
+    ) -> None:
         with self._lock:
             session = self._require_session()
             try:
+                verified = 0
+                total = image.size if isinstance(image.size, int) and image.size > 0 else 0
+                if progress_callback is not None:
+                    progress_callback(0.0)
                 for address, expected in self._iter_image_chunks(image):
                     self._verify_expected_bytes(session.target, address, expected)
+                    verified += len(expected)
+                    if progress_callback is not None:
+                        progress_callback(verified / total if total else 1.0)
             except FlashError:
                 raise
             except FileNotFoundError:
@@ -908,6 +1081,33 @@ class PyOcdBackend:
                     FlashErrorCode.TARGET_NOT_SUPPORTED,
                     "target memory map is unavailable",
                 ) from None
+
+    def read_memory(self, address: int, size: int) -> bytes:
+        """Read an exact target-memory range while the pyOCD session is open."""
+        if type(address) is not int or address < 0:
+            raise ValueError("address must be a non-negative integer")
+        if type(size) is not int or size <= 0:
+            raise ValueError("size must be a positive integer")
+        with self._lock:
+            session = self._require_session()
+            try:
+                data = self._read_target_bytes(session.target, address, size)
+            except Exception as exc:
+                if self._is_locked_error(exc):
+                    raise FlashError(
+                        FlashErrorCode.TARGET_LOCKED,
+                        "target memory is protected",
+                    ) from None
+                raise FlashError(
+                    FlashErrorCode.CONNECT_FAIL,
+                    f"target memory read failed: {exc}",
+                ) from None
+            if len(data) != size:
+                raise FlashError(
+                    FlashErrorCode.CONNECT_FAIL,
+                    f"target returned {len(data)} bytes for a {size}-byte read",
+                )
+            return data
 
     @staticmethod
     def _iter_image_chunks(

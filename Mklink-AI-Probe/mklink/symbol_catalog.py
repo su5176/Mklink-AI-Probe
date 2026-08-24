@@ -107,6 +107,8 @@ class SymbolBrowseNode:
     child_count: int | None = None
     range_start: int | None = None
     range_end: int | None = None
+    array_dimensions: tuple[int, ...] = ()
+    snapshot_eligible: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -122,6 +124,8 @@ class SymbolBrowseNode:
             "child_count": self.child_count,
             "range_start": self.range_start,
             "range_end": self.range_end,
+            "array_dimensions": list(self.array_dimensions),
+            "snapshot_eligible": self.snapshot_eligible,
         }
 
 
@@ -190,6 +194,53 @@ class SymbolCatalog:
         if descriptor is None:
             raise SymbolCatalogError(f"symbol is unavailable: {path}")
         return descriptor
+
+    def array_descriptors(
+        self,
+        path: str,
+        *,
+        start_index: int = 0,
+        count: int | None = None,
+        max_elements: int = 4096,
+    ) -> tuple[SymbolDescriptor, ...]:
+        """Resolve a bounded one-dimensional scalar array slice for snapshots."""
+        node = self._resolve_node(path)
+        if node is None:
+            raise SymbolCatalogError(f"symbol array is unavailable: {path}")
+        shape = self._array_shape(node)
+        if shape is None:
+            raise SymbolCatalogError(f"symbol is not an array: {path}")
+        dimensions, _element_type_offset = shape
+        if len(dimensions) != 1:
+            raise SymbolCatalogError(
+                f"array snapshot requires one dimension: {path}"
+            )
+        total = dimensions[0]
+        if total <= 0:
+            raise SymbolCatalogError(f"symbol array is empty: {path}")
+        if not isinstance(start_index, int) or start_index < 0 or start_index >= total:
+            raise SymbolCatalogError(
+                f"array snapshot start index must be between 0 and {total - 1}: {path}"
+            )
+        if count is None:
+            count = total - start_index
+        if not isinstance(count, int) or count <= 0 or count > max_elements:
+            raise SymbolCatalogError(
+                f"array snapshot count must be between 1 and {max_elements}: {path}"
+            )
+        if start_index + count > total:
+            raise SymbolCatalogError(
+                f"array snapshot range exceeds {total} elements: {path}"
+            )
+        descriptors: list[SymbolDescriptor] = []
+        for index in range(start_index, start_index + count):
+            descriptor = self._descriptor_from_node(self._array_child(node, index))
+            if descriptor is None:
+                raise SymbolCatalogError(
+                    f"array snapshot elements must be scalar numeric values: {path}"
+                )
+            descriptors.append(descriptor)
+        return tuple(descriptors)
 
     def is_stale(self) -> bool:
         try:
@@ -355,6 +406,11 @@ class SymbolCatalog:
             return self._leaf_entry(descriptor)
         array = self._array_shape(node)
         if array is not None:
+            dimensions, _element_type_offset = array
+            first = (
+                self._descriptor_from_node(self._array_child(node, 0))
+                if dimensions[0] > 0 else None
+            )
             return SymbolBrowseNode(
                 key=node.path,
                 path=node.path,
@@ -363,7 +419,13 @@ class SymbolCatalog:
                 type_name=node.type_name,
                 size=node.size,
                 address=node.address,
-                child_count=array[0][0],
+                child_count=dimensions[0],
+                array_dimensions=dimensions,
+                snapshot_eligible=(
+                    len(dimensions) == 1
+                    and dimensions[0] > 0
+                    and first is not None
+                ),
             )
         record = self._record_for(node)
         if record is not None:

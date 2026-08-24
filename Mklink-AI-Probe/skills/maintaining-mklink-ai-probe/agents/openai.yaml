@@ -1,7 +1,7 @@
 interface:
   display_name: "Maintain Mklink AI Probe"
-  short_description: "Shared cross-model repository maintenance workflow"
-  default_prompt: "Use $maintaining-mklink-ai-probe to diagnose, implement, verify, document, and hand off this repository task consistently."
+  short_description: "Explicit-only repository maintainer workflow"
+  default_prompt: "Use $maintaining-mklink-ai-probe for this authorized repository maintenance task."
 
 policy:
-  allow_implicit_invocation: true
+  allow_implicit_invocation: false

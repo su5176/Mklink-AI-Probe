@@ -114,6 +114,7 @@ export function useBinaryStream(
     capacity: options.capacity,
     channelCount: options.channelCount,
     decoderMode: options.decoderMode,
+    serializeWorkerFrames: stream === 'systemview',
     onState,
     onWorkerMessage,
   })

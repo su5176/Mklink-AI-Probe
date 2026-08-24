@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -64,6 +64,7 @@ class OnlineFlashServices:
     custom_flms: object = None
     configuration_lock: object = field(default_factory=threading.RLock)
     image_targets: Dict[str, object] = field(default_factory=dict)
+    image_flash_overrides: Dict[str, object] = field(default_factory=dict)
     upload_limit: int = _DEFAULT_UPLOAD_LIMIT
     pack_index_updater: Optional[Callable[[Callable[[Dict[str, object]], None]], object]] = None
     heartbeat_interval: float = 15.0
@@ -155,6 +156,20 @@ class JobBody(BaseModel):
     reset_mode: str = "default"
     base_address: Optional[int] = None
     sector_addresses: List[int] = Field(default_factory=list)
+    board: Optional[str] = None
+    hpm_flash_cfg: Optional[Tuple[str, str, str, str]] = None
+
+
+class ReadMemoryBody(BaseModel):
+    address: Union[str, int]
+    size: int = Field(..., ge=1, le=64 * 1024 * 1024)
+    probe_id: Optional[str] = None
+    target_part: str
+    preempt_ai: bool = True
+    frequency: int = Field(default=1_000_000, ge=1, le=10_000_000)
+    connect_mode: str = "halt"
+    reset_mode: str = "default"
+    chunk_sizes: List[int] = Field(default_factory=list, max_length=65536)
     board: Optional[str] = None
     hpm_flash_cfg: Optional[Tuple[str, str, str, str]] = None
 
@@ -674,6 +689,60 @@ def _target_flash_configuration(
     )
 
 
+def _captured_image_flash_regions(
+    services: OnlineFlashServices,
+    target: TargetRecord,
+    base_regions: Sequence[MemoryRegion],
+) -> tuple[tuple[MemoryRegion, ...], tuple[tuple[int, int], ...]]:
+    """Extend a captured image only to a same-Pack FLM's explicit range."""
+    from mklink.cmsis_dap.algorithm_catalog import discover_flash_algorithms
+
+    if not target.pack_path:
+        return tuple(base_regions), ()
+    pack_path = os.path.normcase(os.path.abspath(target.pack_path))
+    algorithms = [
+        algorithm
+        for algorithm in discover_flash_algorithms(target.part_number, paths=services.paths)
+        if bool(getattr(algorithm, "default", False))
+        and getattr(algorithm, "source_kind", "") in {"installed-pack", "builtin-pack"}
+        and getattr(algorithm, "pack_path", None)
+        and os.path.normcase(os.path.abspath(str(algorithm.pack_path))) == pack_path
+    ]
+    expanded = []
+    overrides = []
+    for region in base_regions:
+        if (
+            not region.is_flash
+            or not region.writable
+            or not isinstance(region.sector_size, int)
+            or isinstance(region.sector_size, bool)
+            or region.sector_size <= 0
+        ):
+            expanded.append(region)
+            continue
+        candidates = [
+            algorithm
+            for algorithm in algorithms
+            if int(getattr(algorithm, "flash_start", -1)) == region.start
+            and int(getattr(algorithm, "flash_size", 0)) > region.length
+        ]
+        if not candidates:
+            expanded.append(region)
+            continue
+        algorithm = min(candidates, key=lambda item: int(item.flash_size))
+        size = int(algorithm.flash_size)
+        expanded.append(MemoryRegion(
+            region.name,
+            region.start,
+            size,
+            True,
+            True,
+            region.sector_size,
+        ))
+        overrides.append((region.start, size))
+    return tuple(expanded), tuple(overrides)
+
+
 def _selected_probe(provider: Callable[[], Sequence[object]], probe_id: str) -> object:
     records = filter_mklink_probes(provider())
     for record in records:
@@ -856,6 +925,7 @@ def _start_job_with_configuration(
         custom_flm_paths = ()
         custom_flm_digests = ()
         custom_flm_regions = ()
+        pack_flm_regions = ()
         custom_flm_ram_start = None
         custom_flm_ram_size = None
         inspection = None
@@ -874,6 +944,9 @@ def _start_job_with_configuration(
                     FlashErrorCode.TARGET_NOT_SUPPORTED,
                     "image inspection does not match the selected target",
                 )
+            flash_override = services.image_flash_overrides.get(body.image_id)
+            if flash_override is not None:
+                regions, pack_flm_regions = flash_override
         if not hpm_target:
             from mklink.cmsis_dap.algorithm_catalog import (
                 FlashAlgorithmError,
@@ -972,6 +1045,7 @@ def _start_job_with_configuration(
             custom_flm_paths=custom_flm_paths,
             custom_flm_digests=custom_flm_digests,
             custom_flm_regions=custom_flm_regions,
+            pack_flm_regions=pack_flm_regions,
             custom_flm_ram_start=custom_flm_ram_start,
             custom_flm_ram_size=custom_flm_ram_size,
             frequency=body.frequency,
@@ -993,6 +1067,7 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
         source: Path,
         part_number: str,
         base_address: Optional[Union[str, int]],
+        captured_from_target: bool = False,
     ) -> object:
         from mklink.hpm_config import is_hpm_target
 
@@ -1005,6 +1080,14 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
         regions, fingerprint, _paths = await _blocking(
             _target_flash_configuration, services, target.part_number
         )
+        pack_flm_regions = ()
+        if captured_from_target and not is_hpm_target(target.part_number):
+            regions, pack_flm_regions = await _blocking(
+                _captured_image_flash_regions,
+                services,
+                target,
+                regions,
+            )
         parsed_base = await _blocking(_parse_base_address, base_address)
         inspection = await _blocking(
             services.image_inspector.inspect,
@@ -1025,6 +1108,10 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
         services.image_targets[inspection.image_id] = (
             target.part_number.casefold(), fingerprint
         )
+        if pack_flm_regions:
+            services.image_flash_overrides[inspection.image_id] = (
+                tuple(regions), pack_flm_regions
+            )
         payload = _json_primitive(inspection, hide_paths=True)
         payload["sector_operations_available"] = coverage.sector_operations_available
         payload["sectors"] = _json_primitive(coverage.sectors)
@@ -1043,6 +1130,105 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
     ) -> object:
         result = await _blocking(services.catalog.search, q, vendor=vendor, installed=installed, limit=limit)
         return _json_primitive(result, hide_paths=True)
+
+    @router.get("/targets/{part_number}/memory-map")
+    async def target_memory_map(part_number: str) -> object:
+        target = await _blocking(_resolved_target, services.catalog, part_number)
+        regions, _fingerprint, _paths = await _blocking(
+            _target_flash_configuration, services, target.part_number
+        )
+        return [
+            {
+                "name": region.name,
+                "start": region.start,
+                "length": region.length,
+                "sector_size": region.sector_size,
+            }
+            for region in regions
+            if region.is_flash
+            and region.length > 0
+            and region.sector_size is not None
+            and region.sector_size > 0
+        ]
+
+    @router.post("/memory/read")
+    async def read_memory(body: ReadMemoryBody) -> Response:
+        """Read a target range and return it as a downloadable BIN file.
+        """
+        target = await _blocking(_resolved_target, services.catalog, body.target_part)
+        if not body.probe_id:
+            raise HTTPException(status_code=422, detail="probe_id is required")
+        address = await _blocking(_parse_base_address, body.address)
+        if address is None:
+            raise HTTPException(status_code=422, detail="address is required")
+        request = JobRequest(
+            actions=("connect", "disconnect"),
+            preempt_ai=body.preempt_ai,
+            probe_id=body.probe_id,
+            target_part=target.part_number,
+            pack_path=target.pack_path,
+            frequency=body.frequency,
+            connect_mode=body.connect_mode,
+            reset_mode=body.reset_mode,
+            board=body.board,
+            hpm_flash_cfg=body.hpm_flash_cfg,
+        )
+        data = await _blocking(
+            services.job_manager.read_memory,
+            request,
+            address,
+            body.size,
+        )
+        filename = "read-0x{:08X}-{}.bin".format(address, body.size)
+        return Response(
+            content=data,
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(len(data)),
+            },
+        )
+
+    @router.post("/memory/read-stream")
+    async def read_memory_stream(body: ReadMemoryBody) -> StreamingResponse:
+        """Stream sector chunks while keeping a single target connection open."""
+        target = await _blocking(_resolved_target, services.catalog, body.target_part)
+        if not body.probe_id:
+            raise HTTPException(status_code=422, detail="probe_id is required")
+        address = await _blocking(_parse_base_address, body.address)
+        if address is None:
+            raise HTTPException(status_code=422, detail="address is required")
+        chunk_sizes = tuple(body.chunk_sizes)
+        if (
+            not chunk_sizes
+            or any(type(value) is not int or value <= 0 for value in chunk_sizes)
+            or sum(chunk_sizes) != body.size
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail="chunk_sizes must contain positive sizes that add up to size",
+            )
+        request = JobRequest(
+            actions=("connect", "disconnect"),
+            preempt_ai=body.preempt_ai,
+            probe_id=body.probe_id,
+            target_part=target.part_number,
+            pack_path=target.pack_path,
+            frequency=body.frequency,
+            connect_mode=body.connect_mode,
+            reset_mode=body.reset_mode,
+            board=body.board,
+            hpm_flash_cfg=body.hpm_flash_cfg,
+        )
+        filename = "read-0x{:08X}-{}.bin".format(address, body.size)
+        return StreamingResponse(
+            services.job_manager.iter_memory(request, address, chunk_sizes),
+            media_type="application/octet-stream",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Length": str(body.size),
+            },
+        )
 
     @router.get("/packs/status")
     async def pack_status() -> object:
@@ -1232,13 +1418,19 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
         file: UploadFile = File(...),
         part_number: str = Form(...),
         base_address: Optional[str] = Form(None),
+        captured_from_target: bool = Form(False),
     ) -> object:
         temporary = None  # type: Optional[Path]
         try:
             temporary, _digest, _size = await _blocking(
                 _stream_upload, file, services.paths, (".hex", ".bin"), services.upload_limit
             )
-            return await inspect_source(temporary, part_number, base_address)
+            return await inspect_source(
+                temporary,
+                part_number,
+                base_address,
+                captured_from_target,
+            )
         finally:
             await run_in_threadpool(_unlink, temporary)
             await file.close()

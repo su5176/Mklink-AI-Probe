@@ -1,6 +1,6 @@
 ---
 name: maintaining-mklink-ai-probe
-description: Maintain Mklink AI Probe consistently across users and coding models. Use for repository coding, debugging, review, handoff, worktree, build, or release tasks to discover the real requirement, diagnose before editing, make proportional changes, verify results, and preserve project memory. Official signed releases require explicit maintainer authorization.
+description: Maintainer-only workflow for authorized Mklink AI Probe repository development, review, build, handoff, and release work. Invoke explicitly in a source checkout; never use for end-user flashing, hardware debugging, RTT, memory, serial, Modbus, or ordinary $mklink-ai-probe requests. Official publication still requires explicit maintainer authorization.
 ---
 
 # Maintain Mklink AI Probe

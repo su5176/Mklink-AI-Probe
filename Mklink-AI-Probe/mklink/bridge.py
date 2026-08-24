@@ -19,7 +19,6 @@ from mklink._types import (
     DEFAULT_BAUDRATE,
     FLM_LOAD_TIMEOUT,
     PROMPT,
-    SYNC_RETRIES,
     DeviceContext,
     DeviceState,
     MKLINK_IDENTITY_COMMAND,
@@ -27,13 +26,22 @@ from mklink._types import (
 )
 from mklink.serial._port import _PortLock
 
-# 流模式停止命令 — RTT 和 VOFA 互斥，恢复时盲发两个是安全的
-_STREAM_STOP_COMMANDS = [
+# SystemView 在二进制流中使用 0x02 停止帧；随后发送文本命令让固件状态机
+# 回到 Pika REPL。必须先独立尝试这一序列，避免后续 RTT/VOFA 命令在状态机
+# 切回命令模式的瞬间拼接成 ``RTTView.stop(RTTView.stop...``。
+_SYSTEMVIEW_STOP_COMMANDS = [
+    b"\x02",
+    b"SystemView.stop()\n",
+]
+# 其他流模式的文本兜底命令，仅在 SystemView 专用恢复没有得到提示符时发送。
+_STREAM_FALLBACK_STOP_COMMANDS = [
     b"RTTView.stop()\n",
     b'vofa.send(0x20000000, "uint8_t", 0)\n',
-    b"cmd.dump_memory(0x20000054, 4, 0)\n",
+    b"cmd.dump_memory(0x20000054, 4, -1.0)\n",
 ]
 _STREAM_READ_POLL_INTERVAL = 0.01
+_SYNC_TIMEOUTS = (0.3, 0.7)
+_RECOVERY_PROMPT_TIMEOUT = 1.0
 
 
 def quote_probe_string(value: str) -> str:
@@ -122,14 +130,15 @@ class MKLinkSerialBridge:
         )
         self._reader_thread.start()
 
-        # 发送空行同步，重试 SYNC_RETRIES 次
-        for attempt in range(1, SYNC_RETRIES + 1):
+        # 正常 CMD 口会立即返回提示符。分两级短等待兼顾 USB 调度抖动，
+        # 无响应时尽快进入流模式恢复，避免固定阻塞 2 秒三次。
+        for sync_timeout in _SYNC_TIMEOUTS:
             self._prompt_event.clear()
             with self._buffer_lock:
                 self._response_buffer.clear()
             self._serial.write(b"\n")
 
-            if self._prompt_event.wait(timeout=2.0):
+            if self._prompt_event.wait(timeout=sync_timeout):
                 self._ctx.state = DeviceState.READY
                 if self._verify_identity():
                     return True
@@ -157,18 +166,15 @@ class MKLinkSerialBridge:
                 return False
 
         try:
-            # 排空缓冲区，盲发停止命令
+            # 排空缓冲区，先尝试 SystemView 的二进制停止握手。探针在
+            # SystemView 流中不会把普通文本当作 Pika 命令，必须先发 0x02。
             self._serial.reset_input_buffer()
             self._serial.reset_output_buffer()
-            for stop_cmd in _STREAM_STOP_COMMANDS:
-                try:
-                    self._serial.write(stop_cmd)
-                except serial.SerialException:
-                    break
-            time.sleep(0.5)
-            self._serial.reset_input_buffer()
+            for stop_cmd in _SYSTEMVIEW_STOP_COMMANDS:
+                self._serial.write(stop_cmd)
+            time.sleep(0.1)
 
-            # 重启 reader 线程，最后尝试一次握手
+            # 重启 reader 线程，先验证 SystemView 是否已经回到 REPL。
             self._running = True
             self._ctx.state = DeviceState.CONNECTING
             self._response_buffer.clear()
@@ -179,7 +185,24 @@ class MKLinkSerialBridge:
             self._reader_thread.start()
 
             self._serial.write(b"\n")
-            if self._prompt_event.wait(timeout=3.0):
+            if self._prompt_event.wait(timeout=_RECOVERY_PROMPT_TIMEOUT):
+                self._ctx.state = DeviceState.READY
+                if self._verify_identity():
+                    print("[OK] 流模式恢复成功")
+                    return True
+
+            # 非 SystemView 流模式（例如 RTT/VOFA）不会响应上述握手，才发送
+            # 各自的文本停止命令，再进行一次短提示符同步。
+            for stop_cmd in _STREAM_FALLBACK_STOP_COMMANDS:
+                try:
+                    self._serial.write(stop_cmd)
+                except serial.SerialException:
+                    break
+            time.sleep(0.3)
+            self._serial.reset_input_buffer()
+            self._prompt_event.clear()
+            self._serial.write(b"\n")
+            if self._prompt_event.wait(timeout=_RECOVERY_PROMPT_TIMEOUT):
                 self._ctx.state = DeviceState.READY
                 if self._verify_identity():
                     print("[OK] 流模式恢复成功")

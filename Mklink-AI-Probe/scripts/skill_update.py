@@ -27,11 +27,21 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_MANIFEST_URLS = (
-    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
     "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/updates/latest.json",
+    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
 )
 USER_AGENT = "Mklink-AI-Probe-Skill-Updater"
-MANAGED_CONTENT_ROOTS = (PurePosixPath("gui/dist"),)
+MANAGED_CONTENT_ROOTS = (
+    PurePosixPath("_maintainer"),
+    PurePosixPath("docs/ai"),
+    PurePosixPath("gui/dist"),
+    PurePosixPath("skills"),
+)
+MANAGED_CONTENT_FILES = {
+    PurePosixPath("AGENTS.md"),
+    PurePosixPath("CLAUDE.md"),
+    PurePosixPath("GEMINI.md"),
+}
 
 
 def utc_now() -> str:
@@ -238,6 +248,10 @@ def _remove_obsolete_installed_files(
 def _remove_unlisted_managed_files(
     root: Path, installed_files: set[PurePosixPath],
 ) -> None:
+    for relative in MANAGED_CONTENT_FILES - installed_files:
+        path = root.joinpath(*relative.parts)
+        if path.is_file() or path.is_symlink():
+            path.unlink()
     for managed_root in MANAGED_CONTENT_ROOTS:
         directory = root.joinpath(*managed_root.parts)
         if not directory.is_dir():

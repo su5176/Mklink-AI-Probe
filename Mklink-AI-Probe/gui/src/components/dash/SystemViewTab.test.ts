@@ -37,11 +37,13 @@ const mocks = vi.hoisted(() => ({
   checkConflict: vi.fn(),
   scheduler: {
     start: vi.fn(), stop: vi.fn(), invalidate: vi.fn(),
-    recordCollection: vi.fn(), dispose: vi.fn(),
+    recordCollection: vi.fn(), setFrameRate: vi.fn(), dispose: vi.fn(),
+    options: null as unknown,
+    render: null as ((reasons: ReadonlySet<string>) => void) | null,
   },
   timeline: {
     construct: vi.fn(),
-    pauseRendering: vi.fn(), resumeRendering: vi.fn(),
+    pauseRendering: vi.fn(), resumeRendering: vi.fn(), renderFrame: vi.fn(),
     setPrefilteredIntervals: vi.fn(),
   },
   importLog: vi.fn(),
@@ -63,6 +65,7 @@ vi.mock('../../lib/svTimeline', () => ({
     setData() {}
     setTickOrigin() {}
     setPrefilteredIntervals = mocks.timeline.setPrefilteredIntervals
+    renderFrame = mocks.timeline.renderFrame
     setWindowSize() {}
     pauseRendering = mocks.timeline.pauseRendering
     resumeRendering = mocks.timeline.resumeRendering
@@ -71,11 +74,25 @@ vi.mock('../../lib/svTimeline', () => ({
   },
 }))
 vi.mock('../../lib/stream/renderScheduler', () => ({
+  AdaptiveFrameRateController: class {
+    reset() {}
+    observe() { return 60 }
+  },
   RenderScheduler: class {
+    constructor(
+      render: (reasons: ReadonlySet<string>) => void,
+      _dependencies: unknown,
+      _collectionTelemetry: unknown,
+      options: unknown,
+    ) {
+      mocks.scheduler.render = render
+      mocks.scheduler.options = options
+    }
     start = mocks.scheduler.start
     stop = mocks.scheduler.stop
     invalidate = mocks.scheduler.invalidate
     recordCollection = mocks.scheduler.recordCollection
+    setFrameRate = mocks.scheduler.setFrameRate
     dispose = mocks.scheduler.dispose
   },
 }))
@@ -127,6 +144,7 @@ describe('SystemViewTab asynchronous lifecycle', () => {
     localStorage.clear()
     saveDesktopSettings(localStorage, desktopSettings())
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue({ ok: false }))
+    mocks.scheduler.render = null
   })
 
   it('searches and persists an RTT address without visiting RTT View', async () => {
@@ -165,6 +183,61 @@ describe('SystemViewTab asynchronous lifecycle', () => {
       mode: 0,
       search_size: 1024,
     })
+    wrapper.unmount()
+  })
+
+  it('coalesces visible-range requests while the Worker is still processing one', async () => {
+    mocks.dash.getStatus.mockResolvedValue({ running: false })
+    const wrapper = mount(SystemViewTab, { props: { deviceConnected: true } })
+    await flushPromises()
+    expect(mocks.scheduler.render).not.toBeNull()
+
+    mocks.scheduler.render?.(new Set(['data']))
+    mocks.scheduler.render?.(new Set(['data']))
+    expect(mocks.binary.requestVisibleRange).toHaveBeenCalledOnce()
+
+    const requestId = mocks.binary.requestVisibleRange.mock.calls[0][0] as number
+    publishVisibleEvent(1_000_000, requestId)
+    await nextTick()
+    expect(mocks.scheduler.invalidate).toHaveBeenCalledWith('data')
+    wrapper.unmount()
+  })
+
+  it('keeps earlier envelope intervals while the follow viewport advances', async () => {
+    mocks.dash.getStatus.mockResolvedValue({ running: false })
+    const wrapper = mount(SystemViewTab, { props: { deviceConnected: true } })
+    await flushPromises()
+
+    publishVisibleIntervals(1_000_000, 0, 1_000_000, 100, 200)
+    await nextTick()
+    publishVisibleIntervals(1_000_000, 0, 2_000_000, 300, 400)
+    await nextTick()
+
+    const last = mocks.timeline.setPrefilteredIntervals.mock.calls.at(-1)?.[0] as Array<{ start: number }>
+    expect(last.map(interval => interval.start)).toEqual([100, 300])
+    wrapper.unmount()
+  })
+
+  it('keeps the startup Timeline cadence fixed until the live window is filled', async () => {
+    mocks.dash.getStatus.mockResolvedValue({ running: false })
+    const wrapper = mount(SystemViewTab, { props: { deviceConnected: true } })
+    await flushPromises()
+
+    expect(mocks.scheduler.options).toEqual({ frameRate: 30, continuous: true })
+    mocks.scheduler.render?.(new Set(['data']))
+    expect(mocks.scheduler.setFrameRate).toHaveBeenLastCalledWith(30)
+
+    const firstRequestId = mocks.binary.requestVisibleRange.mock.calls.at(-1)?.[0] as number
+    publishVisibleEvent(1_000_000, firstRequestId, 1)
+    await nextTick()
+    mocks.scheduler.render?.(new Set(['data']))
+    expect(mocks.scheduler.setFrameRate).toHaveBeenLastCalledWith(30)
+
+    const filledRequestId = mocks.binary.requestVisibleRange.mock.calls.at(-1)?.[0] as number
+    publishVisibleEvent(1_000_000, filledRequestId, 10_000_000)
+    await nextTick()
+    mocks.scheduler.render?.(new Set())
+    expect(mocks.scheduler.setFrameRate).toHaveBeenLastCalledWith(60)
     wrapper.unmount()
   })
 
@@ -264,6 +337,30 @@ describe('SystemViewTab asynchronous lifecycle', () => {
     expect(wrapper.text()).toContain('Tmr Svc')
     expect(mocks.status.connect).toHaveBeenCalledOnce()
     expect(mocks.binary.start).toHaveBeenCalledOnce()
+    wrapper.unmount()
+  })
+
+  it('shows target overflow separately from runtime stream drops', async () => {
+    mocks.dash.getStatus.mockResolvedValue({ running: false })
+    const wrapper = mount(SystemViewTab, { props: { deviceConnected: true } })
+    await flushPromises()
+
+    mocks.status.data.value = [{
+      _streamSeq: 1,
+      target_overflow_events: 1,
+      target_drop_count: 3,
+      target_dropped_packets_since_baseline: 3,
+      dropped_bytes: 0,
+      dropped_packets: 0,
+    }] as never[]
+    await nextTick()
+
+    const health = wrapper.get('.sv-health-grid')
+    expect(health.text()).toContain('Target Overflow1')
+    expect(health.text()).toContain('Runtime Drop0')
+    const overflowCard = health.findAll('.sv-health-card')
+      .find(card => card.text().includes('Target Overflow'))
+    expect(overflowCard?.classes()).toContain('warn')
     wrapper.unmount()
   })
 
@@ -411,15 +508,15 @@ describe('SystemViewTab asynchronous lifecycle', () => {
   })
 })
 
-function publishVisibleEvent(cpuFreq: number) {
+function publishVisibleEvent(cpuFreq: number, requestId = 0, latestTime = 1) {
   mocks.status.data.value = cpuFreq > 0 ? [{ _streamSeq: 1, cpu_freq: cpuFreq }] as never[] : []
   mocks.binary.systemViewVisible.value = {
     type: 'systemview-visible',
-    requestId: 0,
+    requestId,
     intervalCount: 0,
     candidateIntervalCount: 0,
     eventCount: 1,
-    latestTime: 1,
+    latestTime,
     tickOrigin: 9007199254740992n,
     taskIds: new Uint32Array().buffer,
     starts: new Float64Array().buffer,
@@ -433,6 +530,33 @@ function publishVisibleEvent(cpuFreq: number) {
       t_ticks_exact: '9007199254740993',
       t_relative: 1,
     }],
+  } as never
+}
+
+function publishVisibleIntervals(
+  cpuFreq: number,
+  requestId: number,
+  latestTime: number,
+  start: number,
+  end: number,
+) {
+  mocks.status.data.value = [{ _streamSeq: requestId, cpu_freq: cpuFreq }] as never[]
+  mocks.binary.systemViewVisible.value = {
+    type: 'systemview-visible',
+    requestId,
+    intervalCount: 1,
+    candidateIntervalCount: 1,
+    eventCount: 0,
+    latestTime,
+    tickOrigin: 0n,
+    taskIds: new Uint32Array([1]).buffer,
+    contextTypes: new Uint8Array([1]).buffer,
+    starts: new Float64Array([start]).buffer,
+    ends: new Float64Array([end]).buffer,
+    startTicks: new BigUint64Array([BigInt(start)]).buffer,
+    endTicks: new BigUint64Array([BigInt(end)]).buffer,
+    events: [],
+    contexts: [],
   } as never
 }
 

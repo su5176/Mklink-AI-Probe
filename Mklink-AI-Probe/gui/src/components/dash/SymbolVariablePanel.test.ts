@@ -424,4 +424,39 @@ describe('SymbolVariablePanel', () => {
 
     expect(wrapper.get('[data-testid="leaf-values[999]"]').exists()).toBe(true)
   })
+
+  it('configures a bounded array snapshot without changing element selection', async () => {
+    mocks.browseRoots.value = [{
+      key: 'samples', path: 'samples', label: 'samples', kind: 'branch',
+      type_name: 'int16_t[]', size: 512 * 2, address: 0x20001000,
+      descriptor: null, container: null, child_count: 512, range_start: null, range_end: null,
+      array_dimensions: [512], snapshot_eligible: true,
+    }]
+    const fetchMock = vi.fn().mockResolvedValue(okJson({
+      snapshot: { name: 'samples', start_index: 64, count: 32 },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(SymbolVariablePanel, {
+      props: { deviceConnected: true, latestValues: {}, snapshotPath: null },
+    })
+    await flushPromises()
+
+    await wrapper.get('[data-testid="snapshot-samples"]').trigger('click')
+    expect(wrapper.get('[data-testid="array-snapshot-modal"]').exists()).toBe(true)
+    await wrapper.get('[data-testid="array-snapshot-start"]').setValue('64')
+    await wrapper.get('[data-testid="array-snapshot-count"]').setValue('32')
+    await wrapper.get('[data-testid="array-snapshot-confirm"]').trigger('click')
+    await flushPromises()
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/dash/superwatch/array-snapshot/select',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ name: 'samples', start_index: 64, count: 32 }),
+      }),
+    )
+    expect(wrapper.emitted('snapshot-change')).toEqual([['samples']])
+    wrapper.unmount()
+    vi.unstubAllGlobals()
+  })
 })
