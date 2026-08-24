@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-23T21:17:00+08:00`
-- 分支：`master`
-- HEAD：`feature/hil-plugin-v02 基于 master fbaac61，新增独立 hil-plugin-json-v1 one-shot 入口；合并后 master 将成为 HIL-Infra 首个 v0.2 自动化准入插件实现。`
-- 远端 HEAD：`用户已授权将 master 与 feature/eternal-chip-gui 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。`
-- 工作树：功能在隔离 worktree 实现和验证；只提交 mklink/hil_plugin.py、对应测试与项目记忆，DLL、pytest/GUI/Rust 构建缓存和 Vite 哈希产物均不纳入 Git。
-- 当前任务：为 HIL-Infra v0.2 增加最小无人值守插件面：lifecycle + observe/debug.read；有人值守既有 MCP/CLI 能力不变，所有 flash/reset/write/control 在协议入口先于设备访问拒绝。
-- 状态：`hil_plugin_v02_qualified_local`
+- 更新时间：`2026-08-24T11:14:53+08:00`
+- 分支：`feature/eternal-chip-gui`
+- HEAD：`本地 master 9cba616（HIL v0.2 只读插件适配 + hil-lock 元数据 guard 修复）已整体合并进立芯分支，合并提交 afb4781；分支相对 master 仅剩立芯品牌 GUI、演示资产与分支记忆差异，mklink 核心运行时与 master 逐字节一致。`
+- 远端 HEAD：`用户授权将合并后的 feature/eternal-chip-gui 推送到 GitHub origin；master 分支本身仍领先 origin/master 两个提交（fbaac61、9cba616），本次未推送 master，未创建标签或 Release。`
+- 工作树：合并后门禁全部在分支重跑；生产构建产生的 dist 哈希残留已恢复/清理，工作树对 Git 干净（仅既有未跟踪缓存目录）。
+- 当前任务：本地 master 9cba616 全部改动（含 fbaac61 hil-lock 元数据串行化修复、9cba616 HIL v0.2 只读插件适配）合并进 feature/eternal-chip-gui 并推送 GitHub origin；立芯品牌界面与分支独有资产保持不变。
+- 状态：`master_synced_into_eternal_chip`
 
 ## 里程碑
 
@@ -21,6 +21,7 @@
 
 ## 验证证据
 
+- **master 同步进立芯分支门禁**：合并提交 afb4781 把本地 master 9cba616 整体带入 feature/eternal-chip-gui；hil_lock.py 取 master 侧（分支旧版与 40f5b2b 逐字节一致，master 版为严格超集），记忆/交接文件按 master 新状态为基重写。分支相对 master 仅剩立芯品牌 GUI、demo-shots、mock-server、分支 dist 与记忆差异，mklink 核心与 master 逐字节一致（hil_lock、mcu_detect 等校验相同）。门禁在合并分支重跑：Python 全量 1304 passed、1 skipped，仅 test_pack_manager.py::test_cancel_closes_job_before_recovery_and_kills_real_worker 一次时序竞态失败（该文件与 master 逐字节相同，隔离复跑 6 次中 4 过 2 败，属子进程写 PID 文件存在性/内容竞态的环境抖动，非合并回归）；GUI 全量 56 文件/529 项全部通过；vue-tsc + Vite 生产构建与 Tauri cargo check 通过；git diff --check 干净，dist 哈希残留已恢复/清理。真机证据沿用 master 9cba616 已准入记录（真实 MicroKeenV4 识别/健康/debug.read/safe_state、plugin-review 11 OK、conformance 清洁），本次未执行任何新的真机动作。
 - **HIL-Infra v0.2 插件准入**：真实 MicroKeenV4 上完成 identify/capabilities/health/safe_state、双向 transport 锁互操作和无残留 lease；HIL plugin-review PR-01~11 为 11 OK、0 WARN、0 FAIL，runtime conformance 0 error/0 warning/0 waiver。插件单测 5 passed；补入与 master 本机原生源码制品 SHA-256 758E428F...77C07 的未跟踪 mklink-stcp.dll 并把 pytest basetemp 移到源码树外后，Python 全量 1305 passed、1 skipped；GUI 首轮 2 个套件级 mock 抖动，目标文件 67/67 通过后全量复跑 54 文件/525 项通过；Vite 生产构建及 cargo check 通过。未执行烧录、复位、供电、DUT 写入或激励。
 - **僵尸锁与探针电源/重启控制**：Windows PID 判定现同时检查 OpenProcess 与 GetExitCodeProcess；真实已退出子进程仍保留句柄时正确返回死亡，serial_MKLINK_AUTO_CONNECT.lock 回归可自动删除。Device/MCP/REST/GUI 新增 1800/3300/5000 mV 与 probe reboot；5V 在 Device、REST、MCP、GUI 四层要求逐次显式确认，reboot 后释放串口与 HIL 锁，活动 RTT/SystemView 在参数校验通过后先安全停止。最终 Python 1300 passed、1 skipped；GUI 54 文件/525 项、Vite 生产构建、Tauri cargo check 通过。真实 Playwright 验证 3.3V 请求 confirm_5v=false、取消 5V 不发请求、确认 5V 才发送 confirm_5v=true、reboot 需确认。浏览器使用模拟后端，未对硬件输出电压；项目无已确认 bench.yaml，维护者于 2026-08-16 明确豁免本次真机门禁，不得把该豁免表述为真机验证通过。
 - **双分支本地合并与隔离**：master 与 feature/eternal-chip-gui 均完成本地快进。立芯分支运行时 c9fc938 通过 Python 全量覆盖（首轮 1297 passed、1 skipped，PyPI 恢复后受影响文件 7/7 通过）、GUI 56 文件/529 项、生产构建、cargo check 和真实 Chromium + mock 验收。两分支 mklink 核心、Skill 与探针控制回归测试无差异；HIL 锁提交分别位于两条祖先链，立芯品牌提交 7ba8f57 不是 master 祖先。用户随后明确授权，两条分支通过 Git 原子推送同步到 GitHub origin。
@@ -31,6 +32,8 @@
 - **浏览器后端生命周期**：真实 Chrome 双标签验证：关闭一个标签时后端继续运行；关闭最后标签后约 3 秒正常退出，8765 可立即重绑定。关闭前下载器保持连接，随后新后端能重新连接同一下载器，确认 CMD 串口和 Device 已释放。GUI 521 项、生产构建和 Tauri cargo check 通过；Python 1274 项通过、1 项跳过，12 项仅因 Windows 缺少符号链接权限失败。
 - **源码与本地 Skill 同步**：Aladdin-Wang GitHub/Gitee master 与 su5176 PR #10 已同步；用户级 Skill、完整 GUI/MCP 依赖导入和 Skill 校验通过，快速启动网页已写入当前 MICROKEEN 卷。su5176 PR #10 于 2026-08-12 合并为 2f8e902。
 - **PR #10 合并门禁复核**：GitHub 合并前状态 CLEAN、MERGEABLE，头 4d7d617 相对基线 6360843 前进 35 个提交且未落后；仓库未配置远端状态检查。本机隔离复核通过 GUI 54 文件/521 项、Vite 生产构建、Tauri Rust 12 项与 cargo check。首次 Python 全量得到 1284 passed、1 skipped；3 项仅因隔离 worktree 缺少未入库 mklink-stcp.dll 报错，在补入与 PR 完全相同 stcp_bridge 源码树生成且 SHA-256 一致的 DLL 后定向 3 项全通过。旧 Device 连接测试仍 mock 已移除的 _resolve_port，已改为 mock 当前 load_config 入口以消除本地项目配置依赖；修正后的最终 Python 全量为 1288 passed、1 skipped。PR 中既有真实 Chrome 双标签、下载器重连和 HPM/串口/RTT 真机闭环继续作为实机证据。
+- **立芯恒方 GUI 分支验收**：GUI 精修后全量 56 文件/525 项通过，Vite 生产构建、Tauri cargo check 与立芯 GUI 规范校验通过；真实 Chromium 在 1440x1000、1024x768 与 390x844 下完成 porcelain/abyss、配置、仪表盘、主题面板和 About 视觉验收。主题选择、外围点击与 Esc 均能收起面板，Esc 会把焦点还给触发按钮；390px 下修复配置标题全局样式污染并移除可见滚动条轨道。Python 全量仍沿用本分支前次 1285 passed、1 skipped 及 3 项环境缺件 setup error 证据。未执行连接、烧录或其他真机动作。
+- **探针控制与僵尸锁同步验收**：c9fc938 保留立芯 GUI 品牌与既有 HIL 锁，并同步 Windows 已退出进程判定、VCC 1800/3300/5000 mV、5V 显式确认、探针 reboot()、MCP/REST/GUI 接口和无硬件 mock。Python 全量首轮 1297 passed、1 skipped，3 项仅因 PyPI DNS/SSL 临时故障失败；网络恢复后相关两个文件 7/7 通过，完整集合等效为 1300 passed、1 skipped。GUI 56 文件/529 项、Vite 生产构建、cargo check、diff check 通过。真实 Chromium + mock 验证 3.3V 请求、取消 5V 时零请求、确认 5V 时 confirm_5v=true、重启确认和零控制台错误。用户明确豁免本次真机门禁，未执行任何硬件 emit；随后明确授权并通过 Git 原子推送同步到 GitHub origin。
 
 ## 架构决策
 
@@ -45,21 +48,28 @@
 - 串口和 RTT 终端使用独立 Worker 与有界缓冲；终端模式不维护隐藏日志。
 - 每个 Tauri 实例拥有独立 sidecar、动态端口和探针锁；正式发布默认只生成标准 NSIS。
 - 由命令主动打开的浏览器 GUI 使用标签页会话租约；最后标签消失后正常关闭后端并释放资源，显式 --no-browser 和 Tauri sidecar 保持常驻。
+- 立芯恒方作为软件界面品牌，MicroKeen 作为烧录器硬件品牌；GUI 保留现有信息架构并统一使用 porcelain、mica、aqua、abyss、graphite、aurora 六主题。
+- 主题入口使用受控弹层而非原生 details/select；选择主题、点击外围或按 Esc 后收起，Esc 关闭时恢复触发按钮焦点。
+- VCC 仅接受 1800、3300、5000 mV；5000 mV 必须在 GUI 和后端同时显式确认，避免误将 5V 加到 3.3V 系统。
+- reboot() 仅重启 MKLink 探针并主动关闭连接、释放串口与 HIL 锁；目标 MCU 复位继续使用 reset()/cmd.set_reset()。
 
 ## 真机环境
 
 - **probe**：维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。
 - **target**：ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。
-- **permission**：维护者已授权本次 HIL v0.2 插件实现、只读真机识别/健康/debug.read/safe_state、隔离分支提交与本地合并；不授权烧录、擦除、复位、供电、DUT 写入或激励。本次不创建标签、Release，不推送 GitHub/Gitee。历史 VCC/reboot 豁免仍不授权任何 5V 实机输出。
+- **permission**：用户已授权本次 master→feature/eternal-chip-gui 同步合并、合并后门禁复跑与该分支的 GitHub origin 推送；不授权标签、Release、Gitee 同步或新的真机动作。真机证据沿用 master 9cba616 已准入记录（核心运行时逐字节一致）。历史 VCC/reboot 豁免仍不授权任何 5V 实机输出。
 
 ## 下一动作
 
-1. 监控 v0.1.6 用户反馈，运行时修复从新的 fix/feature 分支开始。
-2. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
-3. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
+1. 确认是否把本地 master（9cba616，仍领先 origin/master 两个提交）也推送到 GitHub origin。
+2. 为 test_pack_manager.py 的 PID 文件写入竞态开独立修复分支（原子写或内容就绪等待），消除本机时序抖动。
+3. 需要补充硬件证据时，在额定电压已核对的目标板上分别验证 1.8V/3.3V，5V 仅使用明确可承受 5V 的负载，并验证探针重启后的重新枚举与锁释放。
+4. 下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。
+5. 需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。
 
 ## 已知限制
 
+- test_pack_manager.py 的 cancel/parent-death 进程竞态测试在本机存在时序抖动：子进程 write_text 写 PID 文件非原子，父进程见文件即读可能得到空内容；与合并无关，待独立修复分支收敛。
 - 无人值守面首期没有开放 program/console/bus 写入，也没有为 RTT/UART 只读动作准入；扩大 allowed verbs 必须重新走 HIL plugin-review 和真机安全评审。
 - VCC 与探针 reboot 无本次提交对应的真机 HIL 证据；维护者已明确豁免，真实浏览器仅验证了受保护的请求路径。
 - 高事件率 SystemView 仍可能溢出目标 RTT 缓冲。
@@ -68,6 +78,7 @@
 - 先楫定制店铺尚无权威链接，菜单项保持禁用。
 - USB Web Entry 和安装更新仍需更多平台与干净 Windows 验证。
 - 发布器默认仓库参数仍含旧备用名；下次发布前应修正或继续显式传入两端 Aladdin-Wang 仓库。
+- 本次按用户豁免未取得 VCC 输出与探针重启的真机闭环证据；软件协议、安全门禁和 mock 浏览器闭环已通过。
 
 ## 延续协议
 

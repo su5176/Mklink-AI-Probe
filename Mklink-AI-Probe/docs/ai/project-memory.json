@@ -1,21 +1,21 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-23T21:17:00+08:00",
+  "updated_at": "2026-08-24T11:14:53+08:00",
   "repository": {
     "url": "https://github.com/su5176/Mklink-AI-Probe",
     "project_root": "Mklink-AI-Probe",
-    "branch": "master",
-    "head": "feature/hil-plugin-v02 基于 master fbaac61，新增独立 hil-plugin-json-v1 one-shot 入口；合并后 master 将成为 HIL-Infra 首个 v0.2 自动化准入插件实现。",
-    "remote_head": "用户已授权将 master 与 feature/eternal-chip-gui 原子推送到 GitHub origin；两条远端分支与本地验收头同步，未创建标签或 Release。",
-    "working_tree": "功能在隔离 worktree 实现和验证；只提交 mklink/hil_plugin.py、对应测试与项目记忆，DLL、pytest/GUI/Rust 构建缓存和 Vite 哈希产物均不纳入 Git。"
+    "branch": "feature/eternal-chip-gui",
+    "head": "本地 master 9cba616（HIL v0.2 只读插件适配 + hil-lock 元数据 guard 修复）已整体合并进立芯分支，合并提交 afb4781；分支相对 master 仅剩立芯品牌 GUI、演示资产与分支记忆差异，mklink 核心运行时与 master 逐字节一致。",
+    "remote_head": "用户授权将合并后的 feature/eternal-chip-gui 推送到 GitHub origin；master 分支本身仍领先 origin/master 两个提交（fbaac61、9cba616），本次未推送 master，未创建标签或 Release。",
+    "working_tree": "合并后门禁全部在分支重跑；生产构建产生的 dist 哈希残留已恢复/清理，工作树对 Git 干净（仅既有未跟踪缓存目录）。"
   },
   "mission": {
     "product": "维护 MKLink/MicroLink 的烧录、调试、数据流、Web/Tauri GUI、AI Skill 和远程 Site Agent。",
     "maintenance": "交接只保留当前基线、最新证据、有效约束、限制和下一动作；历史从 Git 查询。"
   },
   "current_session": {
-    "status": "hil_plugin_v02_qualified_local",
-    "current_task": "为 HIL-Infra v0.2 增加最小无人值守插件面：lifecycle + observe/debug.read；有人值守既有 MCP/CLI 能力不变，所有 flash/reset/write/control 在协议入口先于设备访问拒绝。",
+    "status": "master_synced_into_eternal_chip",
+    "current_task": "本地 master 9cba616 全部改动（含 fbaac61 hil-lock 元数据串行化修复、9cba616 HIL v0.2 只读插件适配）合并进 feature/eternal-chip-gui 并推送 GitHub origin；立芯品牌界面与分支独有资产保持不变。",
     "release": "PR #10 保留已发布 v0.1.6 的代码基线且不移动标签。Aladdin-Wang fork 的 v0.1.6 发布记录属于贡献者仓库；su5176 目标仓库当前没有 v0.1.6 标签或 Release，本次未授权发布。"
   },
   "milestones": [
@@ -41,6 +41,10 @@
     }
   ],
   "verification": [
+    {
+      "area": "master 同步进立芯分支门禁",
+      "result": "合并提交 afb4781 把本地 master 9cba616 整体带入 feature/eternal-chip-gui；hil_lock.py 取 master 侧（分支旧版与 40f5b2b 逐字节一致，master 版为严格超集），记忆/交接文件按 master 新状态为基重写。分支相对 master 仅剩立芯品牌 GUI、demo-shots、mock-server、分支 dist 与记忆差异，mklink 核心与 master 逐字节一致（hil_lock、mcu_detect 等校验相同）。门禁在合并分支重跑：Python 全量 1304 passed、1 skipped，仅 test_pack_manager.py::test_cancel_closes_job_before_recovery_and_kills_real_worker 一次时序竞态失败（该文件与 master 逐字节相同，隔离复跑 6 次中 4 过 2 败，属子进程写 PID 文件存在性/内容竞态的环境抖动，非合并回归）；GUI 全量 56 文件/529 项全部通过；vue-tsc + Vite 生产构建与 Tauri cargo check 通过；git diff --check 干净，dist 哈希残留已恢复/清理。真机证据沿用 master 9cba616 已准入记录（真实 MicroKeenV4 识别/健康/debug.read/safe_state、plugin-review 11 OK、conformance 清洁），本次未执行任何新的真机动作。"
+    },
     {
       "area": "HIL-Infra v0.2 插件准入",
       "result": "真实 MicroKeenV4 上完成 identify/capabilities/health/safe_state、双向 transport 锁互操作和无残留 lease；HIL plugin-review PR-01~11 为 11 OK、0 WARN、0 FAIL，runtime conformance 0 error/0 warning/0 waiver。插件单测 5 passed；补入与 master 本机原生源码制品 SHA-256 758E428F...77C07 的未跟踪 mklink-stcp.dll 并把 pytest basetemp 移到源码树外后，Python 全量 1305 passed、1 skipped；GUI 首轮 2 个套件级 mock 抖动，目标文件 67/67 通过后全量复跑 54 文件/525 项通过；Vite 生产构建及 cargo check 通过。未执行烧录、复位、供电、DUT 写入或激励。"
@@ -110,9 +114,10 @@
   "hardware": {
     "probe": "维护机可使用 V2/V3/V4 下载器；交接不记录端口或完整设备标识。",
     "target": "ARM 与 HPM 真机可用；部分客户芯片仅完成 Pack/HEX 软件验证。",
-    "permission": "维护者已授权本次 HIL v0.2 插件实现、只读真机识别/健康/debug.read/safe_state、隔离分支提交与本地合并；不授权烧录、擦除、复位、供电、DUT 写入或激励。本次不创建标签、Release，不推送 GitHub/Gitee。历史 VCC/reboot 豁免仍不授权任何 5V 实机输出。"
+    "permission": "用户已授权本次 master→feature/eternal-chip-gui 同步合并、合并后门禁复跑与该分支的 GitHub origin 推送；不授权标签、Release、Gitee 同步或新的真机动作。真机证据沿用 master 9cba616 已准入记录（核心运行时逐字节一致）。历史 VCC/reboot 豁免仍不授权任何 5V 实机输出。"
   },
   "known_limits": [
+    "test_pack_manager.py 的 cancel/parent-death 进程竞态测试在本机存在时序抖动：子进程 write_text 写 PID 文件非原子，父进程见文件即读可能得到空内容；与合并无关，待独立修复分支收敛。",
     "无人值守面首期没有开放 program/console/bus 写入，也没有为 RTT/UART 只读动作准入；扩大 allowed verbs 必须重新走 HIL plugin-review 和真机安全评审。",
     "VCC 与探针 reboot 无本次提交对应的真机 HIL 证据；维护者已明确豁免，真实浏览器仅验证了受保护的请求路径。",
     "高事件率 SystemView 仍可能溢出目标 RTT 缓冲。",
@@ -124,6 +129,8 @@
     "本次按用户豁免未取得 VCC 输出与探针重启的真机闭环证据；软件协议、安全门禁和 mock 浏览器闭环已通过。"
   ],
   "next_actions": [
+    "确认是否把本地 master（9cba616，仍领先 origin/master 两个提交）也推送到 GitHub origin。",
+    "为 test_pack_manager.py 的 PID 文件写入竞态开独立修复分支（原子写或内容就绪等待），消除本机时序抖动。",
     "需要补充硬件证据时，在额定电压已核对的目标板上分别验证 1.8V/3.3V，5V 仅使用明确可承受 5V 的负载，并验证探针重启后的重新枚举与锁释放。",
     "下次正式发布前修正发布器的默认 GitHub/Gitee 仓库参数。",
     "需要扩大分发证据时，在干净 Windows 环境复测安装更新和 USB Web Entry。"
