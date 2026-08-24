@@ -19,6 +19,7 @@ import re
 import socket
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 _ENV_ROOT = os.environ.get("HIL_CORE_LOCK_ROOT", "")
@@ -49,6 +50,47 @@ def _sanitize(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
 
 
+@contextmanager
+def _exclusive_guard(path: Path, timeout_s: float = 10.0):
+    """与 hil_core.lockd 相同的元操作 guard（owner 校验/删/建原子区）。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b")
+    acquired = False
+    try:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0"); handle.flush()
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:  # pragma: no cover
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"wait HIL lock guard timeout: {path}")
+                time.sleep(0.01)
+        yield
+    finally:
+        try:
+            if acquired:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:  # pragma: no cover
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
+
+
 class HilFileLock:
     """一次性获取/释放的租约文件锁；支持 with 语法与幂等 release。"""
 
@@ -57,6 +99,7 @@ class HilFileLock:
         self.name = name
         self.root = Path(root) if root is not None else LOCK_ROOT
         self.path = self.root / (_sanitize(name) + ".lock")
+        self.guard_path = self.path.with_name(self.path.name + ".guard")
         self.lease_s = float(lease_s)
         prefix = f"{purpose}-" if purpose else ""
         self.owner_id = owner_id or f"{prefix}{uuid.uuid4().hex[:12]}"
@@ -84,42 +127,43 @@ class HilFileLock:
     def acquire(self) -> "HilFileLock":
         self.root.mkdir(parents=True, exist_ok=True)
         data = json.dumps(self._payload()).encode("utf-8")
-        for _ in range(4):  # 回收竞争重试上限：创建成功者唯一
-            try:
-                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                holder = self._read()
-                if holder is None:
-                    # 损坏/残缺文件按崩溃处理：清除后重试
-                    try:
-                        self.path.unlink()
-                    except OSError:
-                        pass
-                    continue
-                if float(holder.get("expires_at", 0) or 0) < time.time():
-                    try:
-                        self.path.unlink()
+        with _exclusive_guard(self.guard_path):
+            for _ in range(4):  # guard 内回收并排他创建
+                try:
+                    fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                except FileExistsError:
+                    holder = self._read()
+                    if holder is None:
+                        try:
+                            self.path.unlink()
+                        except OSError:
+                            pass
                         continue
-                    except OSError:
-                        pass
-                raise HilLockHeld(self.name, holder)
-            try:
-                os.write(fd, data)
-            finally:
-                os.close(fd)
-            self._held = True
-            return self
+                    if float(holder.get("expires_at", 0) or 0) < time.time():
+                        try:
+                            self.path.unlink()
+                            continue
+                        except OSError:
+                            pass
+                    raise HilLockHeld(self.name, holder)
+                try:
+                    os.write(fd, data)
+                finally:
+                    os.close(fd)
+                self._held = True
+                return self
         raise HilLockHeld(self.name, self._read() or {})
 
     def release(self) -> bool:
         if not self._held:
             return False
-        holder = self._read()
-        if holder is not None and holder.get("owner_id") == self.owner_id:
-            try:
-                self.path.unlink()
-            except OSError:
-                pass
+        with _exclusive_guard(self.guard_path):
+            holder = self._read()
+            if holder is not None and holder.get("owner_id") == self.owner_id:
+                try:
+                    self.path.unlink()
+                except OSError:
+                    pass
         self._held = False
         return True
 
@@ -134,19 +178,20 @@ class HilFileLock:
             self.lease_s = float(lease_s)
         tmp = self.path.with_name(self.path.name + f".renew-{self.owner_id[:8]}")
         tmp.write_text(json.dumps(self._payload()), encoding="utf-8")
-        for attempt in range(5):  # Windows 杀毒/索引器可能短暂持锁
-            try:
-                current = self._read()
-                if current is None or current.get("owner_id") != self.owner_id:
-                    tmp.unlink()
-                    return False  # 所有权已丢失（过期被回收）
-                os.replace(tmp, self.path)
-                return True
-            except OSError:
-                if attempt == 4:
-                    tmp.unlink()
-                    return False
-                time.sleep(0.02)
+        with _exclusive_guard(self.guard_path):
+            for attempt in range(5):  # Windows 杀毒/索引器可能短暂持锁
+                try:
+                    current = self._read()
+                    if current is None or current.get("owner_id") != self.owner_id:
+                        tmp.unlink()
+                        return False
+                    os.replace(tmp, self.path)
+                    return True
+                except OSError:
+                    if attempt == 4:
+                        tmp.unlink()
+                        return False
+                    time.sleep(0.02)
         return False
 
     @property
