@@ -282,6 +282,26 @@ def test_tauri_bundle_includes_complete_third_party_license_texts():
     assert "http://unlicense.org/" in notices
 
 
+def test_tauri_bundle_integrates_mklink_usb_port_naming():
+    tauri_dir = PROJECT_ROOT / "gui" / "src-tauri"
+    config = json.loads((tauri_dir / "tauri.conf.json").read_text(encoding="utf-8"))
+    nsis = config["bundle"]["windows"]["nsis"]
+    hook = (tauri_dir / "installer-hooks.nsh").read_text(encoding="utf-8")
+
+    assert nsis["installMode"] == "perMachine"
+    assert nsis["installerHooks"] == "installer-hooks.nsh"
+    assert "NSIS_HOOK_PREINSTALL" in hook
+    assert "$LOCALAPPDATA\\Mklink AI Probe\\uninstall.exe" in hook
+    assert 'HKCU "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Mklink AI Probe"' in hook
+    assert 'HKLM "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Mklink AI Probe"' in hook
+    assert 'ReadRegStr $0 ${ROOT} "${KEY}" "UninstallString"' in hook
+    assert "NSIS_HOOK_POSTINSTALL" in hook
+    assert "Initializing MKLink USB serial port naming" in hook
+    assert "the helper still runs successfully" in hook
+    assert "--manage-usb-port-names apply" in hook
+    assert "$INSTDIR\\mklink-ai-probe.exe" in hook
+
+
 def test_stable_product_version_and_signed_updater_are_configured():
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     cargo = (PROJECT_ROOT / "gui" / "src-tauri" / "Cargo.toml").read_text(

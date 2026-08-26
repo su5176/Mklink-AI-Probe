@@ -109,7 +109,10 @@ def test_hpm_rom_backend_reads_via_dump_memory(monkeypatch) -> None:
             pass
 
     device = Device()
-    backend = HpmRomBackend(device_factory=lambda **_kwargs: device)
+    backend = HpmRomBackend(
+        device_factory=lambda **_kwargs: device,
+        port_resolver=lambda _probe: "probe-port",
+    )
     backend.connect(
         probe="probe",
         target="HPM5300",

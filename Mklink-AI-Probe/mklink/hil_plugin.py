@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import sys
 from contextlib import redirect_stdout
 from importlib.metadata import PackageNotFoundError, version
@@ -17,6 +16,7 @@ from typing import Any
 from serial.tools import list_ports
 
 from mklink.hil_lock import HilFileLock, HilLockHeld, transport_lock_name
+from mklink.usb_interfaces import usb_interface_number
 
 
 PROTOCOL = "hil-plugin-json-v1"
@@ -79,17 +79,6 @@ def _port_info(port: str):
     )
 
 
-def _interface_number(info: Any) -> str | None:
-    text = " ".join(
-        str(getattr(info, key, "") or "")
-        for key in ("hwid", "location", "interface")
-    ).strip()
-    match = re.search(r"(?i)MI[_-]?(\d+)", text)
-    if match is None:
-        match = re.search(r"(?i)(?:x\.|\.)(\d+)$", text)
-    return f"{int(match.group(1)):02d}" if match else None
-
-
 def _actual_identity(transport: dict[str, Any]) -> dict[str, str]:
     port = str(transport["port"])
     info = _port_info(port)
@@ -121,10 +110,11 @@ def _actual_identity(transport: dict[str, Any]) -> dict[str, str]:
         parts.append(f"vid_{actual_vid:04x}_pid_{actual_pid:04x}")
     if actual_serial:
         parts.append(f"sn_{actual_serial.casefold()}")
-    interface = _interface_number(info)
+    interface_number = usb_interface_number(info)
+    interface = f"{interface_number:02X}" if interface_number is not None else None
     expected_interface = str(transport.get("interface") or "").strip()
     if expected_interface:
-        expected_number = expected_interface.rsplit("_", 1)[-1].zfill(2)
+        expected_number = expected_interface.rsplit("_", 1)[-1].zfill(2).upper()
         if interface is None or interface != expected_number:
             raise ValueError("probe interface does not match bench identity")
     if interface:

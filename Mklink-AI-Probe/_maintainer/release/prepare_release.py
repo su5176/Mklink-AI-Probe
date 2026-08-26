@@ -20,7 +20,6 @@ PUBLIC_SKILL_DIRECTORIES = (
     PurePosixPath(".claude-plugin"),
     PurePosixPath("agents"),
     PurePosixPath("gui/dist"),
-    PurePosixPath("MK-Firmware"),
     PurePosixPath("mklink"),
     PurePosixPath("references"),
 )
@@ -29,6 +28,7 @@ PUBLIC_SKILL_FILES = {
     PurePosixPath("pyproject.toml"),
     PurePosixPath("README.md"),
     PurePosixPath("scripts/skill_update.py"),
+    PurePosixPath("scripts/win_usb_rename.ps1"),
     PurePosixPath("SKILL.md"),
 }
 
@@ -99,6 +99,7 @@ def _validate_skill_archive(path: Path, version: str) -> None:
             PurePosixPath(root, "SKILL.md"),
             PurePosixPath(root, ".claude-plugin", "plugin.json"),
             PurePosixPath(root, "scripts", "skill_update.py"),
+            PurePosixPath(root, "scripts", "win_usb_rename.ps1"),
         }
         if not required <= files:
             raise ValueError(

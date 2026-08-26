@@ -503,8 +503,8 @@ def _cli_project_init(project_root: str):
         if check.status == "upgrade_required":
             for line in check.instructions.splitlines():
                 print(line)
-        elif check.status == "no_firmware_dir":
-            print(f"[WARN] 找不到 MK-Firmware 目录 ({check.firmware_dir})，无法校验探针固件版本")
+        elif check.status in {"no_firmware", "manifest_unavailable"}:
+            print(f"[WARN] {check.instructions or '没有可用的探针固件'}")
         # ok / skipped 不打
     except Exception as e:
         print(f"[WARN] 探针固件版本检查异常：{e}", file=sys.stderr)
@@ -984,10 +984,7 @@ def _cli_systemview_analyze(project_root: str, port: str | None, duration: float
 
     ensure_rtt_config_updated(project_root)
     # 自动加载 axf（读 SystemCoreClock 做 µs 换算 + 任务名解析需要符号）
-    from pathlib import Path
-    axf = None
-    for p in Path(project_root).glob("build/**/*.axf"):
-        axf = str(p); break
+    axf = _systemview_symbol_source(project_root)
     print(f"[*] 连接 MKLink（端口: {port or '自动检测'}）…" + (f"  axf={axf}" if axf else "  [WARN] 未找到 axf，将无法换算 µs"))
     try:
         dev = mklink.connect(port=port, project_root=project_root, axf=axf)
@@ -1041,8 +1038,7 @@ def _cli_systemview_report(
     from mklink.systemview_report import generate_html_report
 
     ensure_rtt_config_updated(project_root)
-    axf = next(Path(project_root).glob("build/**/*.axf"), None)
-    axf = str(axf) if axf else None
+    axf = _systemview_symbol_source(project_root)
     print(f"[*] 连接 MKLink（端口: {port or '自动检测'}）…")
     try:
         dev = mklink.connect(port=port, project_root=project_root, axf=axf)
@@ -2291,6 +2287,19 @@ def _default_axf_from_project(project_root: str) -> str | None:
     if not project:
         return None
     return project.get("axf_path") or project.get("out_path")
+
+
+def _systemview_symbol_source(project_root: str) -> str | None:
+    from pathlib import Path
+
+    configured = _default_axf_from_project(project_root)
+    if configured and Path(configured).is_file():
+        return str(Path(configured))
+    for pattern in ("build/**/*.axf", "**/output/*.elf"):
+        candidate = next(Path(project_root).glob(pattern), None)
+        if candidate is not None:
+            return str(candidate)
+    return None
 
 
 def _project_root_from_args(args) -> str:

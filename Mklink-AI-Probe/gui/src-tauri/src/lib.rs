@@ -1,6 +1,8 @@
 mod site_agent_config;
 mod site_agent_network;
 mod site_agent_secret;
+#[cfg(target_os = "windows")]
+mod usb_port_naming;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -42,7 +44,7 @@ struct Sidecar {
     port: Mutex<Option<u16>>,
     instance_id: String,
     runtime_info_path: PathBuf,
-    project_root: String,
+    project_root: Mutex<String>,
     site_agent_root: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "windows")]
     job: Mutex<Option<JobHandle>>,
@@ -103,6 +105,10 @@ fn resolve_sidecar_launch() -> Result<SidecarLaunch, String> {
 
 fn default_project_root() -> String {
     ".".into()
+}
+
+fn desktop_workspace_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("workspace")
 }
 
 fn configured_site_agent_root(state: &Sidecar) -> Result<PathBuf, String> {
@@ -270,6 +276,61 @@ fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
         return Err("file path is empty".into());
     }
     std::fs::write(&target, contents).map_err(|error| error.to_string())
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn elevated_helper_arguments(executable: &Path, operation: &str) -> (String, String) {
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = format!("--manage-usb-port-names {}", operation);
+    (executable, arguments)
+}
+
+#[tauri::command]
+fn rename_usb_ports(action: String) -> Result<serde_json::Value, String> {
+    if action != "apply" && action != "restore" {
+        return Err("USB port naming action must be apply or restore".into());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("USB port naming is only available on Windows".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("cannot resolve desktop executable: {error}"))?;
+        let (file_path, child_arguments) = elevated_helper_arguments(&executable, &action);
+        // The helper itself performs identity validation, registry backup and
+        // write verification. Start-Process -Verb RunAs supplies the UAC
+        // boundary when the desktop app is running as a normal user.
+        let command = format!(
+            "$p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+            powershell_single_quote(&file_path),
+            powershell_single_quote(&child_arguments),
+        );
+        let status = Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .status()
+            .map_err(|error| format!("failed to start USB naming helper: {error}"))?;
+        let code = status.code().unwrap_or(1);
+        if code != 0 {
+            return Err(format!("USB port naming helper exited with code {code}"));
+        }
+        Ok(serde_json::json!({ "action": action, "status": "completed" }))
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_usb_port_naming_cli(action: &str) -> Result<serde_json::Value, String> {
+    serde_json::to_value(usb_port_naming::apply(action)?).map_err(|error| error.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -639,7 +700,14 @@ fn start_owned_sidecar(
     if !(DEFAULT_SIDECAR_PORT..=LAST_SIDECAR_PORT).contains(&port) {
         return Err("The preferred sidecar port is outside the desktop range".into());
     }
-    let project_root = project_root.unwrap_or_else(|| state.project_root.clone());
+    let project_root = match project_root {
+        Some(path) => path,
+        None => state
+            .project_root
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone(),
+    };
     let launch = resolve_sidecar_launch()?;
     let child = spawn_registered_sidecar(state, &launch, port, &project_root)?;
     *state.child.lock().map_err(|error| error.to_string())? = Some(child);
@@ -802,7 +870,7 @@ pub fn run() {
             port: Mutex::new(None),
             instance_id,
             runtime_info_path,
-            project_root: default_project_root(),
+            project_root: Mutex::new(default_project_root()),
             site_agent_root: Mutex::new(None),
             #[cfg(target_os = "windows")]
             job: Mutex::new(None),
@@ -821,8 +889,18 @@ pub fn run() {
             site_agent_stcp_credentials_configure,
             site_agent_bind_addresses,
             write_file,
+            rename_usb_ports,
         ])
         .setup(move |app| {
+            let workspace_root = desktop_workspace_root(&app.path().app_local_data_dir()?);
+            std::fs::create_dir_all(&workspace_root)?;
+            {
+                let state: State<Sidecar> = app.state();
+                *state
+                    .project_root
+                    .lock()
+                    .map_err(|error| error.to_string())? = workspace_root.to_string_lossy().into_owned();
+            }
             let site_agent_root = app.path().app_local_data_dir()?.join("site-agent");
             site_agent_config::ensure_root(&site_agent_root)?;
             {
@@ -973,6 +1051,32 @@ mod tests {
     }
 
     #[test]
+    fn installed_runtime_uses_a_user_writable_workspace() {
+        assert_eq!(
+            desktop_workspace_root(Path::new(r"C:\Users\test\AppData\Local\Mklink AI Probe")),
+            PathBuf::from(r"C:\Users\test\AppData\Local\Mklink AI Probe\workspace"),
+        );
+    }
+
+    #[test]
+    fn powershell_paths_are_single_quote_escaped() {
+        assert_eq!(
+            powershell_single_quote(r"C:\Program Files\Owner's MKLink\rename.ps1"),
+            r"'C:\Program Files\Owner''s MKLink\rename.ps1'"
+        );
+        assert_eq!(
+            elevated_helper_arguments(
+                Path::new(r"C:\Program Files\Mklink AI Probe\resources\rename.ps1"),
+                "restore",
+            ),
+            (
+                r"C:\Program Files\Mklink AI Probe\resources\rename.ps1".into(),
+                "--manage-usb-port-names restore".into(),
+            ),
+        );
+    }
+
+    #[test]
     fn health_check_requires_the_owning_desktop_instance() {
         let response = concat!(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
@@ -1041,7 +1145,7 @@ mod tests {
             port: Mutex::new(Some(DEFAULT_SIDECAR_PORT)),
             instance_id: "test-instance".into(),
             runtime_info_path: std::env::temp_dir().join("mklink-test-runtime-info.json"),
-            project_root: default_project_root(),
+            project_root: Mutex::new(default_project_root()),
             site_agent_root: Mutex::new(None),
             job: Mutex::new(Some(job)),
         };

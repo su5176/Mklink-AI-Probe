@@ -355,6 +355,7 @@ def test_quick_connect_restores_last_successful_device_inputs():
         mcu="stm32f103rc",
         project_root=state["project_root"],
         elf_backend="builtin",
+        initialize_target_now=False,
     )
     managers["superwatch"].prepare.assert_called_once_with(restored)
     assert state["device"] is restored

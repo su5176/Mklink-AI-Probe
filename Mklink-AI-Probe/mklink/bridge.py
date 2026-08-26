@@ -140,7 +140,7 @@ class MKLinkSerialBridge:
 
             if self._prompt_event.wait(timeout=sync_timeout):
                 self._ctx.state = DeviceState.READY
-                if self._verify_identity():
+                if self._is_known_command_port() or self._verify_identity():
                     return True
                 self.close()
                 return False
@@ -220,6 +220,26 @@ class MKLinkSerialBridge:
         self._port_lock.release()
         return False
 
+    def _is_known_command_port(self) -> bool:
+        """MI_04 is the fixed MKLink command interface on V2/V3/V4."""
+        try:
+            from serial.tools import list_ports
+            from mklink.usb_interfaces import (
+                MKLINK_COMMAND_INTERFACE,
+                is_mklink_usb_port,
+                usb_interface_number,
+            )
+            for info in list_ports.comports():
+                if str(getattr(info, "device", "")).casefold() != self._port.casefold():
+                    continue
+                return (
+                    is_mklink_usb_port(info)
+                    and usb_interface_number(info) == MKLINK_COMMAND_INTERFACE
+                )
+        except Exception:
+            pass
+        return False
+
     def close(self):
         """关闭串口连接并释放文件锁。"""
         self._running = False
@@ -233,6 +253,15 @@ class MKLinkSerialBridge:
         # 重置上下文
         self._ctx = DeviceContext()
         self._ctx.state = DeviceState.DISCONNECTED
+
+    def enter_bootloader(self) -> None:
+        """Ask the probe to switch to its UF2 bootloader and close CDC."""
+        if self._ctx.state not in (DeviceState.READY, DeviceState.BUSY):
+            raise ConnectionError("设备未就绪，请先连接命令端口")
+        try:
+            self.send_command_nowait("cmd.enter_bootloader()")
+        finally:
+            self.close()
 
     # ------------------------------------------------------------------
     # 命令发送

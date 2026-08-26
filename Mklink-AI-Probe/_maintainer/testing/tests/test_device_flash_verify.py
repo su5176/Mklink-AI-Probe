@@ -323,6 +323,27 @@ def test_device_flash_routes_hpm_bin_to_rom_api_without_flm(tmp_path: Path, monk
     ]
 
 
+def test_device_flash_does_not_apply_generic_reset_after_hpm_rom_programming(
+    tmp_path: Path,
+):
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"hpm")
+    device = _device(lambda _address, _size: b"")
+    device.reset = lambda: (_ for _ in ()).throw(
+        AssertionError("HPM must not use the generic SWD reset")
+    )
+
+    result = device.flash(
+        str(firmware),
+        target_part="HPM5301xEGx",
+        base_address=0x80000400,
+        board="hpm5301evklite",
+        verify=False,
+    )
+
+    assert result["reset_handled_by_rom_api"] is True
+
+
 def test_unknown_hpm_target_requires_board_or_flash_configuration(tmp_path: Path):
     firmware = tmp_path / "firmware.bin"
     firmware.write_bytes(b"hpm")

@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "mklink-ai-probe"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "base64 0.22.1",
  "get_if_addrs",
@@ -1929,6 +1929,7 @@ dependencies = [
  "tauri-plugin-updater",
  "windows",
  "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

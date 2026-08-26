@@ -96,7 +96,7 @@ def initialize_target(
     *,
     mcu_hint: str | None = None,
     project_root: str = ".",
-    timeout: float = 10.0,
+    timeout: float = 2.0,
 ) -> int:
     """Initialize the target SWD DP, read IDCODE, and match the MCU profile.
 
@@ -196,6 +196,7 @@ class Device:
         mcu: str | None = None,
         project_root: str = ".",
         elf_backend: str | None = None,
+        initialize_target_now: bool = True,
     ):
         self._port = port
         self._preferred_port = preferred_port
@@ -203,6 +204,7 @@ class Device:
         self._mcu_hint = mcu
         self._project_root = project_root
         self._elf_backend_requested = elf_backend
+        self._initialize_target_now = initialize_target_now
         self._elf_backend = None
         self._bridge = None
         self._flash = None
@@ -322,12 +324,13 @@ class Device:
         # 0. Doing it here fixes all of them at once. Tolerant: a missing
         # target leaves idcode at 0 rather than failing connect (see
         # initialize_target docstring).
-        initialize_target(
-            self._bridge,
-            self._flash,
-            mcu_hint=self._mcu_hint,
-            project_root=self._project_root,
-        )
+        if self._initialize_target_now:
+            initialize_target(
+                self._bridge,
+                self._flash,
+                mcu_hint=self._mcu_hint,
+                project_root=self._project_root,
+            )
 
         if self._axf:
             self._load_dwarf_info()
@@ -786,12 +789,13 @@ class Device:
                 raise DeviceError(f"Flash failed: {result}")
             result = dict(result)
             result["algorithm_source"] = "hpm-rom-api"
+            # The HPM ROM programming routine finishes with the target-specific
+            # RISC-V reset/resume sequence. A generic SWD reset can halt HPM.
+            result["reset_handled_by_rom_api"] = True
             result["verified"] = False
             if verify:
                 self._verify_firmware_readback(firmware, _fmt_hex(address))
                 result["verified"] = True
-            if reset_after:
-                self.reset()
             return result
 
         if resolved_target:
@@ -1838,6 +1842,7 @@ def connect(
     mcu: str | None = None,
     project_root: str = ".",
     elf_backend: str | None = None,
+    initialize_target_now: bool = True,
 ) -> Device:
     """Create and connect a Device.
 
@@ -1861,6 +1866,7 @@ def connect(
         mcu=mcu,
         project_root=project_root,
         elf_backend=elf_backend,
+        initialize_target_now=initialize_target_now,
     )
     dev._connect()
     # HIL-Infra lockd 协议互操作：connect 成功即持有 transport_usb-serial_<COM>，

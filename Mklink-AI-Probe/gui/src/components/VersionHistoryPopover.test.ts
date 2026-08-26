@@ -33,7 +33,7 @@ describe('VersionHistoryPopover', () => {
     expect(panel.text()).toContain('完整 AXF 路径')
     expect(panel.text()).toContain('内置 pyelftools')
     expect(panel.text()).toContain('避免污染 JSON-RPC')
-    expect(wrapper.findAll('[data-testid="release-entry"]')).toHaveLength(8)
+    expect(wrapper.findAll('[data-testid="release-entry"]')).toHaveLength(9)
     expect(wrapper.get('.release-entry.current').text()).toContain('v0.1.7')
     expect(wrapper.get('.current-badge').text()).toBe('当前版本')
     wrapper.unmount()

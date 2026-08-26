@@ -13,7 +13,8 @@
 python -m mklink serial list
 ```
 
-自动排除 MKLink 虚拟串口，只显示普通 UART 端口。
+自动排除 MKLink 的 `MI_04` Python Console 命令口；保留 `MI_02` USB to UART，
+并在 V4 上保留 `MI_06` USB to RS485，供通用串口或 Modbus 使用。
 
 ### 交互式终端
 

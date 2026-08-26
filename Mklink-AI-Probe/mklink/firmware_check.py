@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -22,7 +23,9 @@ _FIRMWARE_FILE_RE = re.compile(
     r"(?P<version>V(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+))\.uf2$"
 )
 FirmwareFamily = Literal["microlink", "hpmlink"]
-HPMLINK_DISK_MARKER = "STARTUP_ANIMATION.zhrgb"
+HPM_FIRMWARE_MARKER = re.compile(
+    r"(?im)^\s*HPM\s+Firmware\s+Build\s+Date\s*:"
+)
 
 # Firmware directory name (relative to repo/package root)
 FIRMWARE_DIR_NAME = "MK-Firmware"
@@ -34,7 +37,9 @@ FIRMWARE_DIR_ENV = "MKLINK_FIRMWARE_DIR"
 DEFAULT_VERSION_TIMEOUT = 5.0
 
 # Status of CheckResult
-CheckStatus = Literal["ok", "upgrade_required", "no_firmware_dir", "skipped"]
+CheckStatus = Literal[
+    "ok", "upgrade_required", "no_firmware", "manifest_unavailable", "skipped"
+]
 UpgradeStatus = Literal[
     "up_to_date",
     "updated",
@@ -76,7 +81,7 @@ class Version:
 
 @dataclass
 class FirmwareInfo:
-    """A single supported UF2 firmware file in MK-Firmware/."""
+    """A supported local UF2 or an entry from the online firmware channel."""
     name: str
     version: Version
     model: str  # "V3" | "V4"
@@ -84,6 +89,9 @@ class FirmwareInfo:
     family: FirmwareFamily = "microlink"
     download_url: str | None = None
     download_source: Literal["github", "gitee"] | None = None
+    download_urls: dict[str, str] | None = None
+    size: int | None = None
+    sha256: str | None = None
 
     @property
     def version_str(self) -> str:
@@ -137,16 +145,22 @@ def list_firmwares(root: Path) -> list[FirmwareInfo]:
     return result
 
 
+def _read_microkeen_readme(root: str | Path) -> str | None:
+    path = Path(root) / "readme.txt"
+    try:
+        return path.read_text(encoding="utf-8-sig", errors="replace")
+    except (OSError, UnicodeError):
+        return None
+
+
 def read_microkeen_version(root: str | Path) -> Version | None:
     """Read the active probe version from a MICROKEEN ``readme.txt``.
 
     The probe keeps a descending changelog in this file; the first semantic
     version is the build currently installed on the drive.
     """
-    path = Path(root) / "readme.txt"
-    try:
-        text = path.read_text(encoding="utf-8-sig", errors="replace")
-    except (OSError, UnicodeError):
+    text = _read_microkeen_readme(root)
+    if text is None:
         return None
     match = re.search(r"(?<![A-Za-z0-9])V(\d+)\.(\d+)\.(\d+)", text)
     if not match:
@@ -157,14 +171,11 @@ def read_microkeen_version(root: str | Path) -> Version | None:
 def probe_firmware_family(
     root: str | Path, current: Version | None = None,
 ) -> FirmwareFamily:
-    """Identify HPMLink only for V4 drives carrying the HPM marker file."""
+    """Identify HPMLink from the firmware identity line in ``readme.txt``."""
     if current is not None and current.major != 4:
         return "microlink"
-    return (
-        "hpmlink"
-        if (Path(root) / HPMLINK_DISK_MARKER).is_file()
-        else "microlink"
-    )
+    text = _read_microkeen_readme(root)
+    return "hpmlink" if text is not None and HPM_FIRMWARE_MARKER.search(text) else "microlink"
 
 
 def _probe_disk():
@@ -198,10 +209,77 @@ def _find_bootloader_disk() -> str | None:
     return None
 
 
-_REMOTE_RELEASES = {
-    "github": "https://api.github.com/repos/Aladdin-Wang/Mklink-AI-Probe/releases/latest",
-    "gitee": "https://gitee.com/api/v5/repos/Aladdin-Wang/Mklink-AI-Probe/releases/latest",
+FIRMWARE_MANIFEST_URLS = {
+    "github": "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/firmware/latest.json",
+    "gitee": "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/firmware/latest.json",
 }
+FIRMWARE_MANIFEST_SCHEMA = "mklink-firmware-v1"
+
+
+def _parse_manifest(payload: object) -> list[FirmwareInfo]:
+    """Validate the public manifest and return its firmware entries."""
+    if not isinstance(payload, dict) or payload.get("schema") != FIRMWARE_MANIFEST_SCHEMA:
+        raise ValueError("unsupported firmware manifest schema")
+    raw_entries = payload.get("firmwares")
+    if not isinstance(raw_entries, list):
+        raise ValueError("firmware manifest has no firmware list")
+    entries: list[FirmwareInfo] = []
+    seen: set[tuple[str, str]] = set()
+    for raw in raw_entries:
+        if not isinstance(raw, dict):
+            raise ValueError("invalid firmware manifest entry")
+        info = parse_firmware_filename(str(raw.get("name") or ""))
+        urls = raw.get("urls")
+        digest = str(raw.get("sha256") or "").lower()
+        size = raw.get("size")
+        if (
+            info is None
+            or raw.get("family") != info.family
+            or raw.get("model") != info.model
+            or raw.get("version") != info.version_str
+            or not isinstance(size, int)
+            or size <= 0
+            or not re.fullmatch(r"[0-9a-f]{64}", digest)
+            or not isinstance(urls, dict)
+        ):
+            raise ValueError("invalid firmware manifest entry")
+        clean_urls = {
+            source: str(urls[source])
+            for source in ("github", "gitee")
+            if isinstance(urls.get(source), str)
+            and str(urls[source]).startswith("https://")
+        }
+        if not clean_urls:
+            raise ValueError("firmware manifest entry has no HTTPS download URL")
+        key = (info.family, info.model)
+        if key in seen:
+            raise ValueError("duplicate firmware family/model in manifest")
+        seen.add(key)
+        info.path = Path(info.name)
+        info.size = size
+        info.sha256 = digest
+        info.download_urls = clean_urls
+        preferred = "github" if "github" in clean_urls else "gitee"
+        info.download_source = preferred
+        info.download_url = clean_urls[preferred]
+        entries.append(info)
+    return entries
+
+
+def _remote_firmwares_from_source(
+    source: Literal["github", "gitee"], *, timeout: float = 8.0,
+) -> list[FirmwareInfo] | None:
+    """Fetch one provider's complete firmware manifest; fail softly."""
+    try:
+        request = Request(
+            FIRMWARE_MANIFEST_URLS[source],
+            headers={"Accept": "application/json", "User-Agent": "mklink-ai-probe"},
+        )
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return _parse_manifest(payload)
+    except (OSError, URLError, ValueError, TypeError, json.JSONDecodeError):
+        return None
 
 
 def _remote_firmware_from_source(
@@ -211,30 +289,17 @@ def _remote_firmware_from_source(
     family: FirmwareFamily = "microlink",
     timeout: float = 8.0,
 ) -> FirmwareInfo | None:
-    """Find the newest same-model UF2 from one release provider."""
-    try:
-        request = Request(
-            _REMOTE_RELEASES[source],
-            headers={"Accept": "application/json", "User-Agent": "mklink-ai-probe"},
-        )
-        with urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        candidates: list[FirmwareInfo] = []
-        for asset in payload.get("assets") or []:
-            info = parse_firmware_filename(str(asset.get("name") or ""))
-            if info is None or info.model != model or info.family != family:
-                continue
-            info.download_url = str(
-                asset.get("browser_download_url")
-                or asset.get("download_url")
-                or ""
-            ) or None
-            if info.download_url:
-                info.download_source = source
-                candidates.append(info)
-        return max(candidates, key=lambda item: item.version) if candidates else None
-    except (OSError, URLError, ValueError, TypeError, json.JSONDecodeError):
+    """Find an exact family/model entry from one manifest provider."""
+    entries = _remote_firmwares_from_source(source, timeout=timeout)
+    if entries is None:
         return None
+    for info in entries:
+        if info.model == model and info.family == family:
+            if info.download_urls and source in info.download_urls:
+                info.download_source = source
+                info.download_url = info.download_urls[source]
+            return info
+    return None
 
 
 def _remote_firmware(
@@ -253,15 +318,31 @@ def _remote_firmware(
     return None
 
 
+def _remote_firmwares(*, timeout: float = 8.0) -> list[FirmwareInfo] | None:
+    """Fetch the complete index with GitHub-to-Gitee provider fallback."""
+    for source in ("github", "gitee"):
+        entries = _remote_firmwares_from_source(source, timeout=timeout)
+        if entries is not None:
+            for info in entries:
+                if info.download_urls and source in info.download_urls:
+                    info.download_source = source
+                    info.download_url = info.download_urls[source]
+            return entries
+    return None
+
+
 def _materialize_firmware(info: FirmwareInfo) -> tuple[Path, bool, str]:
     """Return a local UF2 path, ownership flag, and actual download source."""
     if info.download_url:
         handle, raw_path = tempfile.mkstemp(prefix="mklink-firmware-", suffix=".uf2")
         os.close(handle)
         destination = Path(raw_path)
-        downloads: list[tuple[str, str]] = [
-            (info.download_source or "github", info.download_url)
-        ]
+        preferred = info.download_source or "github"
+        downloads: list[tuple[str, str]] = [(preferred, info.download_url)]
+        for source in ("github", "gitee"):
+            url = (info.download_urls or {}).get(source)
+            if url and (source, url) not in downloads:
+                downloads.append((source, url))
         attempted_sources: list[str] = []
         last_error: Exception | None = None
         index = 0
@@ -274,11 +355,12 @@ def _materialize_firmware(info: FirmwareInfo) -> tuple[Path, bool, str]:
                 request = Request(url, headers={"User-Agent": "mklink-ai-probe"})
                 with urlopen(request, timeout=30) as response, destination.open("wb") as output:
                     shutil.copyfileobj(response, output, length=1024 * 1024)
+                _validate_downloaded_firmware(destination, info)
                 return destination, True, source
             except Exception as error:
                 last_error = error
                 destination.unlink(missing_ok=True)
-                if source == "github":
+                if source == "github" and not info.download_urls:
                     if "gitee" not in attempted_sources:
                         attempted_sources.append("gitee")
                     fallback = _remote_firmware_from_source(
@@ -296,6 +378,47 @@ def _materialize_firmware(info: FirmwareInfo) -> tuple[Path, bool, str]:
     return info.path, False, "local"
 
 
+def validate_uf2(path: str | Path) -> int:
+    """Validate UF2 framing and return its block count."""
+    path = Path(path)
+    size = path.stat().st_size
+    if size == 0 or size % 512:
+        raise ValueError("UF2 file size is not a non-zero multiple of 512 bytes")
+    expected_blocks = size // 512
+    with path.open("rb") as stream:
+        for index in range(expected_blocks):
+            block = stream.read(512)
+            if (
+                int.from_bytes(block[0:4], "little") != 0x0A324655
+                or int.from_bytes(block[4:8], "little") != 0x9E5D5157
+                or int.from_bytes(block[508:512], "little") != 0x0AB16F30
+            ):
+                raise ValueError(f"invalid UF2 magic in block {index}")
+            payload_size = int.from_bytes(block[16:20], "little")
+            block_number = int.from_bytes(block[20:24], "little")
+            total_blocks = int.from_bytes(block[24:28], "little")
+            if payload_size > 476 or block_number != index or total_blocks != expected_blocks:
+                raise ValueError(f"invalid UF2 metadata in block {index}")
+    return expected_blocks
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _validate_downloaded_firmware(path: Path, info: FirmwareInfo) -> None:
+    if info.size is not None and path.stat().st_size != info.size:
+        raise ValueError("downloaded firmware size does not match manifest")
+    if info.sha256 is not None and _file_sha256(path) != info.sha256:
+        raise ValueError("downloaded firmware SHA-256 does not match manifest")
+    if info.size is not None or info.sha256 is not None:
+        validate_uf2(path)
+
+
 def latest_firmware(
     model: str,
     firmware_root: Path,
@@ -306,8 +429,6 @@ def latest_firmware(
     if family == "hpmlink" and model != "V4":
         return None
     remote = _remote_firmware(model, family=family)
-    if remote is not None:
-        return remote
     try:
         local = [
             item for item in list_firmwares(firmware_root)
@@ -315,7 +436,8 @@ def latest_firmware(
         ]
     except (FileNotFoundError, NotADirectoryError, OSError):
         local = []
-    return max(local, key=lambda item: item.version) if local else None
+    candidates = ([remote] if remote is not None else []) + local
+    return max(candidates, key=lambda item: item.version) if candidates else None
 
 
 def _looks_like_bootloader(root: str | Path) -> bool:
@@ -338,11 +460,11 @@ def _wait_for_bootloader_drive(previous: str | None, timeout: float) -> str | No
 
 
 def upgrade_probe_firmware(
-    device: object,
+    device: object | None,
     firmware_root: Path,
     *,
     confirm: bool = False,
-    bootloader_timeout: float = 10.0,
+    bootloader_timeout: float = 20.0,
     verify_timeout: float = 20.0,
 ) -> dict:
     """Upgrade a connected probe through its UF2 bootloader drive."""
@@ -359,7 +481,16 @@ def upgrade_probe_firmware(
         f"V{current.major}", firmware_root, family=family,
     )
     if candidate is None:
-        return {"status": "no_firmware", "message": f"未找到 {current.major} 系列固件", "current_version": str(current)}
+        return {
+            "status": "no_firmware",
+            "message": (
+                "在线固件通道暂不可用，或尚未发布 "
+                f"{family} V{current.major} 固件"
+            ),
+            "current_version": str(current),
+            "model": f"V{current.major}",
+            "family": family,
+        }
     if candidate.version <= current:
         return {"status": "up_to_date", "current_version": str(current), "latest_version": candidate.version_str, "firmware": candidate.name}
     manual_details = {
@@ -374,7 +505,7 @@ def upgrade_probe_firmware(
     if not callable(enter):
         return {
             "status": "manual_required",
-            "message": "当前后端不支持自动进入 Bootloader",
+            "message": "未连接调试会话，请按住升级键进入 Bootloader 后复制该 UF2 文件",
             **manual_details,
         }
     try:
@@ -565,6 +696,7 @@ def _firmware_to_dict(f: FirmwareInfo) -> dict:
         "model": f.model,
         "family": f.family,
         "path": str(f.path),
+        "source": f.download_source or "local",
     }
 
 
@@ -601,12 +733,12 @@ def build_instructions(result: CheckResult) -> str:
 
     # 2. Tell the user which UF2 to use
     if result.recommended_uf2 is not None:
-        lines.append(f"     - {result.recommended_uf2.path}")
+        lines.append(f"     - {result.recommended_uf2.name}")
     elif result.current_version is not None and not result.recommended_uf2:
         # current known but no same-major firmware
         lines.append(
             f"     - （无 V{result.current_version.major} 同型号固件，"
-            "请检查 MK-Firmware/ 目录或联系维护者）"
+            "请检查在线固件通道或联系维护者）"
         )
     else:
         for f in result.all_uf2s:
@@ -629,29 +761,41 @@ def check_probe_firmware(
     Failure-soft: never raises. Any error → returns a CheckResult with
     a non-'ok' status. UI/CLI can inspect `status` and act accordingly.
     """
-    # Step 1: scan firmware directory
+    # Step 1: resolve the independent online channel, with a local development
+    # fallback. Installed builds intentionally do not carry MK-Firmware/.
+    remote_available = True
+    firmwares = _remote_firmwares()
     try:
-        firmwares = list_firmwares(firmware_root)
+        local_firmwares = list_firmwares(firmware_root)
     except (FileNotFoundError, NotADirectoryError, OSError):
-        return CheckResult(
-            status="no_firmware_dir",
-            current_version=None,
-            min_required_version=None,
-            recommended_uf2=None,
-            all_uf2s=[],
-            firmware_dir=Path(firmware_root),
-            instructions="",
+        local_firmwares = []
+    if firmwares is None:
+        remote_available = False
+        firmwares = local_firmwares
+    else:
+        remote_versions = {
+            (item.family, item.model, item.version) for item in firmwares
+        }
+        firmwares.extend(
+            item for item in local_firmwares
+            if (item.family, item.model, item.version) not in remote_versions
         )
-
     if not firmwares:
+        status: CheckStatus = (
+            "no_firmware" if remote_available else "manifest_unavailable"
+        )
         return CheckResult(
-            status="no_firmware_dir",
+            status=status,
             current_version=None,
             min_required_version=None,
             recommended_uf2=None,
             all_uf2s=[],
-            firmware_dir=Path(firmware_root),
-            instructions="",
+            firmware_dir=None if remote_available else Path(firmware_root),
+            instructions=(
+                "在线固件索引中没有可用固件"
+                if remote_available
+                else "无法连接 GitHub/Gitee 固件通道，且没有本地备用固件"
+            ),
         )
 
     # Step 2: prefer the version stamped in the mounted probe drive.  This is
@@ -661,17 +805,19 @@ def check_probe_firmware(
     if disk:
         current = read_microkeen_version(disk)
     family = probe_firmware_family(disk, current) if disk else "microlink"
-    firmwares = [item for item in firmwares if item.family == family]
+    all_firmwares = firmwares
+    firmwares = [item for item in all_firmwares if item.family == family]
     if not firmwares:
         return CheckResult(
-            status="no_firmware_dir",
+            status="no_firmware",
             current_version=current,
             min_required_version=None,
             recommended_uf2=None,
             all_uf2s=[],
-            firmware_dir=Path(firmware_root),
-            instructions="",
+            firmware_dir=None if remote_available else Path(firmware_root),
+            instructions=f"在线固件通道尚未发布 {family} 固件",
         )
+
     min_version = find_min_version(firmwares)
     assert min_version is not None
     if current is None:
@@ -682,7 +828,7 @@ def check_probe_firmware(
                 min_required_version=min_version,
                 recommended_uf2=None,
                 all_uf2s=firmwares,
-                firmware_dir=Path(firmware_root),
+                firmware_dir=None if remote_available else Path(firmware_root),
                 instructions="",
             )
         try:
@@ -693,48 +839,48 @@ def check_probe_firmware(
             if resolved_family != family:
                 family = resolved_family
                 firmwares = [
-                    item for item in list_firmwares(firmware_root)
-                    if item.family == family
+                    item for item in all_firmwares if item.family == family
                 ]
                 if not firmwares:
                     return CheckResult(
-                        status="no_firmware_dir",
+                        status="no_firmware",
                         current_version=current,
                         min_required_version=None,
                         recommended_uf2=None,
                         all_uf2s=[],
-                        firmware_dir=Path(firmware_root),
-                        instructions="",
+                        firmware_dir=None if remote_available else Path(firmware_root),
+                        instructions=f"在线固件通道尚未发布 {family} 固件",
                     )
                 min_version = find_min_version(firmwares)
                 assert min_version is not None
         except TimeoutError:
-            # E4: probe is too old to respond — treat as unknown version
             current = None
         except Exception:
-            # E8: other serial errors (ConnectionError, SerialException) — skip
             return CheckResult(
                 status="skipped",
                 current_version=None,
                 min_required_version=min_version,
                 recommended_uf2=None,
                 all_uf2s=firmwares,
-                firmware_dir=Path(firmware_root),
+                firmware_dir=None if remote_available else Path(firmware_root),
                 instructions="",
             )
 
-    # Step 3: decide
+    # Step 3: compare against the newest firmware for the exact hardware model.
     recommended = find_recommended_uf2(firmwares, current)
-    requires_upgrade = (current is None) or (current < min_version)
-    status: CheckStatus = "upgrade_required" if requires_upgrade else "ok"
+    required = recommended.version if recommended is not None else min_version
+    requires_upgrade = (current is None) or (
+        recommended is not None and current < recommended.version
+    )
+    status = "upgrade_required" if requires_upgrade else "ok"
 
     result = CheckResult(
         status=status,
         current_version=current,
-        min_required_version=min_version,
+        min_required_version=required,
         recommended_uf2=recommended,
         all_uf2s=firmwares,
-        firmware_dir=Path(firmware_root),
+        firmware_dir=None if remote_available else Path(firmware_root),
         instructions="",
     )
     if status == "upgrade_required":

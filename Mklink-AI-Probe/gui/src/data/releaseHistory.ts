@@ -9,6 +9,24 @@ export interface ReleaseHistoryEntry {
 
 export const releaseHistory: ReleaseHistoryEntry[] = [
   {
+    version: '0.1.8',
+    date: '2026-08-25',
+    summary: '新增探针固件升级与 USB 端口角色命名',
+    summaryEn: 'Added probe firmware upgrades and USB port role naming',
+    changes: [
+      '完善 MicroLink 与 HPMLink 探针固件检查、下载和升级流程，并使用独立固件更新通道。',
+      'V2/V3/V4 命令接口固定识别 MI_04，减少串口轮询并加快自动连接，同时保留身份验证与旧固件回退。',
+      '在 Windows 设备管理器中区分 MKLink USB to UART、MKLink Python Console，以及 V4 的 MKLink USB to RS485。',
+      '安装器自动处理已连接的 MKLink 端口；安装时未连接设备时，可在本地设备配置中修改或恢复端口名称。',
+    ],
+    changesEn: [
+      'Improve MicroLink and HPMLink probe firmware checks, downloads, and upgrades through a dedicated firmware update channel.',
+      'Identify MI_04 as the V2/V3/V4 command interface to reduce serial polling and speed up discovery while retaining identity checks and legacy fallback.',
+      'Distinguish MKLink USB to UART, MKLink Python Console, and the V4-only MKLink USB to RS485 in Windows Device Manager.',
+      'Rename connected MKLink ports during installation, with rename and restore actions in Local Device settings for probes connected later.',
+    ],
+  },
+  {
     version: '0.1.7',
     date: '2026-08-20',
     summary: '修复连接、在线读取与实时调试体验',

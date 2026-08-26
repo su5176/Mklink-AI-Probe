@@ -16,7 +16,6 @@ const mocks = vi.hoisted(() => {
     deviceStatus,
     api: {
       listPorts: vi.fn(),
-      discoverPort: vi.fn(),
       getConfig: vi.fn(),
       updateConfig: vi.fn(),
       connectDevice: vi.fn(),
@@ -31,6 +30,8 @@ const mocks = vi.hoisted(() => {
     wsDisconnect: vi.fn(),
     toastError: vi.fn(),
     toastSuccess: vi.fn(),
+    toastWarn: vi.fn(),
+    invoke: vi.fn(),
     loadDesktopSettings: vi.fn(),
     saveDesktopSettings: vi.fn(),
     pickSymbolFile: vi.fn(),
@@ -53,8 +54,12 @@ vi.mock('../composables/useMklinkWs', () => ({
 }))
 
 vi.mock('../composables/useToast', () => ({
-  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess }),
+  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess, warn: mocks.toastWarn }),
 }))
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
+
+vi.mock('../lib/runtimeEndpoint', () => ({ IS_TAURI: true }))
 
 vi.mock('../lib/desktopSettings', async importOriginal => ({
   ...await importOriginal<typeof import('../lib/desktopSettings')>(),
@@ -104,7 +109,6 @@ describe('ConfigView', () => {
       { device: 'TEST_PORT_A', description: 'MKLink A', manufacturer: 'MicroLink', vid: 1, pid: 2 },
       { device: 'TEST_PORT_B', description: 'MKLink', manufacturer: 'MicroLink', vid: 1, pid: 2 },
     ])
-    mocks.api.discoverPort.mockResolvedValue({ port: 'TEST_PORT_B' })
     mocks.api.getConfig.mockResolvedValue({ com_port: 'TEST_PORT_A', swd_clock: '2000000' })
     mocks.api.updateConfig.mockResolvedValue({})
     mocks.api.connectDevice.mockResolvedValue({})
@@ -124,6 +128,7 @@ describe('ConfigView', () => {
       version: 'V3.3.7',
       source: 'github',
     })
+    mocks.invoke.mockResolvedValue({ status: 'completed' })
     mocks.saveBlobFile.mockResolvedValue(true)
     mocks.loadDesktopSettings.mockReturnValue({
       version: 1,
@@ -158,6 +163,21 @@ describe('ConfigView', () => {
     expect(text).not.toContain('重启 MKLink')
     expect(wrapper.find('[data-testid="probe-controls"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="device-status"]').exists()).toBe(false)
+  })
+
+  it('runs elevated USB port rename and restore actions from the local panel', async () => {
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="rename-usb-ports"]').trigger('click')
+    await flushPromises()
+    expect(mocks.invoke).toHaveBeenCalledWith('rename_usb_ports', { action: 'apply' })
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('端口名称处理完成'))
+
+    await wrapper.get('[data-testid="restore-usb-ports"]').trigger('click')
+    await flushPromises()
+    expect(mocks.invoke).toHaveBeenCalledWith('rename_usb_ports', { action: 'restore' })
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('端口名称已恢复'))
+    expect(wrapper.get('[data-testid="usb-port-naming"]').exists()).toBe(true)
   })
 
   it('distinguishes readable variables from DWARF type definitions', async () => {
@@ -319,16 +339,15 @@ describe('ConfigView', () => {
       .toBe('TEST_PORT_B')
   })
 
-  it('automatically saves serial discovery and SWD changes without a save button', async () => {
+  it('automatically saves SWD changes without a save button or auto-discover action', async () => {
     const wrapper = await mountView()
 
-    await wrapper.get('[data-testid="auto-port"]').trigger('click')
+    expect(wrapper.find('[data-testid="auto-port"]').exists()).toBe(false)
     await wrapper.get('[data-testid="swd-clock"]').setValue('4000000')
     await flushPromises()
 
-    expect(mocks.api.discoverPort).toHaveBeenCalledOnce()
     expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
-      com_port: 'TEST_PORT_B',
+      com_port: 'TEST_PORT_A',
       swd_clock: '4000000',
     }))
     expect(wrapper.find('[data-testid="save-local"]').exists()).toBe(false)
@@ -526,7 +545,7 @@ describe('ConfigView', () => {
     expect(wrapper.find('[data-testid="launch-server"]').exists()).toBe(false)
   })
 
-  it('preserves the probe firmware upgrade warning', async () => {
+  it('keeps the firmware upgrade in its dedicated section without the legacy warning', async () => {
     mocks.api.probeFirmwareCheck.mockResolvedValue({
       status: 'upgrade_required',
       instructions: 'upgrade',
@@ -537,7 +556,14 @@ describe('ConfigView', () => {
 
     const wrapper = await mountView()
 
-    expect(wrapper.get('[data-testid="firmware-warning"]').text()).toContain('探针固件需要升级')
+    expect(wrapper.find('[data-testid="firmware-warning"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    expect(wrapper.get('[data-testid="firmware-upgrade-panel"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledWith(true)
   })
 
   it('shows the latest version and saves firmware after automatic update fails', async () => {

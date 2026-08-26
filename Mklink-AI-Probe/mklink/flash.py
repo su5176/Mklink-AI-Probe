@@ -130,7 +130,12 @@ class MKLinkFlash:
         """
         start = time.time()
         while time.time() - start < timeout:
-            resp = self._bridge.send_command("cmd.get_idcode()", echo=True)
+            remaining = max(0.1, timeout - (time.time() - start))
+            resp = self._bridge.send_command(
+                "cmd.get_idcode()",
+                timeout=min(5.0, remaining),
+                echo=True,
+            )
             # 解析多种格式:
             # - idcode = 0X2BA01477 (hex with prefix)
             # - idcode = 732195447 (decimal)

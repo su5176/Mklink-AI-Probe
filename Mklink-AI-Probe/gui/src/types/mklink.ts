@@ -393,12 +393,14 @@ export interface FirmwareInfo {
   model: 'V3' | 'V4'
   family: 'microlink' | 'hpmlink'
   path: string
+  source: 'github' | 'gitee' | 'local'
 }
 
 export type ProbeFirmwareCheckStatus =
   | 'ok'
   | 'upgrade_required'
-  | 'no_firmware_dir'
+  | 'no_firmware'
+  | 'manifest_unavailable'
   | 'skipped'
 
 export interface ProbeFirmwareCheck {

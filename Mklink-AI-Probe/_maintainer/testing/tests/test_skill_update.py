@@ -227,7 +227,12 @@ def test_copy_installed_skill_removes_legacy_maintainer_context(
     root = make_root(tmp_path / "installed", "0.1.2")
     legacy_files = [
         root / "_maintainer" / "testing" / "test_private.py",
+        root / ".pytest_cache" / "README.md",
+        root / "commands" / "maintainer.md",
         root / "docs" / "ai" / "project-memory.json",
+        root / "MK-Firmware" / "HPMLink_V4.3.7.uf2",
+        root / "mklink.egg-info" / "PKG-INFO",
+        root / "native" / "stcp_bridge" / "main.go",
         root / "skills" / "maintaining-mklink-ai-probe" / "SKILL.md",
         root / "AGENTS.md",
         root / "CLAUDE.md",
@@ -304,6 +309,25 @@ def test_desktop_update_is_not_skipped_when_skill_is_already_current(
     assert result["desktop"] == {"installed": True}
     assert len(observed) == 1
     assert "skill" not in result
+
+
+def test_desktop_installer_uses_its_per_machine_default(updater, monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"installer")
+    calls = []
+    monkeypatch.setattr(updater, "_port_in_use", lambda _port: False)
+    monkeypatch.setattr(updater, "_installed_app", lambda: (tmp_path / "Program Files", "0.1.8"))
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda arguments, check=False: calls.append((arguments, check))
+        or type("Completed", (), {"returncode": 0})(),
+    )
+
+    result = updater.install_desktop(installer)
+
+    assert calls == [([str(installer), "/S"], False)]
+    assert result["install_location"] == str(tmp_path / "Program Files")
 
 
 def test_skill_instructions_require_proactive_check_and_user_approval():

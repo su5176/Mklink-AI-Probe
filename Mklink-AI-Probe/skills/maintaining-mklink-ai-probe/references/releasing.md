@@ -117,3 +117,24 @@ asset set, sizes, and hashes. It then:
 Publishing `latest.json` last prevents clients from discovering an incomplete
 release. Never move a published tag. Documentation or tooling corrections after
 publication belong in later `master` commits or a new version.
+
+## Publish Probe Firmware Independently
+
+Probe UF2 updates are independent from application and Skill releases. Put the
+newly compiled file in `MK-Firmware/` using the exact
+`MicroLink_V<major>.<minor>.<patch>.uf2` or
+`HPMLink_V4.<minor>.<patch>.uf2` name, then run:
+
+```powershell
+python _maintainer/firmware/publish_firmware.py
+```
+
+The command validates UF2 framing, selects the newest file for each exact
+family/model, rejects version rollback and same-version content changes, and
+verifies the public GitHub/Gitee assets by size and SHA-256. It adds immutable
+files to the `firmware-assets` Release on both providers and force-publishes
+`firmware/latest.json` last. Re-running it with unchanged files is safe.
+
+Use `--dry-run` for local validation. Do not add UF2 files to the NSIS bundle or
+the public Skill archive; installed clients resolve the independent manifest
+with GitHub-to-Gitee fallback.

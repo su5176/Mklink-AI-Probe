@@ -1470,11 +1470,9 @@ def create_app(
 
         import mklink
 
-        # mklink.connect() now performs SWD DP init + IDCODE read + MCU match
-        # inside Device._connect (see mklink.device.initialize_target), so this
-        # endpoint no longer duplicates that work. Run the whole (potentially
-        # slow, hardware-touching) connect in a worker thread to avoid blocking
-        # the async event loop during cmd.get_idcode().
+        # Open the command port first. Target SWD/IDCODE initialization is
+        # intentionally deferred so a successful serial connection returns
+        # immediately; it is synchronized in the background below.
         loop = asyncio.get_event_loop()
 
         def _connect():
@@ -1485,6 +1483,7 @@ def create_app(
                 mcu=mcu,
                 project_root=_state["project_root"],
                 elf_backend=elf_backend,
+                initialize_target_now=False,
             )
 
         async with async_target_debug_lease(_state, "connect"):
@@ -1497,6 +1496,28 @@ def create_app(
         _state["dispatcher"] = DeviceDispatcher(device)
         await run_in_threadpool(get_managers()["superwatch"].prepare, device)
         remember_device_connection(_state, device, mcu=mcu)
+
+        async def _initialize_target_later():
+            try:
+                from mklink.device import initialize_target
+                async with async_target_debug_lease(_state, "connect-init"):
+                    if _state.get("device") is not device or not device.connected:
+                        return
+                    await run_in_threadpool(
+                        initialize_target,
+                        device._bridge,
+                        device._flash,
+                        mcu_hint=mcu,
+                        project_root=_state["project_root"],
+                    )
+                    remember_device_connection(_state, device, mcu=mcu)
+            except Exception:
+                # Target initialization is best effort; the command session is
+                # already usable and later status polling will expose 0/empty
+                # until a target becomes available.
+                return
+
+        asyncio.create_task(_initialize_target_later())
         return {
             "status": "connected",
             "mcu": device.mcu_name,
@@ -1504,6 +1525,7 @@ def create_app(
             "port": device.port,
             "axf_loaded": bool(getattr(device, "_dwarf_info", None)),
             "elf_backend": device.axf_status.get("elf_backend"),
+            "target_initializing": True,
         }
 
     async def _disconnect_shared_device() -> dict[str, object]:
@@ -1571,23 +1593,47 @@ def create_app(
 
     @app.post("/api/probe/firmware-upgrade")
     async def probe_firmware_upgrade(confirm: bool = Body(default=False)):
-        """Upgrade the connected probe through its UF2 bootloader drive."""
+        """Upgrade the probe through its UF2 bootloader drive.
+
+        The MICROKEEN volume is the source of truth for this operation.  A
+        debug-session connection is optional; when no session is connected the
+        endpoint still performs the disk/version check and returns the manual
+        UF2 details instead of rejecting the request at the API boundary.
+        """
         if confirm is not True:
             raise HTTPException(status_code=400, detail="firmware upgrade requires confirm=true")
         from mklink import firmware_check as _fc
 
         device = None
         try:
-            async with _exclusive_probe_control("firmware-upgrade") as (device, stopped):
-                root = _fc._resolve_firmware_root()
-                result = await run_in_threadpool(
-                    _fc.upgrade_probe_firmware,
-                    device,
-                    root,
-                    confirm=True,
-                )
-                result["stopped"] = stopped
-                return result
+            root = _fc._resolve_firmware_root()
+            if _state.get("device") and _state["device"].connected:
+                async with _exclusive_probe_control("firmware-upgrade") as (device, stopped):
+                    result = await run_in_threadpool(
+                        _fc.upgrade_probe_firmware,
+                        device,
+                        root,
+                        confirm=True,
+                    )
+                    result["stopped"] = stopped
+                    return result
+            def _upgrade_without_debug_session():
+                from mklink.bridge import MKLinkSerialBridge
+                from mklink.discovery import find_mklink_cdc_port
+
+                port = find_mklink_cdc_port()
+                if not port:
+                    return _fc.upgrade_probe_firmware(None, root, confirm=True)
+                bridge = MKLinkSerialBridge(port)
+                if not bridge.connect():
+                    bridge.close()
+                    return _fc.upgrade_probe_firmware(None, root, confirm=True)
+                try:
+                    return _fc.upgrade_probe_firmware(bridge, root, confirm=True)
+                finally:
+                    bridge.close()
+
+            return await run_in_threadpool(_upgrade_without_debug_session)
         except ValueError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         finally:
@@ -1628,7 +1674,10 @@ def create_app(
         if candidate is None:
             raise HTTPException(
                 status_code=404,
-                detail=f"未找到 {normalized_model} 系列固件",
+                detail=(
+                    "在线固件通道暂不可用，或尚未发布 "
+                    f"{normalized_family} {normalized_model} 固件"
+                ),
             )
         temporary = False
         path = None

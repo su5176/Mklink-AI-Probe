@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 import io
 import os
 from urllib.error import URLError
@@ -6,8 +7,21 @@ from urllib.error import URLError
 from mklink import firmware_check as fc
 
 
-def _readme(path: Path, version: str) -> None:
-    (path / "readme.txt").write_text(f"Firmware Build Date:test\n{version}\n", encoding="utf-8")
+def _valid_uf2(payload: bytes = b"firmware") -> bytes:
+    block = bytearray(512)
+    block[0:4] = (0x0A324655).to_bytes(4, "little")
+    block[4:8] = (0x9E5D5157).to_bytes(4, "little")
+    block[16:20] = len(payload).to_bytes(4, "little")
+    block[20:24] = (0).to_bytes(4, "little")
+    block[24:28] = (1).to_bytes(4, "little")
+    block[32:32 + len(payload)] = payload
+    block[508:512] = (0x0AB16F30).to_bytes(4, "little")
+    return bytes(block)
+
+
+def _readme(path: Path, version: str, *, family: str = "microlink") -> None:
+    marker = "HPM Firmware Build Date" if family == "hpmlink" else "Firmware Build Date"
+    (path / "readme.txt").write_text(f"{marker}:test\n{version}\n", encoding="utf-8")
 
 
 def test_read_microkeen_version_uses_first_changelog_version(tmp_path):
@@ -23,6 +37,65 @@ def test_parse_hpmlink_firmware_accepts_only_v4():
     assert info.model == "V4"
     assert info.version == fc.Version(4, 3, 7)
     assert fc.parse_firmware_filename("HPMLink_V3.3.7.uf2") is None
+
+
+def test_manifest_parser_requires_integrity_and_exact_hardware_identity():
+    content = _valid_uf2()
+    payload = {
+        "schema": fc.FIRMWARE_MANIFEST_SCHEMA,
+        "firmwares": [{
+            "family": "hpmlink",
+            "model": "V4",
+            "version": "V4.3.7",
+            "name": "HPMLink_V4.3.7.uf2",
+            "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "urls": {
+                "github": "https://github.example/HPMLink_V4.3.7.uf2",
+                "gitee": "https://gitee.example/HPMLink_V4.3.7.uf2",
+            },
+        }],
+    }
+
+    entries = fc._parse_manifest(payload)
+
+    assert len(entries) == 1
+    assert entries[0].family == "hpmlink"
+    assert entries[0].size == 512
+    assert entries[0].download_urls == payload["firmwares"][0]["urls"]
+
+
+def test_materialize_manifest_firmware_validates_and_falls_back(monkeypatch):
+    content = _valid_uf2(b"remote")
+    info = fc._parse_manifest({
+        "schema": fc.FIRMWARE_MANIFEST_SCHEMA,
+        "firmwares": [{
+            "family": "microlink", "model": "V3", "version": "V3.3.7",
+            "name": "MicroLink_V3.3.7.uf2", "size": len(content),
+            "sha256": hashlib.sha256(content).hexdigest(),
+            "urls": {
+                "github": "https://github.example/firmware.uf2",
+                "gitee": "https://gitee.example/firmware.uf2",
+            },
+        }],
+    })[0]
+    requested = []
+
+    def download(request, timeout):
+        requested.append(request.full_url)
+        if "github" in request.full_url:
+            raise URLError("unavailable")
+        return io.BytesIO(content)
+
+    monkeypatch.setattr(fc, "urlopen", download)
+    path, temporary, source = fc._materialize_firmware(info)
+    try:
+        assert temporary is True
+        assert source == "gitee"
+        assert path.read_bytes() == content
+        assert requested == [info.download_urls["github"], info.download_urls["gitee"]]
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def test_find_bootloader_disk_uses_uf2_marker(monkeypatch, tmp_path):
@@ -83,13 +156,13 @@ def test_upgrade_probe_firmware_copies_and_verifies(monkeypatch, tmp_path):
     assert (boot / firmware.name).read_bytes() == b"new-uf2"
 
 
-def test_upgrade_probe_firmware_selects_hpmlink_for_marked_v4_disk(
+def test_upgrade_probe_firmware_selects_hpmlink_for_hpm_readme(
     monkeypatch, tmp_path,
 ):
     disk = tmp_path / "disk"
     disk.mkdir()
-    _readme(disk, "V4.3.6")
-    (disk / fc.HPMLINK_DISK_MARKER).write_bytes(b"animation")
+    _readme(disk, "V4.3.6", family="hpmlink")
+    (disk / "STARTUP_ANIMATION.zhrgb").write_bytes(b"animation")
     boot = tmp_path / "boot"
     boot.mkdir()
     (boot / "INFO_UF2.TXT").write_text("UF2 Bootloader", encoding="ascii")
@@ -105,7 +178,7 @@ def test_upgrade_probe_firmware_selects_hpmlink_for_marked_v4_disk(
 
     class Device:
         def enter_bootloader(self):
-            _readme(disk, "V4.3.7")
+            _readme(disk, "V4.3.7", family="hpmlink")
 
     result = fc.upgrade_probe_firmware(
         Device(), firmware_root, confirm=True,
@@ -139,13 +212,45 @@ def test_upgrade_probe_firmware_keeps_microlink_for_unmarked_v4_disk(
     assert result["firmware"] == microlink.name
 
 
+def test_probe_firmware_family_ignores_animation_without_hpm_readme(tmp_path):
+    _readme(tmp_path, "V4.3.7")
+    (tmp_path / "STARTUP_ANIMATION.zhrgb").write_bytes(b"animation")
+    assert fc.probe_firmware_family(tmp_path, fc.Version(4, 3, 7)) == "microlink"
+
+
+def test_probe_firmware_family_requires_v4_even_with_hpm_readme(tmp_path):
+    _readme(tmp_path, "V3.3.7", family="hpmlink")
+    assert fc.probe_firmware_family(tmp_path, fc.Version(3, 3, 7)) == "microlink"
+
+
+def test_latest_firmware_prefers_newer_local_release_candidate(
+    monkeypatch, tmp_path,
+):
+    remote = fc.FirmwareInfo(
+        "HPMLink_V4.3.7.uf2",
+        fc.Version(4, 3, 7),
+        "V4",
+        Path("HPMLink_V4.3.7.uf2"),
+        family="hpmlink",
+        download_url="https://github.example/HPMLink_V4.3.7.uf2",
+    )
+    local = tmp_path / "HPMLink_V4.3.8.uf2"
+    local.write_bytes(b"candidate")
+    monkeypatch.setattr(fc, "_remote_firmware", lambda *args, **kwargs: remote)
+
+    candidate = fc.latest_firmware("V4", tmp_path, family="hpmlink")
+
+    assert candidate is not None
+    assert candidate.version == fc.Version(4, 3, 8)
+    assert candidate.path == local
+
+
 def test_firmware_check_filters_v4_candidates_by_probe_family(
     monkeypatch, tmp_path,
 ):
     disk = tmp_path / "disk"
     disk.mkdir()
-    _readme(disk, "V4.3.7")
-    (disk / fc.HPMLINK_DISK_MARKER).write_bytes(b"animation")
+    _readme(disk, "V4.3.7", family="hpmlink")
     firmware_root = tmp_path / "firmware"
     firmware_root.mkdir()
     (firmware_root / "MicroLink_V4.3.8.uf2").write_bytes(b"micro-uf2")
@@ -159,6 +264,32 @@ def test_firmware_check_filters_v4_candidates_by_probe_family(
     assert result.recommended_uf2 is not None
     assert result.recommended_uf2.name == hpmlink.name
     assert [item.name for item in result.all_uf2s] == [hpmlink.name]
+
+
+def test_firmware_check_includes_newer_local_release_candidate(
+    monkeypatch, tmp_path,
+):
+    disk = tmp_path / "disk"
+    disk.mkdir()
+    _readme(disk, "V4.3.7", family="hpmlink")
+    local = tmp_path / "HPMLink_V4.3.8.uf2"
+    local.write_bytes(b"candidate")
+    remote = fc.FirmwareInfo(
+        "HPMLink_V4.3.7.uf2",
+        fc.Version(4, 3, 7),
+        "V4",
+        Path("HPMLink_V4.3.7.uf2"),
+        family="hpmlink",
+        download_url="https://github.example/HPMLink_V4.3.7.uf2",
+    )
+    monkeypatch.setattr(fc, "_probe_disk", lambda: str(disk))
+    monkeypatch.setattr(fc, "_remote_firmwares", lambda: [remote])
+
+    result = fc.check_probe_firmware(None, tmp_path)
+
+    assert result.status == "upgrade_required"
+    assert result.recommended_uf2 is not None
+    assert result.recommended_uf2.path == local
 
 
 def test_materialize_firmware_falls_back_from_github_to_gitee(monkeypatch):
@@ -249,7 +380,7 @@ def test_manual_upgrade_result_includes_latest_download_details(monkeypatch, tmp
 
     assert result == {
         "status": "manual_required",
-        "message": "当前后端不支持自动进入 Bootloader",
+        "message": "未连接调试会话，请按住升级键进入 Bootloader 后复制该 UF2 文件",
         "current_version": "V3.3.6",
         "latest_version": "V3.3.7",
         "firmware": "MicroLink_V3.3.7.uf2",

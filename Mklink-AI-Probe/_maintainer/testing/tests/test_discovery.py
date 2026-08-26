@@ -12,6 +12,8 @@ def port(
     pid=None,
     manufacturer="",
     serial_number=None,
+    location="",
+    interface=None,
 ):
     return SimpleNamespace(
         device=device,
@@ -20,7 +22,86 @@ def port(
         pid=pid,
         manufacturer=manufacturer,
         serial_number=serial_number,
+        location=location,
+        interface=interface,
     )
+
+
+def test_discovery_selects_mi04_without_opening_other_interfaces(monkeypatch):
+    ports = [
+        port(
+            "COM54",
+            hwid="USB VID:PID=0D28:0202 LOCATION=1-2:x.2",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="probe-v4",
+            location="1-2:x.2",
+        ),
+        port(
+            "COM55",
+            hwid="USB VID:PID=0D28:0202 LOCATION=1-2:x.4",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="probe-v4",
+            location="1-2:x.4",
+        ),
+        port(
+            "COM56",
+            hwid="USB VID:PID=0D28:0202 LOCATION=1-2:x.6",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="probe-v4",
+            location="1-2:x.6",
+        ),
+    ]
+    monkeypatch.setattr(discovery.list_ports, "comports", lambda: ports)
+    monkeypatch.setattr(
+        discovery,
+        "_probe_port",
+        lambda _device: (_ for _ in ()).throw(
+            AssertionError("descriptor-based discovery must not open a port")
+        ),
+    )
+
+    assert discovery.find_mklink_cdc_port() == "COM55"
+    assert discovery.find_mklink_cdc_port(serial_number="PROBE-V4") == "COM55"
+
+
+def test_discovery_uses_mi04_from_the_requested_composite_device(monkeypatch):
+    ports = [
+        port(
+            "COM739",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="probe-v3",
+            location="1-1.2:x.4",
+        ),
+        port(
+            "COM55",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="probe-v4",
+            location="1-2:x.4",
+        ),
+    ]
+    monkeypatch.setattr(discovery.list_ports, "comports", lambda: ports)
+
+    assert discovery.find_mklink_cdc_port(serial_number="probe-v4") == "COM55"
+
+
+def test_discovery_keeps_automatic_fallback_for_a_logical_probe_id(monkeypatch):
+    ports = [
+        port(
+            "COM55",
+            vid=0x0D28,
+            pid=0x0202,
+            serial_number="usb-serial",
+            location="1-2:x.4",
+        ),
+    ]
+    monkeypatch.setattr(discovery.list_ports, "comports", lambda: ports)
+
+    assert discovery.find_mklink_cdc_port(serial_number="logical-probe-id") == "COM55"
 
 
 def test_discovery_probes_usb_before_virtual_and_skips_bluetooth(monkeypatch):

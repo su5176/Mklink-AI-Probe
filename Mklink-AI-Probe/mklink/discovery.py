@@ -18,6 +18,11 @@ from mklink._types import (
     MKLINK_IDENTITY_TOKEN,
     PROMPT,
 )
+from mklink.usb_interfaces import (
+    MKLINK_COMMAND_INTERFACE,
+    is_mklink_usb_port,
+    usb_interface_number,
+)
 
 # MICROKEEN 磁盘名称
 _MICROKEEN_DISK_NAME = "MICROKEEN"
@@ -87,9 +92,9 @@ def find_mklink_cdc_port(
 ) -> str | None:
     """自动扫描并识别 MicroLink 的 USB CDC 虚拟串口。
 
-    优先使用 USB 设备描述符匹配，然后清理设备端残留输入并执行唯一
-    身份命令；读取在看到 ">>>" 提示符时立即返回。
-    逐端口顺序探测，不并发。
+    新版 V2/V3/V4 固件固定使用 MI_04 作为命令接口，因此有完整 USB
+    接口元数据时直接返回该端口。旧固件或元数据缺失时仍逐端口执行
+    唯一身份命令，不并发探测。
     """
     excluded = {str(port).strip().casefold() for port in (exclude_ports or set())}
     ports = [
@@ -99,30 +104,21 @@ def find_mklink_cdc_port(
     ]
     requested_serial = str(serial_number or "").strip().casefold()
     if requested_serial:
-        matching = [
+        matching_ports = [
             port_info for port_info in ports
             if str(getattr(port_info, "serial_number", "") or "").strip().casefold()
             == requested_serial
         ]
-        if matching:
-            # Composite USB devices expose several CDC interfaces with the
-            # same serial number.  Only one is the MKLink command bridge;
-            # identify it by the protocol handshake instead of enumeration
-            # order (which can change when COM numbers are reassigned).
-            if len(matching) == 1:
-                return matching[0].device
-            for port_info in matching:
-                if _probe_port(port_info.device):
-                    return port_info.device
-            return None
+        if matching_ports:
+            ports = matching_ports
 
-    # 优先：USB 描述符匹配（精确匹配，避免 "Microsoft" 误命中）
-    for port_info in ports:
-        mfr = (port_info.manufacturer or "").lower()
-        if mfr and ("microkeen" in mfr or "microlink" in mfr or "mklink" in mfr):
-            return port_info.device
-        if port_info.vid and (port_info.vid, port_info.pid) in KNOWN_MKLINK_VID_PIDS:
-            return port_info.device
+    command_ports = [
+        port_info for port_info in ports
+        if is_mklink_usb_port(port_info)
+        and usb_interface_number(port_info) == MKLINK_COMMAND_INTERFACE
+    ]
+    if command_ports:
+        return command_ports[0].device
 
     # 单轮扫描，每端口执行残留行清理和身份确认
     # Probe physical USB serial ports first. Bluetooth RFCOMM opens can block
@@ -131,10 +127,23 @@ def find_mklink_cdc_port(
         port_info for port_info in ports
         if not str(getattr(port_info, "hwid", "") or "").upper().startswith("BTHENUM")
     ]
-    probe_candidates.sort(key=lambda port_info: 0 if (
-        getattr(port_info, "vid", None) is not None
-        or str(getattr(port_info, "hwid", "") or "").upper().startswith("USB")
-    ) else 1)
+    def probe_priority(port_info: object) -> int:
+        mfr = str(getattr(port_info, "manufacturer", "") or "").lower()
+        if any(name in mfr for name in ("microkeen", "microlink", "mklink")):
+            return 0
+        if (
+            getattr(port_info, "vid", None),
+            getattr(port_info, "pid", None),
+        ) in KNOWN_MKLINK_VID_PIDS:
+            return 0
+        if (
+            getattr(port_info, "vid", None) is not None
+            or str(getattr(port_info, "hwid", "") or "").upper().startswith("USB")
+        ):
+            return 1
+        return 2
+
+    probe_candidates.sort(key=probe_priority)
 
     for port_info in probe_candidates:
         if _probe_port(port_info.device):

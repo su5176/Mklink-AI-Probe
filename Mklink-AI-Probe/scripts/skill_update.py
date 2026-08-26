@@ -33,8 +33,13 @@ DEFAULT_MANIFEST_URLS = (
 USER_AGENT = "Mklink-AI-Probe-Skill-Updater"
 MANAGED_CONTENT_ROOTS = (
     PurePosixPath("_maintainer"),
+    PurePosixPath(".pytest_cache"),
+    PurePosixPath("commands"),
     PurePosixPath("docs/ai"),
     PurePosixPath("gui/dist"),
+    PurePosixPath("MK-Firmware"),
+    PurePosixPath("mklink.egg-info"),
+    PurePosixPath("native"),
     PurePosixPath("skills"),
 )
 MANAGED_CONTENT_FILES = {
@@ -348,12 +353,10 @@ def install_desktop(installer: Path) -> dict[str, object]:
     if _port_in_use(8765):
         raise RuntimeError("close Mklink AI Probe and its local service before installing the update")
     arguments = ["/S"]
-    location, _version = _installed_app()
-    if location is not None:
-        arguments.append(f"/D={location}")
     completed = subprocess.run([str(installer), *arguments], check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"desktop installer exited with code {completed.returncode}")
+    location, _version = _installed_app()
     return {"installed": True, "install_location": str(location) if location else None}
 
 

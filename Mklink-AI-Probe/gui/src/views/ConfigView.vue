@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, onMounted } from 'vue'
-import { Download, RefreshCw, Search, TriangleAlert, Unplug, Usb } from '@lucide/vue'
+import { Download, RefreshCw, RotateCcw, Tag, Unplug, Usb } from '@lucide/vue'
+import { invoke } from '@tauri-apps/api/core'
 import { useMklinkApi } from '../composables/useMklinkApi'
 import { useMklinkWs } from '../composables/useMklinkWs'
 import { useToast } from '../composables/useToast'
@@ -15,15 +16,14 @@ import {
 } from '../lib/desktopSettings'
 import { pickMapFile, pickSymbolFile, type PickedFile } from '../lib/filePicker'
 import { saveBlobFile } from '../lib/downloadTextFile'
+import { IS_TAURI } from '../lib/runtimeEndpoint'
 import type { AxlStatus, FileSourceKind, PortInfo, ProbeFirmwareCheck, ProbeFirmwareUpgrade, ProjectConfig } from '../types/mklink'
 import ConfigSectionNav, { type ConfigSection } from '../components/config/ConfigSectionNav.vue'
 import FileSourcesPanel from '../components/config/FileSourcesPanel.vue'
-import FirmwareUpdateModal from '../components/config/FirmwareUpdateModal.vue'
 
 const {
   deviceStatus,
   listPorts,
-  discoverPort,
   getConfig,
   updateConfig,
   uploadFileSource,
@@ -60,12 +60,12 @@ const serveConfig = reactive({ host: '127.0.0.1', port: 8765, token: '' })
 const launching = ref(false)
 
 const firmwareCheck = ref<ProbeFirmwareCheck | null>(null)
-const showFirmwareModal = ref(false)
 const firmwareUpgrading = ref(false)
 const firmwareUpgradeStatus = ref('')
 const firmwareUpgradeResult = ref<ProbeFirmwareUpgrade | null>(null)
 const firmwareDownloading = ref(false)
 const firmwareDownloadStatus = ref('')
+const usbNamingAction = ref<'idle' | 'apply' | 'restore'>('idle')
 const manualFirmwareUpgrade = computed(() => {
   const result = firmwareUpgradeResult.value
   if (!result || result.status === 'updated' || result.status === 'up_to_date') return null
@@ -84,22 +84,6 @@ async function refreshPorts() {
     }))
   } catch (error: any) {
     toast.error(tr('读取串口失败: ', 'Failed to read serial ports: ') + error.message)
-  } finally {
-    portsLoading.value = false
-  }
-}
-
-async function autoDiscover() {
-  portsLoading.value = true
-  try {
-    const result = await discoverPort()
-    if (result.port) {
-      localPort.value = result.port
-      localPortExplicit.value = false
-      await saveLocalConfig()
-    }
-  } catch (error: any) {
-    toast.error(tr('自动检测失败: ', 'Auto-detection failed: ') + error.message)
   } finally {
     portsLoading.value = false
   }
@@ -126,12 +110,25 @@ async function saveLocalConfig() {
   }
   savingLocal.value = true
   localSaveState.value = 'saving'
+  const payload = {
+    ...config.value,
+    com_port: localPort.value.trim(),
+    swd_clock: rawClock || undefined,
+  }
   try {
-    config.value = await updateConfig({
-      ...config.value,
-      com_port: localPort.value.trim(),
-      swd_clock: rawClock || undefined,
-    })
+    let lastError: any
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        config.value = await updateConfig(payload)
+        lastError = null
+        break
+      } catch (error: any) {
+        lastError = error
+        if (error?.message !== 'Failed to fetch' || attempt === 2) throw error
+        await new Promise(resolve => window.setTimeout(resolve, 200 * (attempt + 1)))
+      }
+    }
+    if (lastError) throw lastError
     localSaveState.value = 'saved'
   } catch (error: any) {
     localSaveState.value = 'idle'
@@ -182,6 +179,32 @@ async function disconnectLocal() {
     toast.error(tr('断开失败: ', 'Disconnect failed: ') + error.message)
   } finally {
     disconnecting.value = false
+  }
+}
+
+async function renameUsbPorts(action: 'apply' | 'restore') {
+  if (!IS_TAURI) {
+    toast.warn(tr('端口名称管理仅支持 Windows 桌面版', 'Port naming is available only in the Windows desktop app'))
+    return
+  }
+  if (usbNamingAction.value !== 'idle') return
+  const restoring = action === 'restore'
+  const prompt = restoring
+    ? tr('将恢复已由 MKLink 修改的端口显示名称，并请求管理员权限。继续吗？', 'This restores MKLink port display names and requests administrator permission. Continue?')
+    : tr('将严格识别当前在线的 MKLink V2/V3/V4 端口并修改显示名称，需要管理员权限。继续吗？', 'This verifies connected MKLink V2/V3/V4 ports and changes their display names. Administrator permission is required. Continue?')
+  if (!window.confirm(prompt)) return
+
+  usbNamingAction.value = action
+  try {
+    await invoke('rename_usb_ports', { action })
+    toast.success(restoring
+      ? tr('端口名称已恢复；如设备管理器未刷新，请重新插拔下载器。', 'Port names restored; reconnect the probe if Device Manager has not refreshed.')
+      : tr('端口名称处理完成；如设备管理器未刷新，请重新插拔下载器。', 'Port naming completed; reconnect the probe if Device Manager has not refreshed.'))
+    await refreshPorts()
+  } catch (error: any) {
+    toast.error((restoring ? tr('恢复端口名称失败: ', 'Failed to restore port names: ') : tr('修改端口名称失败: ', 'Failed to rename ports: ')) + (error?.message || error))
+  } finally {
+    usbNamingAction.value = 'idle'
   }
 }
 
@@ -286,22 +309,23 @@ function launchServer() {
   launching.value = false
 }
 
-async function recheckFirmware(openModal = true) {
+async function recheckFirmware() {
   try {
     firmwareCheck.value = await probeFirmwareCheck()
-    if (openModal && firmwareCheck.value.status === 'upgrade_required') {
-      showFirmwareModal.value = true
-    }
   } catch {
     // Firmware checks are advisory and must not block configuration.
   }
 }
 
 async function upgradeFirmware() {
-  if (firmwareUpgrading.value || !deviceStatus.value.connected) return
+  if (firmwareUpgrading.value) return
   if (!window.confirm(tr(
-    '将让探针进入 Bootloader 并重启连接，随后自动复制 UF2 固件。继续吗？',
-    'The probe will enter Bootloader and restart its connection before copying the UF2 firmware. Continue?',
+    deviceStatus.value.connected
+      ? '将让探针进入 Bootloader 并重启连接，随后自动复制 UF2 固件。继续吗？'
+      : '将读取 MICROKEEN U 盘并检查固件；若未连接命令端口，请按住升级键手动进入 Bootloader。继续吗？',
+    deviceStatus.value.connected
+      ? 'The probe will enter Bootloader and restart its connection before copying the UF2 firmware. Continue?'
+      : 'The MICROKEEN drive will be checked; without a command-port session, hold the upgrade button to enter Bootloader manually. Continue?',
   ))) return
   firmwareUpgrading.value = true
   firmwareUpgradeResult.value = null
@@ -323,7 +347,7 @@ async function upgradeFirmware() {
       firmwareUpgradeStatus.value = result.message || tr('未完成自动升级，请按提示手动升级', 'Automatic update did not complete; follow the manual update instructions')
       toast.error(firmwareUpgradeStatus.value)
     }
-    await recheckFirmware(false)
+    await recheckFirmware()
   } catch (error: any) {
     firmwareUpgradeStatus.value = error?.message || tr('固件升级失败', 'Firmware update failed')
     toast.error(firmwareUpgradeStatus.value)
@@ -366,7 +390,10 @@ async function downloadFirmware() {
 }
 
 onMounted(async () => {
-  await Promise.all([refreshPorts(), loadConfig(), recheckFirmware(false)])
+  // Firmware status is checked from the dedicated upgrade action. Avoid a
+  // network manifest lookup during login so the local connection controls are
+  // immediately responsive.
+  await Promise.all([refreshPorts(), loadConfig()])
   const restoredPort = localPort.value.trim()
   if (restoredPort && !portOptions.value.some(option => option.value === restoredPort)) {
     localPort.value = ''
@@ -395,6 +422,9 @@ onMounted(async () => {
             {{ deviceStatus.connected ? tr('已连接', 'Connected') : tr('未连接', 'Disconnected') }}
           </span>
         </header>
+        <div v-if="deviceStatus.connected && deviceStatus.port" class="connection-detail" data-testid="connected-port">
+          {{ tr('当前串口：', 'Connected port: ') }}{{ deviceStatus.port }}
+        </div>
 
         <div class="form-row">
           <label class="form-label" for="local-port">{{ tr('串口', 'Serial Port') }}</label>
@@ -413,16 +443,6 @@ onMounted(async () => {
             @click="refreshPorts"
           >
             <RefreshCw :size="14" aria-hidden="true" />
-          </button>
-          <button
-            class="btn btn-sm icon-command"
-            type="button"
-            data-testid="auto-port"
-            :disabled="portsLoading"
-            @click="autoDiscover"
-          >
-            <Search :size="14" aria-hidden="true" />
-            {{ tr('自动', 'Auto') }}
           </button>
         </div>
 
@@ -465,6 +485,30 @@ onMounted(async () => {
           >
             <Unplug :size="15" aria-hidden="true" />
             {{ disconnecting ? tr('断开中...', 'Disconnecting...') : tr('断开', 'Disconnect') }}
+          </button>
+        </div>
+
+        <div v-if="IS_TAURI" class="port-naming-actions" data-testid="usb-port-naming">
+          <span class="form-hint">{{ tr('设备管理器端口显示名称', 'Device Manager port display names') }}</span>
+          <button
+            class="btn btn-sm icon-command"
+            type="button"
+            data-testid="rename-usb-ports"
+            :disabled="usbNamingAction !== 'idle'"
+            @click="renameUsbPorts('apply')"
+          >
+            <Tag :size="14" aria-hidden="true" />
+            {{ usbNamingAction === 'apply' ? tr('处理中...', 'Working...') : tr('修改端口名称', 'Rename ports') }}
+          </button>
+          <button
+            class="btn btn-sm icon-command"
+            type="button"
+            data-testid="restore-usb-ports"
+            :disabled="usbNamingAction !== 'idle'"
+            @click="renameUsbPorts('restore')"
+          >
+            <RotateCcw :size="14" aria-hidden="true" />
+            {{ usbNamingAction === 'restore' ? tr('处理中...', 'Working...') : tr('恢复名称', 'Restore names') }}
           </button>
         </div>
 
@@ -548,7 +592,7 @@ onMounted(async () => {
           <span v-if="firmwareCheck?.current_version" class="firmware-version">{{ firmwareCheck.current_version }}</span>
         </header>
         <div class="firmware-upgrade-content">
-          <button class="btn" type="button" data-testid="upgrade-firmware" :disabled="firmwareUpgrading || !deviceStatus.connected" @click="upgradeFirmware">
+          <button class="btn" type="button" data-testid="upgrade-firmware" :disabled="firmwareUpgrading" @click="upgradeFirmware">
             {{ firmwareUpgrading ? tr('升级中...', 'Updating...') : tr('检查并升级固件', 'Check and Update Firmware') }}
           </button>
           <div v-if="manualFirmwareUpgrade" class="manual-firmware-download" data-testid="manual-firmware-download">
@@ -566,23 +610,6 @@ onMounted(async () => {
       </section>
     </main>
 
-    <div
-      v-if="firmwareCheck?.status === 'upgrade_required'"
-      class="firmware-banner"
-      data-testid="firmware-warning"
-    >
-      <TriangleAlert :size="18" aria-hidden="true" />
-      <span>{{ tr('探针固件需要升级', 'Probe firmware update required') }}</span>
-      <button class="btn btn-sm" type="button" @click="showFirmwareModal = true">{{ tr('查看升级步骤', 'View Update Steps') }}</button>
-      <button class="btn btn-sm" type="button" @click="recheckFirmware(true)">{{ tr('重新检测', 'Check Again') }}</button>
-    </div>
-
-    <FirmwareUpdateModal
-      v-if="showFirmwareModal && firmwareCheck"
-      :check="firmwareCheck"
-      @close="showFirmwareModal = false"
-      @recheck="recheckFirmware(true)"
-    />
   </div>
 </template>
 
@@ -596,6 +623,12 @@ onMounted(async () => {
 
 .section-content {
   min-width: 0;
+}
+
+.connection-detail {
+  margin: -2px 0 10px;
+  color: var(--muted);
+  font: 12px var(--font-mono);
 }
 
 .local-panel,
@@ -703,6 +736,20 @@ onMounted(async () => {
   margin: 18px 0 20px 110px;
 }
 
+.port-naming-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin: 0 0 8px 110px;
+}
+
+.port-naming-actions .form-hint {
+  color: var(--dim);
+  font-size: 12px;
+  margin-right: 4px;
+}
+
 .auto-save-state {
   color: var(--dim);
   font-size: 12px;
@@ -754,7 +801,8 @@ onMounted(async () => {
   }
 
   .local-actions,
-  .panel-actions {
+  .panel-actions,
+  .port-naming-actions {
     margin-left: 0;
     flex-wrap: wrap;
   }
