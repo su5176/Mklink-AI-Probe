@@ -275,16 +275,61 @@ class BuiltinElfBackend:
 
     def sections(self, source: str) -> list[ElfSection]:
         with self._open_elf(source) as elf:
+            # Arm Compiler may store a compressed RW load image in an AXF while
+            # keeping symbols at their uncompressed execution addresses.  In
+            # that format sh_size is the compressed byte count, so section-only
+            # writable-range checks can incorrectly reject valid RAM objects.
+            # A defined symbol still carries its execution address and section
+            # index; extend the normalized section to cover those symbols.
+            raw_sections = list(elf.iter_sections())
+            allocated_addresses = sorted({
+                int(section["sh_addr"])
+                for section in raw_sections
+                if int(section["sh_flags"]) & 0x2
+            })
+            symbol_ends: dict[int, int] = {}
+            for symbol in _symbols_from_elf(elf):
+                if (
+                    symbol.kind != "object"
+                    or not isinstance(symbol.section, int)
+                    or not 0 <= symbol.section < len(raw_sections)
+                    or symbol.size <= 0
+                ):
+                    continue
+                section = raw_sections[symbol.section]
+                address = int(section["sh_addr"])
+                flags = int(section["sh_flags"])
+                symbol_end = symbol.address + symbol.size
+                next_address = next(
+                    (candidate for candidate in allocated_addresses if candidate > address),
+                    None,
+                )
+                if (
+                    flags & 0x3 != 0x3
+                    or symbol.address < address
+                    or (next_address is not None and symbol_end > next_address)
+                ):
+                    continue
+                symbol_ends[symbol.section] = max(
+                    symbol_ends.get(symbol.section, 0),
+                    symbol_end,
+                )
+
             sections = []
-            for section in elf.iter_sections():
+            for index, section in enumerate(raw_sections):
                 name = str(section.name or "")
                 if not name:
                     continue
+                address = int(section["sh_addr"])
+                size = int(section["sh_size"])
+                symbol_end = symbol_ends.get(index, 0)
+                if symbol_end > address + size and symbol_end >= address:
+                    size = symbol_end - address
                 sections.append(
                     ElfSection(
                         name=name,
-                        address=int(section["sh_addr"]),
-                        size=int(section["sh_size"]),
+                        address=address,
+                        size=size,
                         flags=int(section["sh_flags"]),
                         section_type=str(section["sh_type"]),
                     )

@@ -81,7 +81,7 @@ def test_websocket_sends_binary_batch_with_hub_metadata(
             assert metadata.stream_type is StreamType.SUPERWATCH
             assert metadata.flags == 0x02
         expected_sequence = hub.publish(b"payload", item_count=7)
-        frame = decode_frame(websocket.receive_bytes())
+        frame = _receive_data_frame(websocket)
 
     assert frame.stream_type is stream_type
     assert frame.stream_id == int(stream_type)
@@ -123,7 +123,24 @@ def test_websocket_accepts_existing_server_auth_token(monkeypatch):
             websocket.send_json({"token": "secret"})
             assert decode_frame(websocket.receive_bytes()).stream_type is StreamType.CONTROL
             app.state.stream_registry["rtt"].publish(b"ok", item_count=1)
-            assert decode_frame(websocket.receive_bytes()).payload == b"ok"
+            assert _receive_data_frame(websocket).payload == b"ok"
+
+
+def test_websocket_accepts_private_authorization_header(monkeypatch):
+    from mklink.remote import stream_api
+
+    monkeypatch.setattr(stream_api, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    app = create_app(auth_token="secret", project_root=".")
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/ws/streams/rtt",
+            headers={"Authorization": "Bearer secret"},
+        ) as websocket,
+    ):
+        assert decode_frame(websocket.receive_bytes()).stream_type is StreamType.CONTROL
+        app.state.stream_registry["rtt"].publish(b"ok", item_count=1)
+        assert _receive_data_frame(websocket).payload == b"ok"
 
 
 @pytest.mark.parametrize(
@@ -222,7 +239,7 @@ def test_publish_from_external_thread_wakes_websocket(client, app, monkeypatch):
         assert metadata.stream_type is StreamType.SUPERWATCH
         assert metadata.flags == 0x02
         publisher.start()
-        frame = decode_frame(websocket.receive_bytes())
+        frame = _receive_data_frame(websocket)
         publisher.join(timeout=1)
 
     assert not publisher.is_alive()

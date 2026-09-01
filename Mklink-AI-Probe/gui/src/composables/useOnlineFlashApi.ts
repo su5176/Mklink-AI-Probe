@@ -1,5 +1,6 @@
 import type {
   CustomFlmRecord,
+  FlashAlgorithmRecord,
   FirmwareSourceStatus,
   ImageInspection,
   JobEvent,
@@ -246,6 +247,10 @@ export function useOnlineFlashApi() {
     return request(`/targets/${encoded(partNumber)}/memory-map`)
   }
 
+  function listTargetAlgorithms(partNumber: string): Promise<FlashAlgorithmRecord[]> {
+    return request(`/targets/${encoded(partNumber)}/algorithms`)
+  }
+
   function getPackStatus(): Promise<PackStatus> {
     return request('/packs/status')
   }
@@ -444,6 +449,7 @@ export function useOnlineFlashApi() {
   return {
     listProbes,
     searchTargets,
+    listTargetAlgorithms,
     getTargetMemoryMap,
     getPackStatus,
     updatePackIndex,

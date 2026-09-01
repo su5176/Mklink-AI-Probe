@@ -237,6 +237,33 @@ describe('StreamDecoder worker controller', () => {
     })
   })
 
+  it('uses exact device sample times despite host jitter and preserves real gaps', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 16, channelCount: 1 })
+    const metadata = new TextEncoder().encode(JSON.stringify({ version: 1, channels: [{ name: 'a' }] }))
+    const send = (sequence: bigint, flags: number, payload: Uint8Array, count: number, host: bigint) => decoder.handle({
+      type: 'frame', buffer: frame(sequence, count, payload, StreamType.SUPERWATCH, host, flags),
+      connectionGeneration: 1, frameTicket: Number(sequence),
+    })
+    send(1n, 2, metadata, 0, 1n)
+    const payload = (times: number[]) => {
+      const bytes = new Uint8Array(times.length * 12)
+      bytes.set(new Uint8Array(Float64Array.from(times).buffer))
+      bytes.set(floats(...times), times.length * 8)
+      return bytes
+    }
+    send(2n, 3, payload([0, 0.13]), 2, 20_000_000_000n)
+    send(3n, 3, payload([0.26, 25]), 2, 20_050_000_000n)
+    const batches = messages.filter(message => message.type === 'waveform-batch')
+    expect(batches).toHaveLength(2)
+    expect(batches.flatMap(batch => Array.from(new Float64Array(batch.times)))).toEqual([0, 0.13, 0.26, 25])
+    // Reject invalid time order without poisoning the next valid batch.
+    send(4n, 3, payload([25, 26]), 2, 21_000_000_000n)
+    expect(messages.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_FRAME' })
+    send(4n, 3, payload([26, 27]), 2, 19_000_000_000n)
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(3)
+  })
+
   it('applies versioned SuperWatch metadata independently from sample batches', () => {
     const { decoder, messages, transfers } = setup()
     decoder.handle({ type: 'configure', capacity: 16, channelCount: 1 })
@@ -260,6 +287,47 @@ describe('StreamDecoder worker controller', () => {
     if (batch?.type !== 'waveform-batch') throw new Error('expected batch')
     expect(Array.from(new Float32Array(batch.values))).toEqual([1, 2, 3, 4])
     expect(transfers[messages.indexOf(batch)]).toEqual([batch.values, batch.times])
+  })
+
+  it('keeps full SuperWatch history in the Worker and emits only latest summaries normally', () => {
+    const { decoder, messages, transfers } = setup()
+    decoder.handle({
+      type: 'configure', capacity: 3, channelCount: 1, waveformSummaryOnly: true,
+    })
+    const metadata = new TextEncoder().encode(JSON.stringify({
+      version: 1, channels: [{ name: 'a', type: 'float' }],
+    }))
+    const send = (sequence: bigint, values: number[]) => decoder.handle({
+      type: 'frame',
+      buffer: frame(sequence, values.length, floats(...values), StreamType.SUPERWATCH, sequence * 1_000_000n, 0x01),
+      connectionGeneration: 1,
+      frameTicket: Number(sequence),
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 0, metadata, StreamType.SUPERWATCH, 1n, 0x02),
+      connectionGeneration: 1, frameTicket: 1,
+    })
+    send(2n, [1, 2])
+    send(3n, [3, 4])
+
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(0)
+    const summaries = messages.filter(message => message.type === 'waveform-summary')
+    expect(summaries).toHaveLength(2)
+    const latest = summaries.at(-1)
+    if (latest?.type !== 'waveform-summary') throw new Error('expected waveform summary')
+    expect(latest).toMatchObject({ collectedItemCount: 2, bufferedItemCount: 3, channelCount: 1 })
+    expect(Array.from(new Float32Array(latest.latestValues))).toEqual([4])
+
+    decoder.handle({ type: 'history-snapshot', requestId: 7 })
+    const snapshot = messages.at(-1)
+    if (snapshot?.type !== 'history-snapshot') throw new Error('expected history snapshot')
+    expect(snapshot).toMatchObject({ requestId: 7, itemCount: 3, channelCount: 1 })
+    expect(Array.from(new Float32Array(snapshot.values))).toEqual([2, 3, 4])
+    expect(transfers[messages.indexOf(snapshot)]).toEqual([snapshot.times, snapshot.values])
+
+    decoder.handle({ type: 'waveform-detail', enabled: true })
+    send(4n, [5])
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(1)
   })
 
   it('rejects stale metadata, nonfinite samples, bad flags, and reset clears versions', () => {

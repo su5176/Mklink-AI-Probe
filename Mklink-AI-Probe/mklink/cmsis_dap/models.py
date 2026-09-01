@@ -100,6 +100,8 @@ class TargetRecord:
     pack_path: Optional[str] = None
     installed: bool = False
     source: str = "index"
+    family: str = ""
+    series: str = ""
 
 
 @dataclass(frozen=True)

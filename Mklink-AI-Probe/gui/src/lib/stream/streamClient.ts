@@ -14,6 +14,7 @@ export interface StreamClientOptions {
   readonly capacity: number
   readonly channelCount: number
   readonly decoderMode?: DecoderMode
+  readonly waveformSummaryOnly?: boolean
   /** Serialize frame delivery so control/range requests can interleave. */
   readonly serializeWorkerFrames?: boolean
   readonly reconnectBaseMs?: number
@@ -116,6 +117,7 @@ export class StreamClient {
       capacity: options.capacity,
       channelCount: options.channelCount,
       decoderMode: options.decoderMode,
+      waveformSummaryOnly: options.waveformSummaryOnly,
     } satisfies WorkerInput)
   }
 
@@ -156,6 +158,7 @@ export class StreamClient {
     this.worker.postMessage({
       type: 'configure', capacity, channelCount,
       decoderMode: this.options.decoderMode,
+      waveformSummaryOnly: this.options.waveformSummaryOnly,
     } satisfies WorkerInput)
   }
 
@@ -164,6 +167,16 @@ export class StreamClient {
     this.worker.postMessage({
       type: 'visible-range', requestId, start, end, pixelWidth,
     } satisfies WorkerInput)
+  }
+
+  setWaveformDetail(enabled: boolean): void {
+    if (this.disposed) return
+    this.worker.postMessage({ type: 'waveform-detail', enabled } satisfies WorkerInput)
+  }
+
+  requestHistorySnapshot(requestId: number): void {
+    if (this.disposed) return
+    this.worker.postMessage({ type: 'history-snapshot', requestId } satisfies WorkerInput)
   }
 
   dispose(): void {

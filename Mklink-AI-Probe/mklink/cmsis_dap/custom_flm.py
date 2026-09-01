@@ -14,6 +14,7 @@ from typing import Callable, Iterable, Sequence, Tuple
 
 from .errors import FlashError, FlashErrorCode
 from .models import MemoryRegion
+from .pyocd_runtime import import_pyocd_attr
 
 
 @dataclass(frozen=True)
@@ -29,7 +30,9 @@ class CustomFlmRecord:
 
 
 def _parse_flm(path: Path) -> object:
-    from pyocd.target.pack.flash_algo import PackFlashAlgo
+    PackFlashAlgo = import_pyocd_attr(
+        "pyocd.target.pack.flash_algo", "PackFlashAlgo"
+    )
 
     return PackFlashAlgo(str(path))
 

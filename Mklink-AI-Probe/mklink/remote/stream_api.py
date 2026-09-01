@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
+import hmac
 import json
 import logging
 import time
+from dataclasses import asdict
 from typing import Dict, Mapping, Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from mklink.remote.stream_hub import StreamHub
 from mklink.remote.stream_protocol import Frame, StreamType, encode_frame
-
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,9 @@ def create_stream_registry() -> Dict[str, StreamHub]:
 async def _authenticate(websocket: WebSocket, auth_token: Optional[str]) -> bool:
     if not auth_token:
         return True
+    authorization = websocket.headers.get("authorization")
+    if authorization is not None:
+        return hmac.compare_digest(authorization, f"Bearer {auth_token}")
     try:
         message = await asyncio.wait_for(
             websocket.receive(), timeout=AUTH_TIMEOUT_SECONDS,

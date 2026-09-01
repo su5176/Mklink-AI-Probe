@@ -33,12 +33,27 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import atexit
+from functools import wraps
 import logging
 import sys
 import threading
 from typing import Any, Iterator, TextIO
 
+from pydantic import StrictInt, StrictStr
+
 log = logging.getLogger("mklink.mcp")
+
+MCP_MAX_DIRECT_READ_BYTES = 4096
+MCP_MAX_BATCH_REGIONS = 16
+MCP_MAX_BATCH_TOTAL_BYTES = 4096
+MCP_MAX_WRITE_BYTES = 4096
+MCP_MAX_FLUSH_WRITES = 8
+MCP_MAX_FLUSH_ITEM_BYTES = 12 * 1024
+MCP_MAX_FLUSH_TOTAL_BYTES = 12 * 1024
+MCP_MAX_CAPTURE_SECONDS = 30.0
+MCP_MAX_SEARCH_BYTES = 64 * 1024
+MCP_MAX_RTT_WRITE_BYTES = 256
+MCP_MAX_RTT_PATTERN_BYTES = 256
 
 
 class _McpProtocolStdout:
@@ -76,7 +91,98 @@ def _isolate_stdio_protocol() -> Iterator[None]:
 # Mirrors controller-vtfp-builder vtfp_core/mcp/mcp_server_base.py:71-96.
 # --------------------------------------------------------------------------
 _lock = threading.Lock()
-_holder: dict[str, Any] = {"device": None, "kwargs": {}}
+_operation_lock = threading.RLock()
+_holder: dict[str, Any] = {"device": None, "kwargs": {}, "quarantine": None}
+
+
+@contextmanager
+def _hardware_operation(tool_name: str, *, recovery: bool = False) -> Iterator[None]:
+    """Serialize probe I/O and quarantine a session after an uncertain timeout."""
+    if not _operation_lock.acquire(blocking=False):
+        raise RuntimeError(
+            "Another MKLink hardware tool is active. Do not issue parallel "
+            "calls to one probe; wait for it to finish or stop the stream."
+        )
+    try:
+        with _lock:
+            quarantine = _holder.get("quarantine")
+        if quarantine is not None and not recovery:
+            failed_tool = quarantine.get("tool", "unknown")
+            raise RuntimeError(
+                "MKLink hardware access is quarantined after "
+                f"{failed_tool} timed out. Do not retry hardware commands; "
+                "call device_status, then disconnect before reconnecting."
+            )
+        try:
+            yield
+        except TimeoutError as exc:
+            with _lock:
+                _holder["quarantine"] = {
+                    "active": True,
+                    "tool": tool_name,
+                    "reason": str(exc) or "hardware operation timed out",
+                }
+            raise
+    finally:
+        _operation_lock.release()
+
+
+def _exclusive_hardware_tool(function=None, *, recovery: bool = False):
+    """Reject concurrent or quarantined probe tools before they reach I/O."""
+    def decorate(callback):
+        @wraps(callback)
+        def guarded(*args, **kwargs):
+            with _hardware_operation(callback.__name__, recovery=recovery):
+                return callback(*args, **kwargs)
+        return guarded
+
+    if function is None:
+        return decorate
+    return decorate(function)
+
+
+def _bounded_duration(value: float, field: str = "duration") -> float:
+    try:
+        duration = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a number") from exc
+    if not 0 < duration <= MCP_MAX_CAPTURE_SECONDS:
+        raise ValueError(
+            f"{field} must be greater than 0 and at most "
+            f"{MCP_MAX_CAPTURE_SECONDS:g} seconds"
+        )
+    return duration
+
+
+def _validate_memory_range(address: int, size: int, *, max_size: int) -> None:
+    if type(address) is not int or not 0 <= address <= 0xFFFFFFFF:
+        raise ValueError("address must be a 32-bit non-negative integer")
+    if type(size) is not int or not 0 < size <= max_size:
+        raise ValueError(f"size must be between 1 and {max_size} bytes")
+    if address + size > 0x100000000:
+        raise ValueError("address + size exceeds the 32-bit address space")
+
+
+def _capabilities() -> dict[str, Any]:
+    return {
+        "one_probe_calls": "serial-only; never call hardware tools in parallel",
+        "connect": "reuse one session; disconnect when finished",
+        "direct_read_max_bytes": MCP_MAX_DIRECT_READ_BYTES,
+        "batch_read_max_regions": MCP_MAX_BATCH_REGIONS,
+        "batch_read_max_total_bytes": MCP_MAX_BATCH_TOTAL_BYTES,
+        "write_memory_max_bytes": MCP_MAX_WRITE_BYTES,
+        "flush_memory_max_regions": MCP_MAX_FLUSH_WRITES,
+        "flush_memory_max_item_bytes": MCP_MAX_FLUSH_ITEM_BYTES,
+        "flush_memory_max_total_bytes": MCP_MAX_FLUSH_TOTAL_BYTES,
+        "capture_max_seconds": MCP_MAX_CAPTURE_SECONDS,
+        "rtt_search_max_bytes": MCP_MAX_SEARCH_BYTES,
+        "rtt_write_max_utf8_bytes": MCP_MAX_RTT_WRITE_BYTES,
+        "rtt_pattern_max_utf8_bytes": MCP_MAX_RTT_PATTERN_BYTES,
+        "failure_recovery": (
+            "a timed-out hardware tool quarantines the session; check "
+            "device_status, then disconnect before reconnecting"
+        ),
+    }
 
 
 def configure_device(**kwargs: Any) -> None:
@@ -126,6 +232,7 @@ def _reset_device() -> None:
                 log.exception("error closing device during reset")
         _holder["device"] = None
         _holder["kwargs"] = {}
+        _holder["quarantine"] = None
 
 
 # MCP hosts normally terminate the stdio child after the conversation ends.
@@ -175,6 +282,7 @@ def _register_health_tools(mcp: Any) -> None:
             "transport": "stdio",
             "sdk_version": ver,
             "update": check_for_update(),
+            "limits": _capabilities(),
             **toolchain_status(),
         }
 
@@ -192,6 +300,7 @@ def _register_connection_tools(mcp: Any) -> None:
         return mklink.discover_all()
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def connect(
         port: str | None = None,
         axf: str | None = None,
@@ -215,6 +324,26 @@ def _register_connection_tools(mcp: Any) -> None:
         Replaces any existing session (releases the serial lock first).
         """
         import mklink
+        requested = {
+            "port": port, "axf": axf, "mcu": mcu,
+            "project_root": project_root, "elf_backend": elf_backend,
+        }
+        current = _holder["device"]
+        if (
+            current is not None
+            and current.connected
+            and _holder["kwargs"] == requested
+        ):
+            return {
+                "connected": True,
+                "reused": True,
+                "port": current.port,
+                "idcode": _idcode(current),
+                "mcu": current.mcu_name,
+                "axf_loaded": bool(getattr(current, "_dwarf_info", None)),
+                "elf_backend": current.axf_status.get("elf_backend"),
+                "limits": _capabilities(),
+            }
         _reset_device()
         dev = mklink.connect(
             port=port,
@@ -237,6 +366,8 @@ def _register_connection_tools(mcp: Any) -> None:
             "mcu": dev.mcu_name if dev.connected else None,
             "axf_loaded": axf_loaded,
             "elf_backend": dev.axf_status.get("elf_backend"),
+            "reused": False,
+            "limits": _capabilities(),
         }
         if not axf_loaded and axf:
             # AXF was requested but symbols did not load; surface the parser
@@ -258,6 +389,7 @@ def _register_connection_tools(mcp: Any) -> None:
         return out
 
     @mcp.tool()
+    @_exclusive_hardware_tool(recovery=True)
     def disconnect() -> dict:
         """Disconnect from the probe and release the serial lock.
 
@@ -276,17 +408,24 @@ def _register_connection_tools(mcp: Any) -> None:
         Use to check whether a session is alive before a long operation, or
         to recover context after a tool error. No side effects.
         """
+        with _lock:
+            quarantine = _holder.get("quarantine")
         dev = _holder["device"]
         if dev is None:
-            return {"connected": False, "hint": "no device; call connect() first"}
-        return {
-            "connected": dev.connected,
-            "port": dev.port,
-            "idcode": _idcode(dev),
-            "mcu": dev.mcu_name if dev.connected else None,
-            "state": str(dev.state),
-            "axf_loaded": bool(getattr(dev, "_dwarf_info", None)),
-        }
+            result = {"connected": False, "hint": "no device; call connect() first"}
+        else:
+            result = {
+                "connected": dev.connected,
+                "port": dev.port,
+                "idcode": _idcode(dev),
+                "mcu": dev.mcu_name if dev.connected else None,
+                "state": str(dev.state),
+                "axf_loaded": bool(getattr(dev, "_dwarf_info", None)),
+            }
+        result["quarantined"] = quarantine is not None
+        if quarantine is not None:
+            result["quarantine"] = dict(quarantine)
+        return result
 
 
 def _register_project_tools(mcp: Any) -> None:
@@ -309,19 +448,26 @@ def _register_project_tools(mcp: Any) -> None:
         """
         from mklink.mcu_detect import detect_mcu_profile as _detect
 
-        return _detect(
-            project_root=project_root,
-            device=device,
-            port=port,
-            flm=flm,
-            write_profile=write_profile,
-            copy_flm=copy_flm,
-            read_idcode=read_idcode,
-        )
+        arguments = {
+            "project_root": project_root,
+            "device": device,
+            "port": port,
+            "flm": flm,
+            "write_profile": write_profile,
+            "copy_flm": copy_flm,
+            "read_idcode": read_idcode,
+        }
+        if read_idcode:
+            with _hardware_operation("detect_mcu_profile"):
+                return _detect(**arguments)
+        return _detect(**arguments)
 
 
 def _register_flash_tools(mcp: Any) -> None:
+    from mklink.observe_bridge import flash_facts, observe_operation
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def flash(
         firmware: str,
         target_part: str | None = None,
@@ -352,18 +498,29 @@ def _register_flash_tools(mcp: Any) -> None:
             reset_after: Reset the target to entry point after flash (default
                 True). Set False to keep the CPU halted for inspection.
         """
-        dev = _connected_device()
-        return dev.flash(
-            firmware,
-            target_part=target_part,
-            base_address=base_address,
-            board=board,
-            hpm_flash_cfg=hpm_flash_cfg,
-            verify=verify,
-            reset_after=reset_after,
-        )
+        with observe_operation(
+            "program.flash", capability="program", action_class="emit",
+        ) as observation:
+            dev = _connected_device()
+            result = dev.flash(
+                firmware,
+                target_part=target_part,
+                base_address=base_address,
+                board=board,
+                hpm_flash_cfg=hpm_flash_cfg,
+                verify=verify,
+                reset_after=reset_after,
+                progress_callback=observation.progress,
+            )
+            observation.complete(facts=flash_facts(
+                result,
+                verify_requested=verify,
+                reset_requested=reset_after,
+            ))
+            return result
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def erase_chip() -> dict:
         """Erase the entire target flash. Destructive — no confirmation
         beyond this call. Returns {"erased": bool}."""
@@ -371,6 +528,7 @@ def _register_flash_tools(mcp: Any) -> None:
         return {"erased": dev.erase_chip()}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def erase_sector(address: int) -> dict:
         """Erase a single flash sector containing ``address``.
 
@@ -381,6 +539,7 @@ def _register_flash_tools(mcp: Any) -> None:
         return {"erased": dev.erase_sector(address), "address": f"0x{address:08X}"}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def reset() -> dict:
         """Reset the target MCU (system reset, re-runs from entry point)."""
         dev = _connected_device()
@@ -388,6 +547,7 @@ def _register_flash_tools(mcp: Any) -> None:
         return {"reset": True}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def set_power_on(
         voltage_mv: int,
         confirm_5v: bool = False,
@@ -415,6 +575,7 @@ def _register_flash_tools(mcp: Any) -> None:
         return {"power_on": True, "voltage_mv": voltage_mv}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def reboot_probe() -> dict:
         """Reboot the MKLink probe itself and release the current session.
 
@@ -430,44 +591,314 @@ def _register_flash_tools(mcp: Any) -> None:
 
 
 def _register_memory_tools(mcp: Any) -> None:
+    from mklink.mcp_stream_bridge import (
+        McpStreamSidecar,
+        publish_mcp_memory,
+        publish_mcp_memory_gap,
+        publish_mcp_memory_regions,
+    )
+    from mklink.observe_bridge import (
+        memory_dump_facts,
+        memory_read_facts,
+        memory_write_facts,
+        observe_operation,
+    )
+    from mklink.remote.stream_protocol import canonical_memory_address
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def read_memory(address: int, size: int) -> dict:
         """Read ``size`` bytes of target RAM/peripheral memory at ``address``.
 
         Args:
             address: Read address, e.g. 0x20000000 (RAM) or 0xE000ED28
                 (SCB.CFSR peripheral register).
-            size: Number of bytes. Large reads are slow over SWD — prefer
-                read_variable for named data and keep raw reads small.
+            size: Number of bytes, from 1 through 4096. Larger reads are slow
+                over SWD; use bounded dump_memory captures instead.
 
         Returns hex-encoded bytes. Decode on the client side as needed.
         """
+        with observe_operation(
+            "memory.read",
+            capability="target.memory",
+            action_class="observe",
+        ) as observation:
+            _validate_memory_range(
+                address, size, max_size=MCP_MAX_DIRECT_READ_BYTES
+            )
+            dev = _connected_device()
+            data = dev.read_memory(address, size)
+            if len(data) != size:
+                raise RuntimeError("memory read returned incomplete data")
+            response = {
+                "address": canonical_memory_address(address),
+                "size": size,
+                "bytes_read": len(data),
+                "hex": _hex(data),
+            }
+            try:
+                private_published = publish_mcp_memory("read", address, data)
+            except Exception:
+                private_published = False
+            if not private_published:
+                try:
+                    publish_mcp_memory_gap("publish_drop_count", 1)
+                except Exception:
+                    pass
+            observation.complete(facts=memory_read_facts(
+                response["address"],
+                requested_bytes=size,
+                bytes_read=len(data),
+            ))
+            return response
+
+    @mcp.tool()
+    @_exclusive_hardware_tool
+    def read_memory_regions(regions: list[dict]) -> dict:
+        """Read up to 16 RAM/peripheral regions in one logical snapshot.
+
+        The host merges only overlapping or exactly contiguous addresses, so
+        the common 16-scalar layout uses one REPL/SWD transaction. Disjoint
+        addresses remain separate and preserve request order. This tool is
+        preferred over repeated ``read_memory`` calls.
+
+        Args:
+            regions: List of {"address": int, "size": int}; at most 16
+                entries and 4096 returned bytes in total.
+        """
+        if not isinstance(regions, list) or not regions:
+            raise ValueError("regions must be a non-empty list")
+        if len(regions) > MCP_MAX_BATCH_REGIONS:
+            raise ValueError(
+                f"regions must contain at most {MCP_MAX_BATCH_REGIONS} entries"
+            )
+        pairs: list[tuple[int, int]] = []
+        for index, region in enumerate(regions):
+            if not isinstance(region, dict) or set(region) != {"address", "size"}:
+                raise ValueError(
+                    f"regions[{index}] must contain exactly address and size"
+                )
+            address, size = region["address"], region["size"]
+            _validate_memory_range(
+                address, size, max_size=MCP_MAX_BATCH_TOTAL_BYTES
+            )
+            pairs.append((address, size))
+        total = sum(size for _, size in pairs)
+        if total > MCP_MAX_BATCH_TOTAL_BYTES:
+            raise ValueError(
+                f"total requested bytes must not exceed "
+                f"{MCP_MAX_BATCH_TOTAL_BYTES}"
+            )
         dev = _connected_device()
-        data = dev.read_memory(address, size)
+        payloads = dev.read_memory_regions(pairs)
         return {
-            "address": f"0x{address:08X}",
-            "size": size,
-            "bytes_read": len(data),
-            "hex": _hex(data),
+            "region_count": len(pairs),
+            "total_bytes": sum(len(payload) for payload in payloads),
+            "regions": [
+                {
+                    "address": f"0x{address:08X}",
+                    "size": size,
+                    "hex": payload.hex(),
+                }
+                for (address, size), payload in zip(pairs, payloads)
+            ],
         }
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def write_memory(address: int, data_hex: str) -> dict:
-        """Write bytes to target RAM at ``address``. No read-back verify.
+        """Write bytes to target RAM at ``address`` and verify by reading back.
 
         Args:
             address: Write address, e.g. 0x20001000.
             data_hex: Hex string of bytes to write, e.g. "DEADBEEF" or
                 "de ad be ef" (whitespace tolerated).
         """
-        dev = _connected_device()
-        data = _from_hex(data_hex)
-        dev.write_memory(address, data)
-        return {"address": f"0x{address:08X}", "bytes_written": len(data)}
+        with observe_operation(
+            "memory.write",
+            capability="target.memory",
+            action_class="emit",
+        ) as observation:
+            data = _from_hex(data_hex)
+            _validate_memory_range(
+                address, len(data), max_size=MCP_MAX_WRITE_BYTES
+            )
+            dev = _connected_device()
+            dev.write_memory(address, data)
+            actual = dev.read_memory(address, len(data))
+            if actual != data:
+                from mklink.device import DeviceError
+                raise DeviceError(
+                    f"write verification failed at 0x{address:08X}: "
+                    f"expected {data.hex()}, got {actual.hex()}"
+                )
+            response = {
+                "address": canonical_memory_address(address),
+                "bytes_written": len(data),
+                "verified": True,
+            }
+            observation.complete(facts=memory_write_facts(
+                response["address"],
+                bytes_written=len(data),
+            ))
+            return response
+
+    @mcp.tool()
+    def dump_memory(
+        regions: list[dict],
+        sample_count: int = 1,
+        timeout: float = 10.0,
+    ) -> dict:
+        """Capture a bounded number of complete dump-memory samples.
+
+        This reuses the already-connected probe bridge.  It is a bounded
+        capture, not a persistent stream: ``sample_count`` is 1..64 and the
+        total captured bytes across all samples cannot exceed 512 KiB.
+
+        Args:
+            regions: 1..8 closed objects of ``{"address": int, "size": int}``.
+            sample_count: Complete one-shot samples to capture (default 1).
+            timeout: Per-sample timeout in seconds, from 0.001 through 60.
+        """
+        import math
+        import secrets
+
+        from mklink.dump_memory import (
+            DumpMemoryReadError,
+            MAX_TOTAL_DATA_SIZE,
+            exclusive_dump_memory_capture,
+            read_dump_memory_regions_once,
+        )
+        from mklink.remote.stream_protocol import MAX_MEMORY_REGIONS
+
+        with observe_operation(
+            "memory.dump",
+            capability="target.memory",
+            action_class="observe",
+        ) as observation:
+            if not isinstance(regions, list) or not 1 <= len(regions) <= MAX_MEMORY_REGIONS:
+                raise ValueError(
+                    f"regions must contain 1..{MAX_MEMORY_REGIONS} entries"
+                )
+            if (
+                isinstance(sample_count, bool)
+                or not isinstance(sample_count, int)
+                or not 1 <= sample_count <= 64
+            ):
+                raise ValueError("sample_count must be between 1 and 64")
+            if (
+                isinstance(timeout, bool)
+                or not isinstance(timeout, (int, float))
+                or not math.isfinite(float(timeout))
+                or not 0.001 <= float(timeout) <= 60.0
+            ):
+                raise ValueError("timeout must be between 0.001 and 60 seconds")
+
+            pairs: list[tuple[int, int]] = []
+            per_sample_bytes = 0
+            for index, region in enumerate(regions):
+                if not isinstance(region, dict) or set(region) != {"address", "size"}:
+                    raise ValueError(
+                        f"regions[{index}] must contain only address and size"
+                    )
+                address = region["address"]
+                size = region["size"]
+                if (
+                    isinstance(address, bool)
+                    or not isinstance(address, int)
+                    or not 0 <= address <= 0xFFFFFFFFFFFFFFFF
+                    or isinstance(size, bool)
+                    or not isinstance(size, int)
+                    or size <= 0
+                    or address + size > 0x10000000000000000
+                ):
+                    raise ValueError(f"regions[{index}] has an invalid address/size range")
+                per_sample_bytes += size
+                pairs.append((address, size))
+            if per_sample_bytes > MAX_TOTAL_DATA_SIZE:
+                raise ValueError(
+                    f"one sample exceeds the {MAX_TOTAL_DATA_SIZE}-byte device limit"
+                )
+            max_capture_bytes = 512 * 1024
+            if per_sample_bytes * sample_count > max_capture_bytes:
+                raise ValueError(
+                    f"capture exceeds the {max_capture_bytes}-byte MCP limit"
+                )
+
+            dev = _connected_device()
+            operation_id = f"op-{secrets.token_hex(8)}"
+            samples = []
+            with exclusive_dump_memory_capture():
+                for sample_index in range(sample_count):
+                    try:
+                        payloads = read_dump_memory_regions_once(
+                            dev._bridge,
+                            pairs,
+                            timeout=float(timeout),
+                        )
+                        if (
+                            len(payloads) != len(pairs)
+                            or any(
+                                not isinstance(payload, bytes) or len(payload) != size
+                                for (_address, size), payload in zip(pairs, payloads)
+                            )
+                        ):
+                            raise DumpMemoryReadError(
+                                "dump_memory returned incomplete region coverage",
+                                gap_fact="region_gap_count",
+                            )
+                    except DumpMemoryReadError as exc:
+                        try:
+                            publish_mcp_memory_gap(exc.gap_fact, exc.gap_count)
+                        except Exception:
+                            pass
+                        raise
+                    try:
+                        private_published = publish_mcp_memory_regions(
+                            "dump",
+                            list(zip((address for address, _size in pairs), payloads)),
+                            sample_index=sample_index,
+                            sample_count=sample_count,
+                            operation_id=operation_id,
+                        )
+                    except Exception:
+                        private_published = False
+                    if not private_published:
+                        try:
+                            publish_mcp_memory_gap("publish_drop_count", 1)
+                        except Exception:
+                            pass
+                    samples.append({
+                        "sample_index": sample_index,
+                        "regions": [
+                            {
+                                "address": canonical_memory_address(address),
+                                "size": len(payload),
+                                "data_hex": payload.hex().upper(),
+                            }
+                            for (address, _size), payload in zip(pairs, payloads)
+                        ],
+                    })
+            response = {
+                "sample_count": sample_count,
+                "region_count": len(pairs),
+                "total_bytes": per_sample_bytes * sample_count,
+                "samples": samples,
+            }
+            observation.complete(facts=memory_dump_facts(
+                canonical_memory_address(pairs[0][0]),
+                total_bytes=response["total_bytes"],
+                region_count=len(pairs),
+                sample_count=sample_count,
+            ))
+            return response
 
 
 def _register_variable_tools(mcp: Any) -> None:
+    from mklink.mcp_stream_bridge import publish_mcp_superwatch
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def read_variable(name: str) -> Any:
         """Read a named global variable by DWARF symbol (requires AXF/ELF).
 
@@ -479,9 +910,12 @@ def _register_variable_tools(mcp: Any) -> None:
         been passed to ``connect(axf=...)`` or loaded via ``load_symbols``.
         """
         dev = _connected_device()
-        return dev.read_variable(name)
+        value = dev.read_variable(name)
+        publish_mcp_superwatch(name, value)
+        return value
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def write_variable(name: str, value: int) -> dict:
         """Write an integer value to a named global variable (requires AXF/ELF).
 
@@ -495,6 +929,7 @@ def _register_variable_tools(mcp: Any) -> None:
         return {"name": name, "value": value}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def read_register(name: str) -> dict:
         """Read a memory-mapped peripheral register by name.
 
@@ -503,11 +938,13 @@ def _register_variable_tools(mcp: Any) -> None:
         """
         dev = _connected_device()
         val = dev.read_register(name)
+        publish_mcp_superwatch(name, val)
         return {"name": name, "value": f"0x{val:08X}", "value_int": val}
 
 
 def _register_debug_tools(mcp: Any) -> None:
     @mcp.tool()
+    @_exclusive_hardware_tool
     def halt() -> dict:
         """Halt the target CPU (write DHCSR DBG_HALT). Use before inspecting
         registers/memory to get a consistent snapshot."""
@@ -516,6 +953,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"halted": True}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def resume() -> dict:
         """Resume target CPU execution after a halt or breakpoint hit."""
         dev = _connected_device()
@@ -523,6 +961,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"resumed": True}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def step() -> dict:
         """Single-step one instruction on the halted target."""
         dev = _connected_device()
@@ -530,6 +969,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"stepped": True}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def set_breakpoint(address: int, slot: int | None = None) -> dict:
         """Set an FPB hardware breakpoint at ``address``.
 
@@ -542,6 +982,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"address": f"0x{address:08X}", "slot": used}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def clear_breakpoint(slot: int) -> dict:
         """Clear the hardware breakpoint in comparator ``slot``."""
         dev = _connected_device()
@@ -549,6 +990,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"cleared_slot": slot}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def clear_all_breakpoints() -> dict:
         """Clear every hardware breakpoint."""
         dev = _connected_device()
@@ -556,6 +998,7 @@ def _register_debug_tools(mcp: Any) -> None:
         return {"cleared": n}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def read_core_registers() -> dict[str, int]:
         """Read all Cortex-M core registers (R0–R15, xPSR, etc.) of the
         halted target. Halt first for a meaningful snapshot."""
@@ -565,6 +1008,7 @@ def _register_debug_tools(mcp: Any) -> None:
 
 def _register_symbol_tools(mcp: Any) -> None:
     @mcp.tool()
+    @_exclusive_hardware_tool
     def load_symbols(
         axf_path: str,
         elf_backend: str | None = None,
@@ -591,6 +1035,7 @@ def _register_symbol_tools(mcp: Any) -> None:
         return dev.axf_status
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def memory_map() -> dict:
         """Return the firmware's memory sections (FLASH/RAM regions) parsed
         from the AXF/ELF. Requires symbols loaded (connect with axf=)."""
@@ -599,11 +1044,15 @@ def _register_symbol_tools(mcp: Any) -> None:
 
 
 def _register_rtt_tools(mcp: Any) -> None:
+    from mklink.mcp_stream_bridge import publish_mcp_rtt
+    from mklink.observe_bridge import observe_operation, rtt_facts
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def rtt_start(
         addr: str | None = None,
-        channel: int = 0,
-        search_size: int = 1024,
+        channel: StrictInt = 0,
+        search_size: StrictInt = 1024,
         mode: str = "auto",
     ) -> dict:
         """Start an RTT session to capture target printf/log output.
@@ -611,7 +1060,7 @@ def _register_rtt_tools(mcp: Any) -> None:
         Args:
             addr: RTT control-block address. Required when mode="static";
                 otherwise resolved from .mklink/rtt_config.json.
-            channel: RTT channel number (default 0).
+            channel: RTT channel number, 0..2 on V4 firmware (default 0).
             search_size: Probe scan window in bytes (default 1024). Only
                 used in dynamic mode.
             mode: RTT control-block storage strategy — **decision encoded
@@ -623,47 +1072,106 @@ def _register_rtt_tools(mcp: Any) -> None:
                 - "static": CB is at a fixed address set via the
                   SEGGER_RTT_SECTION macro; pass addr explicitly.
         """
-        dev = _connected_device()
+        if type(channel) is not int or not 0 <= channel < 3:
+            raise ValueError(
+                "channel must be between 0 and 2 for V4 probe firmware"
+            )
+        if type(search_size) is not int or not 0 <= search_size <= MCP_MAX_SEARCH_BYTES:
+            raise ValueError(
+                f"search_size must be between 0 and {MCP_MAX_SEARCH_BYTES} bytes"
+            )
         mode_map = {"auto": None, "dynamic": 0, "static": 1}
         if mode not in mode_map:
             raise ValueError(
                 f"mode must be one of {list(mode_map)}, got {mode!r}"
             )
-        return dev.rtt_start(
-            addr, channel=channel, search_size=search_size,
-            mode=mode_map[mode],
-        )
+        with observe_operation(
+            "console.rtt.start", capability="console.rtt", action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            result = dev.rtt_start(
+                addr, channel=channel, search_size=search_size,
+                mode=mode_map[mode],
+            )
+            observation.complete(facts=[
+                {"name": "channel", "value": channel, "unit": "count"},
+            ])
+            return result
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def rtt_read(duration: float = 10.0) -> dict:
         """Read output from a running RTT session for ``duration`` seconds.
 
         RTT must already be started (call rtt_start first). Returns text the
         target wrote to the up channel.
         """
-        dev = _connected_device()
-        return {"output": dev.rtt_read(duration)}
+        duration = _bounded_duration(duration)
+        with observe_operation(
+            "console.rtt.read", capability="console.rtt", action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            output = dev.rtt_read(duration)
+            publish_mcp_rtt(output)
+            observation.complete(facts=rtt_facts(output, duration=duration))
+            return {"output": output}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def rtt_write(data: str) -> dict:
         """Write text to the target's RTT down channel (stdin equivalent).
 
         Args:
-            data: UTF-8 text to send.
+            data: UTF-8 text to send (1..256 encoded bytes). This is an
+                interactive command channel, not a file-transfer path.
         """
-        dev = _connected_device()
-        return {"sent": dev.rtt_write(data)}
+        if type(data) is not str:
+            raise ValueError("data must be UTF-8 text")
+        try:
+            byte_length = len(data.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise ValueError("data must be valid UTF-8 text") from exc
+        if not 1 <= byte_length <= MCP_MAX_RTT_WRITE_BYTES:
+            raise ValueError(
+                f"data must contain 1..{MCP_MAX_RTT_WRITE_BYTES} UTF-8 bytes"
+            )
+        if "RTTView.stop()" in data:
+            raise ValueError(
+                "data contains the probe-reserved RTTView.stop() sequence"
+            )
+        with observe_operation(
+            "console.rtt.write", capability="console.rtt", action_class="emit",
+        ) as observation:
+            dev = _connected_device()
+            sent = dev.rtt_write(data)
+            observation.complete(facts=[
+                {
+                    "name": "bytes_written",
+                    "value": len(data.encode("utf-8")),
+                    "unit": "bytes",
+                },
+                {"name": "accepted", "value": bool(sent), "ok": bool(sent)},
+            ])
+            return {"sent": sent}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def rtt_stop() -> dict:
         """Stop the RTT session and return any buffered output."""
-        dev = _connected_device()
-        return {"output": dev.rtt_stop()}
+        with observe_operation(
+            "console.rtt.stop", capability="console.rtt", action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            output = dev.rtt_stop()
+            publish_mcp_rtt(output)
+            observation.complete(facts=rtt_facts(output))
+            return {"output": output}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def capture_rtt(
         duration: float = 5.0,
-        pattern: str | None = None,
+        pattern: StrictStr | None = None,
     ) -> dict:
         """One-shot RTT capture: auto start → read → return (session stays up).
 
@@ -673,22 +1181,51 @@ def _register_rtt_tools(mcp: Any) -> None:
         Args:
             duration: Seconds to capture (default 5.0).
             pattern: If given, return early once this substring appears in
-                the output (e.g. "System ready").
+                the output (e.g. "System ready"). It is matched literally
+                and must contain 1..256 UTF-8 bytes.
         """
-        dev = _connected_device()
-        out = dev.wait_for_rtt(
-            pattern, timeout=duration, start_if_needed=True,
-        )
-        matched = pattern is not None and pattern in out
-        return {"output": out, "matched": matched}
+        duration = _bounded_duration(duration)
+        if pattern is not None:
+            if type(pattern) is not str:
+                raise ValueError("pattern must be UTF-8 text or None")
+            try:
+                byte_length = len(pattern.encode("utf-8"))
+            except UnicodeEncodeError as exc:
+                raise ValueError("pattern must be valid UTF-8 text") from exc
+            if not 1 <= byte_length <= MCP_MAX_RTT_PATTERN_BYTES:
+                raise ValueError(
+                    "pattern must contain 1.."
+                    f"{MCP_MAX_RTT_PATTERN_BYTES} UTF-8 bytes"
+                )
+        with observe_operation(
+            "console.rtt.capture", capability="console.rtt", action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            out = dev.wait_for_rtt(
+                pattern, timeout=duration, start_if_needed=True,
+            )
+            matched = pattern is not None and pattern in out
+            publish_mcp_rtt(out)
+            observation.complete(facts=rtt_facts(
+                out, duration=duration, matched=matched,
+            ))
+            return {"output": out, "matched": matched}
 
 
 def _register_systemview_tools(mcp: Any) -> None:
+    from mklink.mcp_stream_bridge import publish_mcp_systemview
+    from mklink.observe_bridge import (
+        observe_operation,
+        systemview_analysis_facts,
+        systemview_capture_facts,
+    )
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_start(
         addr: str | None = None,
-        channel: int = 1,
-        search_size: int = 1024,
+        channel: StrictInt = 1,
+        search_size: StrictInt = 1024,
         mode: str = "auto",
     ) -> dict:
         """Start a SystemView RTOS-trace capture from RTT channel 1.
@@ -702,22 +1239,40 @@ def _register_systemview_tools(mcp: Any) -> None:
         Args:
             addr: RTT control-block address (resolved from
                 .mklink/rtt_config.json when omitted, shared with RTT).
-            channel: SystemView up-channel (SEGGER default 1).
+            channel: SystemView up-channel, 0..2 on V4 firmware (default 1).
             search_size: Probe scan window in bytes (default 1024).
             mode: "auto"/"dynamic"/"static" — same semantics as rtt_start.
         """
-        dev = _connected_device()
+        if type(channel) is not int or not 0 <= channel < 3:
+            raise ValueError(
+                "channel must be between 0 and 2 for V4 probe firmware"
+            )
+        if type(search_size) is not int or not 0 <= search_size <= MCP_MAX_SEARCH_BYTES:
+            raise ValueError(
+                f"search_size must be between 0 and {MCP_MAX_SEARCH_BYTES} bytes"
+            )
         mode_map = {"auto": None, "dynamic": 0, "static": 1}
         if mode not in mode_map:
             raise ValueError(
                 f"mode must be one of {list(mode_map)}, got {mode!r}"
             )
-        return dev.systemview_start(
-            addr, channel=channel, search_size=search_size,
-            mode=mode_map[mode],
-        )
+        with observe_operation(
+            "console.rtt.systemview.start",
+            capability="console.rtt",
+            action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            result = dev.systemview_start(
+                addr, channel=channel, search_size=search_size,
+                mode=mode_map[mode],
+            )
+            observation.complete(facts=[
+                {"name": "channel", "value": channel, "unit": "count"},
+            ])
+            return result
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_read(duration: float = 3.0) -> dict:
         """Read & decode SystemView events for ``duration`` seconds.
 
@@ -726,17 +1281,33 @@ def _register_systemview_tools(mcp: Any) -> None:
         task switches, ISR enter/exit, idle, timer, user events, etc.
         Call systemview_start first.
         """
-        dev = _connected_device()
-        return dev.systemview_read(duration)
+        duration = _bounded_duration(duration)
+        with observe_operation(
+            "console.rtt.systemview.read",
+            capability="console.rtt",
+            action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            result = dev.systemview_read(duration)
+            publish_mcp_systemview(result)
+            observation.complete(facts=systemview_capture_facts(result))
+            return result
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_stop() -> dict:
         """Stop the SystemView capture."""
-        dev = _connected_device()
-        dev.systemview_stop()
-        return {"status": "stopped"}
+        with observe_operation(
+            "console.rtt.systemview.stop",
+            capability="console.rtt",
+            action_class="observe",
+        ):
+            dev = _connected_device()
+            dev.systemview_stop()
+            return {"status": "stopped"}
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def capture_systemview(duration: float = 5.0) -> dict:
         """One-shot SystemView capture: start → read → stop → return events.
 
@@ -745,15 +1316,24 @@ def _register_systemview_tools(mcp: Any) -> None:
         time (from task_start_exec/task_stop_exec intervals), and kernel-object
         events — use to diagnose priority inversion, starvation, or latency.
         """
-        dev = _connected_device()
-        dev.systemview_start()
-        try:
-            result = dev.systemview_read(duration)
-        finally:
-            dev.systemview_stop()
-        return result
+        duration = _bounded_duration(duration)
+        with observe_operation(
+            "console.rtt.systemview.capture",
+            capability="console.rtt",
+            action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            dev.systemview_start()
+            try:
+                result = dev.systemview_read(duration)
+            finally:
+                dev.systemview_stop()
+            publish_mcp_systemview(result)
+            observation.complete(facts=systemview_capture_facts(result))
+            return result
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_analyze(duration: float = 5.0) -> dict:
         """Capture SystemView for ``duration`` seconds and analyze the RTOS state.
 
@@ -764,20 +1344,28 @@ def _register_systemview_tools(mcp: Any) -> None:
         SystemView User Guide (UM08027): per-task/ISR time, ISR latency, scheduling.
         """
         from mklink.systemview_analyzer import analyze_events
-        dev = _connected_device()
-        dev.systemview_start()
-        try:
-            result = dev.systemview_read(duration)
-        finally:
-            dev.systemview_stop()
-        report = analyze_events(result.get("events", []))
-        report["capture"] = {
-            "event_count": result.get("event_count", 0),
-            "synced": result.get("synced"),
-            "dropped": result.get("dropped_bytes", 0) + result.get("dropped_packets", 0),
-            "cpu_freq": result.get("cpu_freq"),
-        }
-        return report
+        duration = _bounded_duration(duration)
+        with observe_operation(
+            "console.rtt.systemview.analyze",
+            capability="console.rtt",
+            action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            dev.systemview_start()
+            try:
+                result = dev.systemview_read(duration)
+            finally:
+                dev.systemview_stop()
+            publish_mcp_systemview(result)
+            report = analyze_events(result.get("events", []))
+            report["capture"] = {
+                "event_count": result.get("event_count", 0),
+                "synced": result.get("synced"),
+                "dropped": result.get("dropped_bytes", 0) + result.get("dropped_packets", 0),
+                "cpu_freq": result.get("cpu_freq"),
+            }
+            observation.complete(facts=systemview_analysis_facts(report))
+            return report
 
     @mcp.tool()
     def systemview_analyze_events(events: list) -> dict:
@@ -792,6 +1380,7 @@ def _register_systemview_tools(mcp: Any) -> None:
         return analyze_events(events)
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_report(
         duration: float = 5.0,
         out_path: str = "systemview_report.html",
@@ -805,32 +1394,46 @@ def _register_systemview_tools(mcp: Any) -> None:
         from mklink.systemview_analyzer import analyze_events
         from mklink.systemview_report import generate_html_report
         from pathlib import Path
-        dev = _connected_device()
-        dev.systemview_start()
-        try:
-            result = dev.systemview_read(duration)
-        finally:
-            dev.systemview_stop()
-        events = result.get("events", [])
-        # 任务名解析
-        ids = list({e["task_id"] for e in events if "task_id" in e})
-        if ids:
+        duration = _bounded_duration(duration)
+        with observe_operation(
+            "console.rtt.systemview.report",
+            capability="console.rtt",
+            action_class="observe",
+        ) as observation:
+            dev = _connected_device()
+            dev.systemview_start()
             try:
-                names = dev.systemview_resolve_task_names(ids)
-                for e in events:
-                    if e.get("task_id") in names:
-                        e["task_name"] = names[e["task_id"]]
-            except Exception:
-                pass
-        report = analyze_events(events)
-        html_str = generate_html_report(report, events, meta={"cpu_freq": result.get("cpu_freq")})
-        out = Path(out_path).resolve()
-        out.write_text(html_str, encoding="utf-8")
-        return {"path": str(out), "events": len(events),
-                "tasks": report["summary"].get("task_count", 0),
-                "anomalies": len(report.get("anomalies", []))}
+                result = dev.systemview_read(duration)
+            finally:
+                dev.systemview_stop()
+            events = result.get("events", [])
+            # 任务名解析
+            ids = list({e["task_id"] for e in events if "task_id" in e})
+            if ids:
+                try:
+                    names = dev.systemview_resolve_task_names(ids)
+                    for e in events:
+                        if e.get("task_id") in names:
+                            e["task_name"] = names[e["task_id"]]
+                except Exception:
+                    pass
+            publish_mcp_systemview(result)
+            report = analyze_events(events)
+            html_str = generate_html_report(report, events, meta={"cpu_freq": result.get("cpu_freq")})
+            out = Path(out_path).resolve()
+            out.write_text(html_str, encoding="utf-8")
+            response = {"path": str(out), "events": len(events),
+                        "tasks": report["summary"].get("task_count", 0),
+                        "anomalies": len(report.get("anomalies", []))}
+            observation.complete(facts=[
+                {"name": "event_count", "value": response["events"], "unit": "count"},
+                {"name": "task_count", "value": response["tasks"], "unit": "count"},
+                {"name": "anomaly_count", "value": response["anomalies"], "unit": "count"},
+            ])
+            return response
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def systemview_integrate(
         project_root: str,
         sv_dir: str = "segger_systemview",
@@ -891,6 +1494,7 @@ def _register_systemview_tools(mcp: Any) -> None:
 
 def _register_hardfault_tools(mcp: Any) -> None:
     @mcp.tool()
+    @_exclusive_hardware_tool
     def check_hardfault() -> dict:
         """Read SCB.CFSR / SCB.HFSR. Non-zero means a HardFault occurred.
 
@@ -908,6 +1512,7 @@ def _register_hardfault_tools(mcp: Any) -> None:
         }
 
     @mcp.tool()
+    @_exclusive_hardware_tool
     def decode_hardfault() -> dict:
         """Decode a HardFault into a structured report with source locations.
 
@@ -971,6 +1576,8 @@ def _plan_flush_batches(
     chunks; batches then greedily packed (≤8 items, ≤230 chars). Encodes the
     chunking strategy from references/flush-memory.md §5.
     """
+    from mklink.remote.stream_protocol import canonical_memory_address
+
     items: list[tuple[int, bytes]] = []
     for addr, data in writes:
         if not data:
@@ -986,7 +1593,7 @@ def _plan_flush_batches(
     cur: list[tuple[int, bytes]] = []
     cur_len = len("cmd.flush_memory([])")
     for addr, data in items:
-        tup = f"(0x{addr:08X}, {_flush_data_expr(data)[0]})"
+        tup = f"({canonical_memory_address(addr)}, {_flush_data_expr(data)[0]})"
         add = len(tup) + (2 if cur else 0)
         if cur and (cur_len + add > _FLUSH_CMD_MAX or len(cur) >= 8):
             batches.append(cur)
@@ -1001,66 +1608,124 @@ def _plan_flush_batches(
 
 
 def _register_flush_tools(mcp: Any) -> None:
+    from mklink.observe_bridge import memory_flush_facts, observe_operation
+    from mklink.remote.stream_protocol import canonical_memory_address
+
     @mcp.tool()
+    @_exclusive_hardware_tool
     def flush_memory(writes: list[dict]) -> dict:
         """Write multiple discontiguous RAM regions silently via cmd.flush_memory.
 
         **Value-add over the CLI: auto-chunks.** The CLI rejects any single
         command over 230 chars (PIKA_LINE_BUFF overflow → REPL deadlock);
         this tool splits automatically:
-          - all-same-byte payloads (zero-fill, 0xFF fill) → short expression,
-            up to the firmware single-address ceiling (validated ≥16300B on
-            V4.3.3; the CLI additionally hits a Windows cmdline-length wall
-            around 16 KiB when bytes are expanded — MCP is unaffected since
-            bytes travel as hex);
+          - all-same-byte payloads (zero-fill, 0xFF fill) → short expression;
           - non-repeat data → 30-byte chunks, ≤8 addresses/batch, ≤230 chars;
           - sends batch-by-batch, waiting for the device prompt between each.
 
-        Coexists with dump_memory streaming (silent write, no hexdump echo).
+        Host safety limits are enforced before device lookup or I/O: at most
+        8 input regions, at most 12288 bytes in any one region, and at most
+        12288 bytes total per tool call. Split larger writes into sequential
+        calls and wait for each call to finish before sending the next.
+
+        The command is silent, but it must not run concurrently with any
+        dump/RTT/SystemView stream on the same probe. Stop and release the
+        stream first, then issue the write in a normal command session.
 
         Args:
             writes: List of {"address": int, "data_hex": str}, e.g.
                 [{"address": 0x20002000, "data_hex": "DEADBEEF"}].
         """
         from mklink.cli import _parse_flush_response
-        parsed: list[tuple[int, bytes]] = []
-        for i, w in enumerate(writes):
-            if not isinstance(w, dict) or "address" not in w or "data_hex" not in w:
-                raise ValueError(f"writes[{i}] must contain address and data_hex")
+        if not isinstance(writes, list) or not writes:
+            raise ValueError("writes must be a non-empty list")
+        if len(writes) > MCP_MAX_FLUSH_WRITES:
+            raise ValueError(
+                f"writes must contain at most {MCP_MAX_FLUSH_WRITES} regions"
+            )
+        with observe_operation(
+            "memory.flush",
+            capability="target.memory",
+            action_class="emit",
+        ) as observation:
+            parsed: list[tuple[int, bytes]] = []
+            for i, w in enumerate(writes):
+                if not isinstance(w, dict) or "address" not in w or "data_hex" not in w:
+                    raise ValueError(f"writes[{i}] must contain address and data_hex")
+                try:
+                    if isinstance(w["address"], bool):
+                        raise ValueError
+                    address = int(w["address"])
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"writes[{i}].address must be an integer") from exc
+                data_hex = w["data_hex"]
+                if not isinstance(data_hex, str):
+                    raise ValueError(f"writes[{i}].data_hex must be a hex string")
+                try:
+                    data = _from_hex(data_hex)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"writes[{i}].data_hex must be valid hex: {exc}"
+                    ) from exc
+                _validate_memory_range(
+                    address, len(data), max_size=MCP_MAX_FLUSH_ITEM_BYTES
+                )
+                parsed.append((address, data))
+            total = sum(len(data) for _, data in parsed)
+            if total > MCP_MAX_FLUSH_TOTAL_BYTES:
+                raise ValueError(
+                    "total write data must not exceed "
+                    f"{MCP_MAX_FLUSH_TOTAL_BYTES} bytes"
+                )
+            dev = _connected_device()
+            batches = _plan_flush_batches(parsed)
+            results = []
             try:
-                address = int(w["address"])
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"writes[{i}].address must be an integer") from exc
-            data_hex = w["data_hex"]
-            if not isinstance(data_hex, str):
-                raise ValueError(f"writes[{i}].data_hex must be a hex string")
-            try:
-                data = _from_hex(data_hex)
-            except ValueError as exc:
-                raise ValueError(f"writes[{i}].data_hex must be valid hex: {exc}") from exc
-            parsed.append((address, data))
-        dev = _connected_device()
-        batches = _plan_flush_batches(parsed)
-        results = []
-        for bi, batch in enumerate(batches):
-            tuple_strs = [
-                f"(0x{a:08X}, {_flush_data_expr(d)[0]})" for a, d in batch
-            ]
-            cmd = f"cmd.flush_memory([{', '.join(tuple_strs)}])"
-            resp = dev._bridge.send_command(cmd, timeout=10.0)
-            ok, msg = _parse_flush_response(resp)
-            results.append({
-                "batch": bi + 1, "items": len(batch),
-                "bytes": sum(len(d) for _, d in batch),
-                "ok": ok, "message": msg,
-            })
-        total = sum(len(d) for _, d in parsed)
-        return {
-            "ok": all(r["ok"] for r in results),
-            "batches": len(batches),
-            "total_bytes": total,
-            "results": results,
-        }
+                for bi, batch in enumerate(batches):
+                    tuple_strs = [
+                        f"({canonical_memory_address(a)}, {_flush_data_expr(d)[0]})"
+                        for a, d in batch
+                    ]
+                    cmd = f"cmd.flush_memory([{', '.join(tuple_strs)}])"
+                    resp = dev._bridge.send_command(cmd, timeout=10.0)
+                    ok, msg = _parse_flush_response(resp)
+                    results.append({
+                        "batch": bi + 1, "items": len(batch),
+                        "bytes": sum(len(d) for _, d in batch),
+                        "ok": ok, "message": msg,
+                    })
+            except Exception:
+                successful_batches = sum(result["ok"] for result in results)
+                facts = memory_flush_facts(
+                    canonical_memory_address(parsed[0][0]) if parsed else None,
+                    total_bytes=total,
+                    region_count=len(parsed),
+                    batch_count=len(batches),
+                    successful_batches=successful_batches,
+                    failed_batches=len(batches) - successful_batches,
+                )
+                observation.fail("memory_flush_transport_failed", facts=facts)
+                raise
+            response = {
+                "ok": all(r["ok"] for r in results),
+                "batches": len(batches),
+                "total_bytes": total,
+                "results": results,
+            }
+            failed_batches = sum(not result["ok"] for result in results)
+            facts = memory_flush_facts(
+                canonical_memory_address(parsed[0][0]) if parsed else None,
+                total_bytes=total,
+                region_count=len(parsed),
+                batch_count=len(batches),
+                successful_batches=len(batches) - failed_batches,
+                failed_batches=failed_batches,
+            )
+            if response["ok"]:
+                observation.complete(facts=facts)
+            else:
+                observation.fail("memory_flush_failed", facts=facts)
+            return response
 
 
 # ---- Modbus RTU (independent serial port session) ----
@@ -1298,6 +1963,7 @@ def _register_serial_tools(mcp: Any) -> None:
             duration: Seconds to capture (default 1.0).
         """
         import time
+        duration = _bounded_duration(duration)
         s = _get_serial()
         deadline = time.time() + duration
         buf = bytearray()
@@ -1360,11 +2026,36 @@ def run() -> None:
     global mcp
     if mcp is None:
         mcp = build_server()
+    stop_mcp_stream_sidecar = None
+    try:
+        from mklink.mcp_stream_bridge import (
+            start_mcp_stream_sidecar,
+            stop_mcp_stream_sidecar,
+        )
+
+        start_mcp_stream_sidecar(wait_timeout=0.75)
+    except Exception:
+        # Observation is optional and must never prevent the MCP owner from
+        # serving device tools. Avoid logging on the stdio protocol channel.
+        pass
     with _isolate_stdio_protocol():
         try:
             mcp.run(transport="stdio")
         finally:
-            _reset_device()
+            try:
+                _reset_device()
+            finally:
+                if stop_mcp_stream_sidecar is not None:
+                    try:
+                        stop_mcp_stream_sidecar(timeout=0.5)
+                    except Exception:
+                        pass
+                try:
+                    from mklink.observe_bridge import shutdown_process_observation
+
+                    shutdown_process_observation(timeout=0.5)
+                except Exception:
+                    pass
 
 
 __all__ = ["build_server", "run", "configure_device"]

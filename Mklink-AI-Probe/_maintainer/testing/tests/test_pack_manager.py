@@ -2,10 +2,12 @@ import json
 import os
 from pathlib import Path
 import signal
+import stat
 import subprocess
 import sys
 import threading
 import time
+import xml.etree.ElementTree as ElementTree
 from zipfile import ZipFile
 
 import pytest
@@ -1909,6 +1911,193 @@ def test_worker_import_indexes_the_descriptor_inside_a_real_pack_archive(tmp_pat
     assert Path(result["pack_path"]).read_bytes() == source.read_bytes()
 
 
+def test_worker_import_indexes_missing_url_pack_without_rewriting_readonly_source(
+    tmp_path,
+):
+    source = tmp_path / "WHXY.CW32L012_DFP.1.0.2.pack"
+    descriptor = """<?xml version="1.0" encoding="utf-8"?>
+<package schemaVersion="1.1" xmlns:xs="http://www.w3.org/2001/XMLSchema-instance">
+  <vendor>WHXY</vendor>
+  <name>CW32L012_DFP</name>
+  <description>CW32 ARM Cortex-M0+ Device Family Pack</description>
+  <releases>
+    <release version="1.0.2" date="2025-09-02">Version 1.0.2</release>
+    <release version="1.0.1" date="2025-07-30">Version 1.0.1</release>
+  </releases>
+  <devices>
+    <family Dfamily="CW32L0 Series" Dvendor="WHXY">
+      <processor Dcore="Cortex-M0+" Dfpu="0" Dmpu="0" Dendian="Little-endian"/>
+      <subFamily DsubFamily="CW32L012">
+        <device Dname="CW32L012C8">
+          <processor Dclock="96000000"/>
+          <memory name="IROM1" access="rx" start="0x00000000" size="0x10000" startup="1" default="1"/>
+          <memory name="IRAM1" access="rw" start="0x20000000" size="0x02000" init="0" default="1"/>
+          <algorithm name="Flash/FlashCW32L012.FLM" start="0x00000000" size="0x10000" default="1"/>
+        </device>
+      </subFamily>
+    </family>
+  </devices>
+</package>
+"""
+    with ZipFile(source, "w") as archive:
+        archive.writestr("WHXY.CW32L012_DFP.pdsc", descriptor)
+        archive.writestr("Flash/FlashCW32L012.FLM", b"algorithm")
+    source_bytes = source.read_bytes()
+    source.chmod(stat.S_IREAD)
+    cache_root = tmp_path / "cache"
+    paths = PackPaths(cache_root)
+    stage = paths.staging_dir / "missing-url-import"
+
+    try:
+        result = handle_request(
+            {
+                "command": "import",
+                "payload": {"path": str(source)},
+                "root": str(cache_root),
+                "staging_dir": str(stage.resolve()),
+            },
+            lambda event: None,
+        )
+
+        installed = Path(result["pack_path"])
+        index = json.loads(paths.index_file.read_text(encoding="utf-8"))
+        assert result["pack_id"] == "WHXY.CW32L012_DFP"
+        assert result["version"] == "1.0.2"
+        assert index["CW32L012C8"]["from_pack"] == {
+            "pack": "CW32L012_DFP",
+            "url": "",
+            "vendor": "WHXY",
+            "version": "1.0.2",
+        }
+        assert source.read_bytes() == source_bytes
+        assert installed.read_bytes() == source_bytes
+        assert installed.stat().st_mode & stat.S_IWRITE
+
+        parent = SubprocessPackWorker(paths)
+        parent._active_staging_dir = stage
+        parent.acknowledge_commit(result)
+        assert not paths.staging_dir.exists()
+    finally:
+        source.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_manager_reimports_over_legacy_readonly_installed_pack(tmp_path):
+    source = tmp_path / "Vendor.Device_DFP.1.2.3.pack"
+    descriptor = """<?xml version="1.0" encoding="UTF-8"?>
+<package schemaVersion="1.7.0">
+  <vendor>Vendor</vendor>
+  <name>Device_DFP</name>
+  <description>Test device family</description>
+  <url>https://example.com/pack/</url>
+  <releases><release version="1.2.3" date="2026-01-01">Test</release></releases>
+  <devices>
+    <family Dfamily="Test" Dvendor="Vendor:1">
+      <processor Dcore="Cortex-M3" Dfpu="NO_FPU" Dmpu="NO_MPU" Dendian="Little-endian" Dclock="1000000"/>
+      <device Dname="DEVICE_A">
+        <memory name="IROM1" start="0x08000000" size="0x1000" access="rx" default="1" startup="1"/>
+        <memory name="IRAM1" start="0x20000000" size="0x1000" access="rwx" default="1"/>
+        <algorithm name="Flash/Test.FLM" start="0x08000000" size="0x1000" default="1"/>
+      </device>
+    </family>
+  </devices>
+</package>
+"""
+    with ZipFile(source, "w") as archive:
+        archive.writestr("Vendor.Device_DFP.pdsc", descriptor)
+        archive.writestr("Flash/Test.FLM", b"algorithm")
+
+    cache_root = tmp_path / "cache"
+    paths = PackPaths(cache_root)
+    manager = PackManager(cache_root)
+    first = manager.import_pack(source, lambda _event: None)
+    installed = Path(first["pack_path"])
+    installed.chmod(stat.S_IREAD)
+
+    try:
+        second = manager.import_pack(source, lambda _event: None)
+
+        assert second == first
+        assert installed.read_bytes() == source.read_bytes()
+        assert installed.stat().st_mode & stat.S_IWRITE
+        assert not (paths.root / "pack-transaction.json").exists()
+        assert not paths.staging_dir.exists()
+    finally:
+        for candidate in tmp_path.rglob("*"):
+            if candidate.is_file():
+                candidate.chmod(stat.S_IREAD | stat.S_IWRITE)
+
+
+def test_local_import_descriptor_preserves_url_and_adds_namespaced_url():
+    existing = b"""<?xml version="1.0" encoding="utf-8"?>
+<package><vendor>Vendor</vendor><name>Pack</name><url>https://example.com/</url></package>
+"""
+    assert pack_worker_module._normalize_local_import_descriptor(existing) == existing
+
+    missing = b"""<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="urn:test"><vendor>Vendor</vendor><name>Pack</name><description>Test</description></package>
+"""
+    normalized = pack_worker_module._normalize_local_import_descriptor(missing)
+    root = ElementTree.fromstring(normalized)
+    urls = [child for child in root if child.tag.rsplit("}", 1)[-1] == "url"]
+
+    assert len(urls) == 1
+    assert urls[0].tag == "{urn:test}url"
+
+
+def test_local_import_descriptor_does_not_confuse_extension_url_with_pack_url():
+    descriptor = b"""<?xml version="1.0" encoding="utf-8"?>
+<package xmlns:ext="urn:extension">
+  <vendor>Vendor</vendor>
+  <name>Pack</name>
+  <ext:description>Extension metadata</ext:description>
+  <ext:url>https://example.com/extension/</ext:url>
+</package>
+"""
+
+    normalized = pack_worker_module._normalize_local_import_descriptor(descriptor)
+    root = ElementTree.fromstring(normalized)
+    children = list(root)
+
+    assert [child.tag for child in children[:3]] == ["vendor", "name", "url"]
+    assert [child.tag for child in children].count("url") == 1
+    assert [child.tag for child in children].count("{urn:extension}url") == 1
+
+
+def test_worker_import_missing_url_pack_without_devices_still_fails(tmp_path):
+    source = tmp_path / "Vendor.Empty_DFP.1.0.0.pack"
+    descriptor = b"""<?xml version="1.0" encoding="utf-8"?>
+<package schemaVersion="1.7.0">
+  <vendor>Vendor</vendor>
+  <name>Empty_DFP</name>
+  <description>No devices</description>
+  <releases><release version="1.0.0">Test</release></releases>
+  <devices/>
+</package>
+"""
+    with ZipFile(source, "w") as archive:
+        archive.writestr("Vendor.Empty_DFP.pdsc", descriptor)
+    source_bytes = source.read_bytes()
+    cache_root = tmp_path / "cache"
+
+    with pytest.raises(pack_worker_module.WorkerFailure) as raised:
+        handle_request(
+            {
+                "command": "import",
+                "payload": {"path": str(source)},
+                "root": str(cache_root),
+                "staging_dir": str(
+                    (PackPaths(cache_root).staging_dir / "empty-import").resolve()
+                ),
+            },
+            lambda event: None,
+        )
+
+    assert raised.value.code is FlashErrorCode.PACK_INTEGRITY_ERROR
+    assert raised.value.message == "imported pack metadata is missing or ambiguous"
+    assert source.read_bytes() == source_bytes
+    assert not list(PackPaths(cache_root).data_dir.rglob("*.pack"))
+
+
 def test_worker_protocol_stdout_contains_json_lines_only():
     from io import StringIO
 
@@ -2393,6 +2582,58 @@ def test_recover_transaction_restores_interrupted_journal(tmp_path):
     assert not prepared.exists()
     assert not backup.exists()
     assert not journal.exists()
+
+
+def test_recover_committed_transaction_removes_legacy_readonly_backup(tmp_path):
+    paths = PackPaths(tmp_path)
+    target = _pack_path(paths, "Test", "Pack", "1.0.0")
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"new")
+    paths.state_file.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "Test.Pack": {"1.0.0": str(target.resolve())},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    stage = paths.staging_dir / "committed-readonly-job"
+    stage.mkdir(parents=True)
+    prepared = stage / "prepared.pack"
+    backup = stage / "target.backup"
+    backup.write_bytes(b"old")
+    backup.chmod(stat.S_IREAD)
+    journal = paths.root / "pack-transaction.json"
+    journal.write_text(
+        json.dumps(
+            {
+                "phase": "committed",
+                "staging_dir": str(stage.resolve()),
+                "result": _transaction_result(target),
+                "entries": [
+                    {
+                        "target": str(target.resolve()),
+                        "prepared": str(prepared.resolve()),
+                        "backup": str(backup.resolve()),
+                        "original_exists": True,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        pack_worker_module.recover_pending_transaction(paths)
+
+        assert target.read_bytes() == b"new"
+        assert not backup.exists()
+        assert not journal.exists()
+    finally:
+        if backup.exists():
+            backup.chmod(stat.S_IREAD | stat.S_IWRITE)
 
 
 def test_failed_rollback_keeps_journal_for_next_worker_recovery(tmp_path):

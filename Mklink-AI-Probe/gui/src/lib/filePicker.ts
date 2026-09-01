@@ -1,7 +1,6 @@
 import { isTauri } from '@tauri-apps/api/core'
 
 const SYMBOL_FILTER = { name: 'AXF / ELF', extensions: ['axf', 'elf', 'out'] }
-const MAP_FILTER = { name: 'MAP', extensions: ['map'] }
 const FIRMWARE_FILTER = { name: 'BIN / HEX', extensions: ['bin', 'hex'] }
 
 export type PickedFile = string | File | null
@@ -59,10 +58,6 @@ async function pickFile(filter: { name: string, extensions: string[] }): Promise
 
 export function pickSymbolFile(): Promise<PickedFile> {
   return pickFile(SYMBOL_FILTER)
-}
-
-export function pickMapFile(): Promise<PickedFile> {
-  return pickFile(MAP_FILTER)
 }
 
 export async function pickFirmwareFiles(multiple = false): Promise<Array<string | File>> {

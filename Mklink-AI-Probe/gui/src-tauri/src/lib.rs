@@ -1,3 +1,4 @@
+mod desktop_clipboard;
 mod site_agent_config;
 mod site_agent_network;
 mod site_agent_secret;
@@ -276,6 +277,27 @@ fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
         return Err("file path is empty".into());
     }
     std::fs::write(&target, contents).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clipboard_read_text() -> Result<String, String> {
+    desktop_clipboard::read_text()
+}
+
+#[tauri::command]
+fn clipboard_write_text(window: tauri::WebviewWindow, text: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let raw_owner = window
+        .hwnd()
+        .map_err(|error| format!("Unable to access the application window handle: {error}"))?
+        .0 as isize;
+    #[cfg(not(target_os = "windows"))]
+    let raw_owner = {
+        let _ = window;
+        1
+    };
+    let owner = desktop_clipboard::ClipboardOwner::from_raw(raw_owner)?;
+    desktop_clipboard::write_text(owner, &text)
 }
 
 fn powershell_single_quote(value: &str) -> String {
@@ -889,6 +911,8 @@ pub fn run() {
             site_agent_stcp_credentials_configure,
             site_agent_bind_addresses,
             write_file,
+            clipboard_read_text,
+            clipboard_write_text,
             rename_usb_ports,
         ])
         .setup(move |app| {
@@ -1056,6 +1080,12 @@ mod tests {
             desktop_workspace_root(Path::new(r"C:\Users\test\AppData\Local\Mklink AI Probe")),
             PathBuf::from(r"C:\Users\test\AppData\Local\Mklink AI Probe\workspace"),
         );
+    }
+
+    #[test]
+    fn clipboard_write_command_receives_the_invoking_webview_window() {
+        let command: fn(tauri::WebviewWindow, String) -> Result<(), String> = clipboard_write_text;
+        let _ = command;
     }
 
     #[test]

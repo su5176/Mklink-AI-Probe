@@ -17,7 +17,7 @@ import {
   type BrowserFirmwareFileHandle,
   type PickedFirmwareSource,
 } from '../lib/filePicker'
-import type { CustomFlmRecord, ImageInspection, JobAction, JobEvent, JobState, JobStreamEvent, JobSubscription, PackStatus, ProbeRecord, TargetMemoryRegion, TargetRecord } from '../types/onlineFlash'
+import type { CustomFlmRecord, FlashAlgorithmRecord, ImageInspection, JobAction, JobEvent, JobState, JobStreamEvent, JobSubscription, PackStatus, ProbeRecord, TargetMemoryRegion, TargetRecord } from '../types/onlineFlash'
 
 const STORAGE_KEY = 'mklink.onlineFlash.settings'
 const PROBE_DISCOVERY_ATTEMPTS = 6
@@ -59,6 +59,7 @@ const selectedTarget = ref<TargetRecord | null>(null)
 const targetMemoryRegions = ref<TargetMemoryRegion[]>([])
 const targetMemoryMapBusy = ref(false)
 const desiredPart = ref(saved.targetPart ?? '')
+const targetQuery = ref('')
 const packStatus = ref<PackStatus | null>(null)
 const packBusy = ref(false)
 const packCancelPending = ref(false)
@@ -66,6 +67,7 @@ const packProgress = ref(0)
 const packPhase = ref('preparing')
 const packError = ref('')
 const customFlms = ref<CustomFlmRecord[]>([])
+const flashAlgorithms = ref<FlashAlgorithmRecord[]>([])
 const customFlmBusy = ref(false)
 const customFlmError = ref('')
 const firmware = ref<File | null>(null)
@@ -106,6 +108,7 @@ let targetSearchController: AbortController | null = null
 let targetMemoryMapToken = 0
 let packOperationToken = 0
 let customFlmToken = 0
+let flashAlgorithmToken = 0
 let autoInspectTimer: ReturnType<typeof setTimeout> | null = null
 let sourcePollTimer: ReturnType<typeof setTimeout> | null = null
 let sourcePollingEnabled = false
@@ -268,6 +271,21 @@ async function searchTargets(query = '', commit = true): Promise<TargetRecord[]>
   }
 }
 
+async function findExactTarget(partNumber: string): Promise<TargetRecord | null> {
+  const records = await api.searchTargets(partNumber, { limit: 100 })
+  return records.find(target => target.part_number === partNumber) ?? null
+}
+
+async function refreshDesiredTarget(partNumber = desiredPart.value): Promise<TargetRecord | null> {
+  if (!partNumber) return null
+  const exact = await findExactTarget(partNumber)
+  if (desiredPart.value === partNumber && !disposed) {
+    selectedTarget.value = exact?.installed ? exact : null
+    if (exact?.installed && !baseAddress.value) baseAddress.value = defaultBinAddress(exact.part_number)
+  }
+  return exact
+}
+
 function applyPackEvent(event: Awaited<ReturnType<typeof api.installPack>>['events'][number]): void {
   if (event.type === 'log') appendLog(`[PACK] ${event.message}`)
   else {
@@ -308,10 +326,12 @@ async function selectTarget(target: TargetRecord): Promise<void> {
         const installedPack = 'part_number' in result ? result.part_number : `${result.pack_id}@${result.version}`
         appendLog(tr(`[PACK] 已安装 ${installedPack}`, `[PACK] Installed ${installedPack}`))
       }
-      const [, refreshedTargets] = await Promise.all([refreshPackStatus(), searchTargets(target.part_number, false)])
+      const [, refreshed] = await Promise.all([refreshPackStatus(), findExactTarget(target.part_number)])
       packProgress.value = 1
-      const refreshed = refreshedTargets.find(item => item.part_number === target.part_number && item.installed)
-      if (refreshed) selectedTarget.value = refreshed
+      if (refreshed?.installed) {
+        selectedTarget.value = refreshed
+        await searchTargets(targetQuery.value)
+      }
       else {
         selectedTarget.value = null
         packError.value = tr(`Pack 安装完成，但安装后索引仍未确认 ${target.part_number} 已安装，请刷新索引后重试。`, `Pack installation completed, but the index still does not show ${target.part_number} as installed. Refresh the index and retry.`)
@@ -345,6 +365,23 @@ async function loadCustomFlms(partNumber = selectedTarget.value?.part_number || 
   }
 }
 
+async function loadFlashAlgorithms(partNumber = selectedTarget.value?.part_number || ''): Promise<void> {
+  const token = ++flashAlgorithmToken
+  if (!partNumber) {
+    flashAlgorithms.value = []
+    return
+  }
+  try {
+    const records = await api.listTargetAlgorithms(partNumber)
+    if (token === flashAlgorithmToken && !disposed) flashAlgorithms.value = records
+  } catch (error) {
+    if (token === flashAlgorithmToken) {
+      flashAlgorithms.value = []
+      customFlmError.value = message(error)
+    }
+  }
+}
+
 async function loadTargetMemoryMap(partNumber = selectedTarget.value?.part_number || ''): Promise<void> {
   const token = ++targetMemoryMapToken
   targetMemoryRegions.value = []
@@ -365,6 +402,7 @@ async function loadTargetMemoryMap(partNumber = selectedTarget.value?.part_numbe
 
 watch(() => selectedTarget.value?.part_number || '', partNumber => {
   void loadCustomFlms(partNumber)
+  void loadFlashAlgorithms(partNumber)
   void loadTargetMemoryMap(partNumber)
 })
 
@@ -375,7 +413,7 @@ async function addCustomFlm(file: File): Promise<void> {
   customFlmError.value = ''
   try {
     await api.addCustomFlm(file, partNumber)
-    await Promise.all([loadCustomFlms(partNumber), loadTargetMemoryMap(partNumber)])
+    await Promise.all([loadCustomFlms(partNumber), loadFlashAlgorithms(partNumber), loadTargetMemoryMap(partNumber)])
     resetInspection()
     scheduleAutoInspection()
   } catch (error) {
@@ -393,7 +431,7 @@ async function removeCustomFlm(algorithmId: string): Promise<void> {
   customFlmError.value = ''
   try {
     await api.removeCustomFlm(algorithmId, partNumber)
-    await Promise.all([loadCustomFlms(partNumber), loadTargetMemoryMap(partNumber)])
+    await Promise.all([loadCustomFlms(partNumber), loadFlashAlgorithms(partNumber), loadTargetMemoryMap(partNumber)])
     resetInspection()
     scheduleAutoInspection()
   } catch (error) {
@@ -410,7 +448,7 @@ async function updatePackIndex(): Promise<void> {
   if (packBusy.value) return
   const operation = ++packOperationToken
   packBusy.value = true; packProgress.value = 0; packPhase.value = 'preparing'; packError.value = ''
-  try { await api.updatePackIndex(applyPackEvent); await Promise.all([refreshPackStatus(), searchTargets('')]); packProgress.value = 1 }
+  try { await api.updatePackIndex(applyPackEvent); await Promise.all([refreshPackStatus(), searchTargets(targetQuery.value), refreshDesiredTarget()]); packProgress.value = 1 }
   catch (error) { packError.value = message(error) } finally {
     if (operation === packOperationToken) { packBusy.value = false; packCancelPending.value = false }
   }
@@ -425,7 +463,7 @@ async function importPack(file: File): Promise<void> {
       ? `${response.result.pack_id}@${response.result.version}`
       : 'part_number' in response.result ? response.result.part_number : 'Pack'
     appendLog(tr(`[PACK] 已导入 ${importedPack}`, `[PACK] Imported ${importedPack}`))
-    await Promise.all([refreshPackStatus(), searchTargets(desiredPart.value)])
+    await Promise.all([refreshPackStatus(), searchTargets(targetQuery.value), refreshDesiredTarget()])
     packProgress.value = 1
   } catch (error) { packError.value = message(error) } finally {
     if (operation === packOperationToken) { packBusy.value = false; packCancelPending.value = false }
@@ -755,7 +793,8 @@ function toggleSector(address: number): void {
 
 onMounted(() => {
   startSourcePolling()
-  void Promise.all([refreshProbes(true), refreshPackStatus(), searchTargets(desiredPart.value)])
+  void Promise.all([refreshProbes(true), refreshPackStatus(), searchTargets(targetQuery.value), refreshDesiredTarget()])
+    .catch(error => { if (!disposed) packError.value = message(error) })
 })
 onActivated(() => {
   disposed = false
@@ -785,7 +824,7 @@ onBeforeUnmount(() => {
   <div class="online-flash-grid">
     <aside class="workspace-zone settings-zone" data-zone="settings">
       <ProbeSettingsPanel :probes="probes" :selected-id="probeId" :frequency="frequency" :connect-mode="connectMode" :reset-mode="resetMode" :busy="probeBusy || active" :error="probeError" @refresh="refreshProbes" @update:selected-id="probeId = $event" @update:frequency="frequency = $event" @update:connect-mode="connectMode = $event" @update:reset-mode="resetMode = $event" />
-      <TargetPackPanel :targets="targets" :selected-part="selectedTarget?.part_number || ''" :status="packStatus" :busy="packBusy" :cancel-pending="packCancelPending" :progress="packProgress" :phase="packPhase" :error="packError" :algorithms="customFlms" :algorithm-busy="customFlmBusy" :algorithm-error="customFlmError" :can-manage-algorithms="!!selectedTarget?.installed && !active && !hpmAlgorithmNotRequired" :algorithm-not-required="hpmAlgorithmNotRequired" @search="searchTargets" @select="selectTarget" @update-index="updatePackIndex" @import-pack="importPack" @cancel="cancelPack" @add-algorithm="addCustomFlm" @remove-algorithm="removeCustomFlm" />
+      <TargetPackPanel :targets="targets" :query="targetQuery" :selected-part="selectedTarget?.part_number || ''" :selected-installed="!!selectedTarget?.installed" :status="packStatus" :busy="packBusy" :cancel-pending="packCancelPending" :progress="packProgress" :phase="packPhase" :error="packError" :algorithms="customFlms" :flash-algorithms="flashAlgorithms" :algorithm-busy="customFlmBusy" :algorithm-error="customFlmError" :can-manage-algorithms="!!selectedTarget?.installed && !active && !hpmAlgorithmNotRequired" :algorithm-not-required="hpmAlgorithmNotRequired" @search="searchTargets" @update:query="targetQuery = $event" @select="selectTarget" @update-index="updatePackIndex" @import-pack="importPack" @cancel="cancelPack" @add-algorithm="addCustomFlm" @remove-algorithm="removeCustomFlm" />
       <label v-if="hpmMode" class="hpm-setting"><span>{{ tr('HPM 板卡', 'HPM Board') }}</span><select v-model="hpmBoard" data-testid="hpm-board"><option v-for="item in hpmBoards" :key="item" :value="item">{{ item }}</option></select></label>
     </aside>
     <main class="workspace-zone firmware-zone" data-zone="firmware">

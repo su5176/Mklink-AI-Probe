@@ -1,7 +1,8 @@
 import {
   decodeFrame, RTT_RAW_UTF8_LINES, RTT_TERMINAL_UTF8, SERIAL_RX_BYTES, SERIAL_TX_BYTES,
   StreamType, SUPERWATCH_METADATA_JSON,
-  SUPERWATCH_SAMPLE_MAJOR_FLOAT32, WAVEFORM_SAMPLE_MAJOR_FLOAT32, type StreamFrame,
+  SUPERWATCH_SAMPLE_MAJOR_FLOAT32, SUPERWATCH_TIMESTAMPED_FLOAT32,
+  WAVEFORM_SAMPLE_MAJOR_FLOAT32, type StreamFrame,
 } from '../lib/stream/protocol'
 import { TypedRingBuffer } from '../lib/stream/typedRingBuffer'
 import {
@@ -13,7 +14,13 @@ import {
 export type DecoderMode = 'default' | 'serial-log' | 'serial-terminal'
 
 export type WorkerInput =
-  | { type: 'configure'; capacity: number; channelCount: number; decoderMode?: DecoderMode }
+  | {
+      type: 'configure'
+      capacity: number
+      channelCount: number
+      decoderMode?: DecoderMode
+      waveformSummaryOnly?: boolean
+    }
   | {
       type: 'frame'
       buffer: ArrayBuffer
@@ -21,6 +28,8 @@ export type WorkerInput =
       frameTicket: number
     }
   | { type: 'visible-range'; requestId: number; start: number; end: number; pixelWidth: number }
+  | { type: 'waveform-detail'; enabled: boolean }
+  | { type: 'history-snapshot'; requestId: number }
   | { type: 'reset' }
 
 export interface StreamTelemetry {
@@ -60,6 +69,26 @@ export type WorkerOutput =
       bufferEndMs: number | null
       values: ArrayBuffer
       times: ArrayBuffer
+    }
+  | {
+      type: 'waveform-summary'
+      sequence: bigint
+      timestampNs: bigint
+      collectedItemCount: number
+      bufferedItemCount: number
+      channelCount: number
+      bufferStartMs: number | null
+      bufferEndMs: number | null
+      latestTimeMs: number
+      latestValues: ArrayBuffer
+    }
+  | {
+      type: 'history-snapshot'
+      requestId: number
+      itemCount: number
+      channelCount: number
+      times: ArrayBuffer
+      values: ArrayBuffer
     }
   | {
       type: 'render-envelope'
@@ -234,6 +263,7 @@ export class StreamDecoder {
   private activeConnectionGeneration: number | null = null
   private decoderMode: DecoderMode = 'default'
   private configuredCapacity = 0
+  private waveformSummaryOnly = false
   private serialDecoder = new TextDecoder('utf-8')
   private serialLineBytes: number[] = []
   private serialLineTimestampNs = 0n
@@ -246,7 +276,12 @@ export class StreamDecoder {
   handle(message: WorkerInput): void {
     switch (message.type) {
       case 'configure':
-        this.configure(message.capacity, message.channelCount, message.decoderMode ?? 'default')
+        this.configure(
+          message.capacity,
+          message.channelCount,
+          message.decoderMode ?? 'default',
+          message.waveformSummaryOnly === true,
+        )
         break
       case 'frame':
         this.receiveFrame(
@@ -258,13 +293,24 @@ export class StreamDecoder {
       case 'visible-range':
         this.visibleRange(message)
         break
+      case 'waveform-detail':
+        this.waveformSummaryOnly = !message.enabled
+        break
+      case 'history-snapshot':
+        this.historySnapshot(message.requestId)
+        break
       case 'reset':
         this.reset()
         break
     }
   }
 
-  private configure(capacity: number, channelCount: number, decoderMode: DecoderMode): void {
+  private configure(
+    capacity: number,
+    channelCount: number,
+    decoderMode: DecoderMode,
+    waveformSummaryOnly: boolean,
+  ): void {
     try {
       if (!['default', 'serial-log', 'serial-terminal'].includes(decoderMode)) {
         throw new RangeError('unsupported decoder mode')
@@ -272,6 +318,7 @@ export class StreamDecoder {
       this.ring = new TypedRingBuffer(capacity, channelCount)
       this.configuredCapacity = capacity
       this.decoderMode = decoderMode
+      this.waveformSummaryOnly = waveformSummaryOnly
       this.timeIndexScratch = new Int32Array(capacity)
       this.systemViewEvents = new SystemViewEventRing<SystemViewEvent>(capacity)
       this.systemViewIntervals = new SystemViewIntervalRing(capacity)
@@ -525,34 +572,107 @@ export class StreamDecoder {
       this.post({ type: 'superwatch-metadata', version, channels })
       return
     }
-    if (decoded.flags !== SUPERWATCH_SAMPLE_MAJOR_FLOAT32 || this.superwatchMetadataVersion <= 0) {
+    const timestamped = decoded.flags === SUPERWATCH_TIMESTAMPED_FLOAT32
+    if ((!timestamped && decoded.flags !== SUPERWATCH_SAMPLE_MAJOR_FLOAT32) || this.superwatchMetadataVersion <= 0) {
       throw new RangeError('SuperWatch samples require current metadata and sample-major Float32')
     }
     const ring = this.ring as TypedRingBuffer
-    const expectedBytes = decoded.itemCount * ring.channelCount * Float32Array.BYTES_PER_ELEMENT
+    const timeBytes = timestamped ? decoded.itemCount * Float64Array.BYTES_PER_ELEMENT : 0
+    const expectedBytes = timeBytes + decoded.itemCount * ring.channelCount * Float32Array.BYTES_PER_ELEMENT
     if (decoded.itemCount <= 0 || decoded.payload.byteLength !== expectedBytes) {
       throw new RangeError('SuperWatch payload does not match metadata channel alignment')
     }
-    const values = new Float32Array(decoded.payload)
+    const valueBuffer = timestamped ? decoded.payload.slice(timeBytes) : decoded.payload
+    const values = new Float32Array(valueBuffer)
     for (let index = 0; index < values.length; index++) {
       if (!Number.isFinite(values[index])) throw new RangeError('SuperWatch samples must be finite')
     }
     const timestampMs = Number(decoded.timestampNs) / 1_000_000
     if (!Number.isFinite(timestampMs)) throw new RangeError('SuperWatch timestamp is outside numeric range')
-    const timing = this.buildMonotonicTimes(timestampMs, decoded.itemCount)
+    let timing: { times: Float64Array; lastTimestamp: number | null; spacing: number | null }
+    if (timestamped) {
+      const times = new Float64Array(decoded.payload.slice(0, timeBytes))
+      let previous = this.lastNumericTimestampMs ?? -Infinity
+      for (const time of times) {
+        if (!Number.isFinite(time) || time < 0 || time <= previous) {
+          throw new RangeError('SuperWatch device sample times must increase strictly')
+        }
+        previous = time
+      }
+      timing = { times, lastTimestamp: previous, spacing: null }
+    } else {
+      // Compatibility with older backends that do not carry sample timestamps.
+      timing = this.buildMonotonicTimes(timestampMs, decoded.itemCount)
+    }
     ring.appendBatch(timing.times, values)
     this.lastNumericTimestampMs = timing.lastTimestamp
     this.lastNumericSpacingMs = timing.spacing
     this.commitSequence(decoded.sequence)
+    this.postWaveformSummary(
+      decoded.sequence,
+      timestamped ? BigInt(Math.round(timing.lastTimestamp! * 1_000_000)) : decoded.timestampNs,
+      decoded.itemCount,
+      ring,
+    )
+    if (this.waveformSummaryOnly) return
     const output: Extract<WorkerOutput, { type: 'waveform-batch' }> = {
       type: 'waveform-batch', sequence: decoded.sequence,
-      timestampNs: decoded.timestampNs, itemCount: decoded.itemCount,
+      timestampNs: timestamped ? BigInt(Math.round(timing.lastTimestamp! * 1_000_000)) : decoded.timestampNs,
+      itemCount: decoded.itemCount,
       channelCount: ring.channelCount, layout: 'sample-major-float32',
       bufferStartMs: ring.length ? ring.timeAt(0) : null,
       bufferEndMs: ring.length ? ring.timeAt(ring.length - 1) : null,
-      values: decoded.payload, times: timing.times.buffer as ArrayBuffer,
+      values: valueBuffer, times: timing.times.buffer as ArrayBuffer,
     }
     this.post(output, [output.values, output.times])
+  }
+
+  private postWaveformSummary(
+    sequence: bigint,
+    timestampNs: bigint,
+    collectedItemCount: number,
+    ring: TypedRingBuffer,
+  ): void {
+    if (collectedItemCount <= 0 || ring.length <= 0) return
+    const latestTimeMs = ring.timeAt(ring.length - 1)
+    const latestValues = new Float32Array(ring.channelCount)
+    for (let channel = 0; channel < ring.channelCount; channel += 1) {
+      latestValues[channel] = ring.valueAt(ring.length - 1, channel)
+    }
+    const output: Extract<WorkerOutput, { type: 'waveform-summary' }> = {
+      type: 'waveform-summary',
+      sequence,
+      timestampNs,
+      collectedItemCount,
+      bufferedItemCount: ring.length,
+      channelCount: ring.channelCount,
+      bufferStartMs: ring.timeAt(0),
+      bufferEndMs: latestTimeMs,
+      latestTimeMs,
+      latestValues: latestValues.buffer,
+    }
+    this.post(output, [output.latestValues])
+  }
+
+  private historySnapshot(requestId: number): void {
+    if (!this.ring) {
+      this.post({ type: 'error', code: 'NOT_CONFIGURED', message: 'configure the worker before export' })
+      return
+    }
+    if (!Number.isSafeInteger(requestId) || requestId <= 0) {
+      this.post({ type: 'error', code: 'INVALID_RANGE', message: 'history request id is invalid' })
+      return
+    }
+    const snapshot = this.ring.copyAll()
+    const output: Extract<WorkerOutput, { type: 'history-snapshot' }> = {
+      type: 'history-snapshot',
+      requestId,
+      itemCount: snapshot.times.length,
+      channelCount: this.ring.channelCount,
+      times: snapshot.times.buffer as ArrayBuffer,
+      values: snapshot.values.buffer as ArrayBuffer,
+    }
+    this.post(output, [output.times, output.values])
   }
 
   private acceptWaveformFrame(decoded: StreamFrame): void {

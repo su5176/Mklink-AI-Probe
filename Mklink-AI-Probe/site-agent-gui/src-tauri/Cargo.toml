@@ -1,6 +1,6 @@
 [package]
 name = "mklink-site-agent"
-version = "0.1.8"
+version = "0.1.9"
 description = "Portable field-side MKLink Site Agent control application"
 authors = ["MicroKeen"]
 edition = "2021"

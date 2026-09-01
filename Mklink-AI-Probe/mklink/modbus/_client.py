@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import threading
+from collections.abc import Callable
 
 from pymodbus.client import ModbusSerialClient
 from pymodbus import FramerType, ModbusException
@@ -99,19 +100,27 @@ class ModbusClient:
         self,
         port: str,
         baudrate: int = 9600,
+        bytesize: int = 8,
         parity: str = "N",
         stopbits: int = 1,
         timeout: float = 1.0,
         retries: int = 3,
+        handle_local_echo: bool = False,
+        trace_packet: Callable[[bool, bytes], bytes] | None = None,
+        trace_connect: Callable[[bool], None] | None = None,
     ):
         self._client = ModbusSerialClient(
             port=port,
             framer=FramerType.RTU,
             baudrate=baudrate,
+            bytesize=bytesize,
             parity=parity,
             stopbits=stopbits,
             timeout=timeout,
             retries=retries,
+            handle_local_echo=handle_local_echo,
+            trace_packet=trace_packet,
+            trace_connect=trace_connect,
         )
         self._port = port
         self._lock = _PortLock(port)

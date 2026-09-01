@@ -18,8 +18,8 @@ def _write_index(paths, targets):
     paths.index_file.write_text(json.dumps(targets), encoding="utf-8")
 
 
-def _index_target(vendor, pack, version):
-    return {
+def _index_target(vendor, pack, version, *, family="", series=""):
+    target = {
         "name": "target",
         "from_pack": {
             "vendor": vendor,
@@ -29,6 +29,11 @@ def _index_target(vendor, pack, version):
         "algorithms": [],
         "memories": {},
     }
+    if family:
+        target["family"] = family
+    if series:
+        target["sub_family"] = series
+    return target
 
 
 def _write_state(paths, installed):
@@ -68,6 +73,81 @@ def test_searches_cached_index_case_insensitively(tmp_path):
     assert results[0].pack_id == "GigaDevice.GD32F30x_DFP"
     assert results[0].pack_version == "3.0.2"
     assert results[0].source == "index"
+
+
+def test_searches_part_number_vendor_family_and_series_without_changing_order(tmp_path):
+    paths = PackPaths(root=tmp_path)
+    _write_index(
+        paths,
+        {
+            "ZX32F103": _index_target(
+                "Acme Semiconductor",
+                "ZX32_DFP",
+                "1.0.0",
+                family="Cortex Control",
+                series="ZX32 Mainstream",
+            ),
+            "AX32F103": _index_target(
+                "Acme Semiconductor",
+                "AX32_DFP",
+                "1.0.0",
+                family="Cortex Control",
+                series="AX32 Value Line",
+            ),
+            "OTHER": _index_target("Other Vendor", "Other_DFP", "1.0.0"),
+        },
+    )
+    catalog = PackCatalog(paths, builtin_provider=lambda: [])
+
+    assert [item.part_number for item in catalog.search("32F103")] == [
+        "AX32F103",
+        "ZX32F103",
+    ]
+    assert [item.part_number for item in catalog.search("acme semiconductor")] == [
+        "AX32F103",
+        "ZX32F103",
+    ]
+    assert [item.part_number for item in catalog.search("cortex control")] == [
+        "AX32F103",
+        "ZX32F103",
+    ]
+    assert [item.part_number for item in catalog.search("value line")] == [
+        "AX32F103"
+    ]
+    assert [item.part_number for item in catalog.search("cortex", limit=1)] == [
+        "AX32F103"
+    ]
+
+
+def test_duplicate_builtin_keeps_cached_family_and_series_search_metadata(tmp_path):
+    paths = PackPaths(root=tmp_path)
+    _write_index(
+        paths,
+        {
+            "PART-A": _index_target(
+                "Vendor",
+                "Part_DFP",
+                "1.0.0",
+                family="Control Family",
+                series="Value Series",
+            ),
+        },
+    )
+    builtin = TargetRecord(
+        part_number="part-a",
+        vendor="Vendor",
+        installed=True,
+        source="builtin",
+    )
+    catalog = PackCatalog(paths, builtin_provider=lambda: [builtin])
+
+    result = catalog.search("value series")
+
+    assert len(result) == 1
+    assert result[0].part_number == "part-a"
+    assert result[0].source == "builtin"
+    assert result[0].family == "Control Family"
+    assert result[0].series == "Value Series"
 
 
 def test_refresh_updates_status_from_new_cached_index(tmp_path):

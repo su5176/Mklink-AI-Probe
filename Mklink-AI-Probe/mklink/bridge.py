@@ -42,6 +42,9 @@ _STREAM_FALLBACK_STOP_COMMANDS = [
 _STREAM_READ_POLL_INTERVAL = 0.01
 _SYNC_TIMEOUTS = (0.3, 0.7)
 _RECOVERY_PROMPT_TIMEOUT = 1.0
+_FAILED_STREAM_STOP_ATTEMPTS = 2
+_FAILED_STREAM_STOP_TIMEOUT = 0.75
+_FAILED_STREAM_IDENTITY_TIMEOUT = 2.0
 
 
 def quote_probe_string(value: str) -> str:
@@ -73,6 +76,10 @@ class MKLinkSerialBridge:
         self._reader_thread: threading.Thread | None = None
         self._running = False
         self._response_buffer: list[str | bytes] = []
+        self._armed_stream_state: DeviceState | None = None
+        self._armed_stream_tail: list[bytes] = []
+        self._armed_prompt_prefix = b""
+        self._armed_prompt_seen = False
         # 命令响应和兼容文本流共用增量 UTF-8 解码器。RTT 原始字节不在
         # reader 线程中解码，以便上层选择目标固件实际使用的文本编码。
         self._utf8_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -84,6 +91,7 @@ class MKLinkSerialBridge:
         self._echo_offset = 0
         self._echo_pending = ""
         self._echo_callback: Callable[[str], None] | None = None
+        self._transport_error: Exception | None = None
 
     # ------------------------------------------------------------------
     # 连接管理
@@ -100,6 +108,7 @@ class MKLinkSerialBridge:
 
     def connect(self) -> bool:
         """打开串口并同步设备状态（等待 >>> 提示符）。"""
+        self._transport_error = None
         # 进程级互斥：获取文件锁
         if not self._port_lock.acquire():
             print(f"[FAIL] 串口 {self._port} 正被其他进程使用")
@@ -139,6 +148,9 @@ class MKLinkSerialBridge:
             self._serial.write(b"\n")
 
             if self._prompt_event.wait(timeout=sync_timeout):
+                if self._transport_error is not None:
+                    self.close()
+                    return False
                 self._ctx.state = DeviceState.READY
                 if self._is_known_command_port() or self._verify_identity():
                     return True
@@ -273,14 +285,22 @@ class MKLinkSerialBridge:
         echo: bool = False,
         echo_prefix: str = "[SERIAL] ",
         on_output: Callable[[str], None] | None = None,
+        stream_state: DeviceState | None = None,
     ) -> str:
         """发送 PikaScript 命令，等待 >>> 提示符后返回完整响应。"""
         with self._cmd_lock:
+            if self._transport_error is not None:
+                self._ctx.state = DeviceState.ERROR
+                raise ConnectionError(
+                    f"串口连接已失效，无法执行命令: {cmd}"
+                ) from self._transport_error
             if self._ctx.state not in (DeviceState.READY, DeviceState.BUSY):
                 raise ConnectionError(
                     f"设备未就绪，当前状态: {self._ctx.state.value}。请先连接设备。"
                 )
 
+            if stream_state is not None:
+                self._arm_stream(stream_state)
             self._prompt_event.clear()
             with self._buffer_lock:
                 self._response_buffer.clear()
@@ -297,6 +317,7 @@ class MKLinkSerialBridge:
             try:
                 self._serial.write((cmd + "\n").encode("utf-8"))
             except serial.SerialException as e:
+                self._transport_error = e
                 self._ctx.state = DeviceState.ERROR
                 self._echo_enabled = False
                 self._echo_callback = None
@@ -315,6 +336,14 @@ class MKLinkSerialBridge:
                     self._echo_enabled = False
                     self._echo_callback = None
                     raise TimeoutError(f"命令超时 ({timeout}s): {cmd}")
+
+            if self._transport_error is not None or self._ctx.state is DeviceState.ERROR:
+                self._echo_enabled = False
+                self._echo_callback = None
+                error = self._transport_error
+                raise ConnectionError(
+                    f"命令期间串口读取失败: {cmd}"
+                ) from error
 
             if stream_output:
                 self._flush_echo_buffer(final=True)
@@ -346,6 +375,7 @@ class MKLinkSerialBridge:
                 self._serial.write((cmd + "\n").encode("utf-8"))
                 self._serial.flush()
             except serial.SerialException as e:
+                self._transport_error = e
                 self._ctx.state = DeviceState.ERROR
                 raise ConnectionError(f"写入串口失败: {e}") from e
 
@@ -458,15 +488,102 @@ class MKLinkSerialBridge:
     # ------------------------------------------------------------------
     # 流模式控制（供 RTTSession 等使用，避免直接访问 _ctx/_serial）
     # ------------------------------------------------------------------
-    def _enter_stream(self, state: DeviceState) -> None:
-        """切换到流模式（RTT/SystemView/VOFA）。清空缓冲区避免残留数据泄漏到流中。"""
+    def _arm_stream(self, state: DeviceState) -> None:
+        """Preserve bytes arriving after a command's prompt for a new stream."""
         with self._buffer_lock:
+            self._armed_stream_state = state
+            self._armed_stream_tail.clear()
+            self._armed_prompt_prefix = b""
+            self._armed_prompt_seen = False
+
+    def _cancel_stream_arm(self) -> None:
+        """Cancel a pending command-to-stream transition."""
+        with self._buffer_lock:
+            self._armed_stream_state = None
+            self._armed_stream_tail.clear()
+            self._armed_prompt_prefix = b""
+            self._armed_prompt_seen = False
+
+    def _try_enter_stream(self, state: DeviceState) -> bool:
+        """切换到流模式，并保留启动提示符之后已经到达的流字节。"""
+        with self._buffer_lock:
+            if self._ctx.state is not DeviceState.READY:
+                return False
+            pending = []
+            armed_state = getattr(self, "_armed_stream_state", None)
+            prompt_seen = getattr(self, "_armed_prompt_seen", False)
+            armed_tail = getattr(self, "_armed_stream_tail", None)
+            if armed_state is state and prompt_seen and armed_tail is not None:
+                pending = list(armed_tail)
             self._response_buffer.clear()
+            self._response_buffer.extend(pending)
+            self._armed_stream_state = None
+            if armed_tail is None:
+                self._armed_stream_tail = []
+            else:
+                armed_tail.clear()
+            self._armed_prompt_prefix = b""
+            self._armed_prompt_seen = False
+            self._ctx.state = state
         self._utf8_decoder.reset()  # 新流会话从干净状态开始
-        self._ctx.state = state
+
+        return True
+
+    def _enter_stream(self, state: DeviceState) -> None:
+        """Atomically enter a stream without overwriting an active stream."""
+        if self._try_enter_stream(state):
+            return
+        raise RuntimeError(
+            f"cannot enter {state.value}; bridge state is {self._ctx.state.value}"
+        )
+
+    def _capture_armed_stream_tail(self, data: bytes) -> bytes:
+        """Capture raw bytes after the prompt and return command-mode bytes.
+
+        The reader still needs to see the prompt itself so it can complete the
+        waiting command.  Bytes after that prompt must never pass through the
+        UTF-8 command decoder: they are already stream payload and retaining
+        them in the reader's command ``line_buf`` would pollute the next REPL
+        response after the stream stops.
+        """
+        prompt = PROMPT.encode("ascii")
+        with self._buffer_lock:
+            if self._armed_stream_state is None:
+                return data
+            if self._armed_prompt_seen:
+                self._armed_stream_tail.append(data)
+                return b""
+
+            combined = self._armed_prompt_prefix + data
+            prompt_index = combined.find(prompt)
+            if prompt_index >= 0:
+                command_end = max(
+                    0,
+                    prompt_index + len(prompt) - len(self._armed_prompt_prefix),
+                )
+                command_data = data[:command_end]
+                tail = data[command_end:]
+                if tail:
+                    self._armed_stream_tail.append(tail)
+                self._armed_prompt_prefix = b""
+                self._armed_prompt_seen = True
+                return command_data
+
+            if combined.endswith(prompt[:2]):
+                self._armed_prompt_prefix = prompt[:2]
+            elif combined.endswith(prompt[:1]):
+                self._armed_prompt_prefix = prompt[:1]
+            else:
+                self._armed_prompt_prefix = b""
+            return data
 
     def _exit_stream(self) -> str:
-        """退出流模式，恢复 READY，返回剩余缓冲数据。"""
+        """退出流模式并返回剩余缓冲数据。
+
+        A stream-state transition can be repaired locally, but a reader or
+        writer transport failure cannot.  Keep such a bridge in ``ERROR`` so
+        callers do not reuse a disconnected serial session as ``READY``.
+        """
         with self._buffer_lock:
             parts = self._response_buffer
             if parts and isinstance(parts[0], bytes):
@@ -475,8 +592,107 @@ class MKLinkSerialBridge:
                 remaining = "".join(parts)
             self._response_buffer.clear()
         self._utf8_decoder.reset()  # 退出流：丢弃可能残留的半字符
-        self._ctx.state = DeviceState.READY
+        self._ctx.state = (
+            DeviceState.ERROR
+            if self._transport_error is not None
+            else DeviceState.READY
+        )
         return remaining
+
+    def _recover_failed_stream_start(self, stop_command: bytes) -> bool:
+        """Boundedly recover command mode after a stream start timed out.
+
+        A raw stop may return its ``>>>`` well after the write.  Returning as
+        soon as that write completes lets the stale prompt satisfy the next
+        unrelated ``send_command``.  Consume a prompt from at most two stop
+        attempts, then send exactly one identity command and keep consuming
+        prompts until the response carrying the identity token arrives.  Since
+        serial commands are ordered, that verified response also drains every
+        earlier stop reply before this method reports READY.
+        """
+        with self._cmd_lock:
+            self._cancel_stream_arm()
+            if self._transport_error is not None:
+                self._ctx.state = DeviceState.ERROR
+                return False
+            self._utf8_decoder.reset()
+            self._ctx.state = DeviceState.READY
+            with self._buffer_lock:
+                self._response_buffer.clear()
+                self._prompt_event.clear()
+
+            stop_prompt_seen = False
+            for _attempt in range(_FAILED_STREAM_STOP_ATTEMPTS):
+                if self._transport_error is not None:
+                    self._ctx.state = DeviceState.ERROR
+                    return False
+                with self._buffer_lock:
+                    self._response_buffer.clear()
+                    self._prompt_event.clear()
+                try:
+                    self._serial.write(stop_command)
+                except serial.SerialException as error:
+                    self._transport_error = error
+                    self._ctx.state = DeviceState.ERROR
+                    return False
+                except AttributeError:
+                    break
+                if self._prompt_event.wait(timeout=_FAILED_STREAM_STOP_TIMEOUT):
+                    if self._transport_error is not None:
+                        self._ctx.state = DeviceState.ERROR
+                        return False
+                    stop_prompt_seen = True
+                    break
+
+            if not stop_prompt_seen:
+                self._ctx.state = DeviceState.ERROR
+                return False
+
+            # Do not use send_command here: a delayed prompt from the second
+            # bounded stop attempt could complete it before its own response.
+            # One directly-written identity command lets us distinguish and
+            # consume such stale prompts without emitting further commands.
+            with self._buffer_lock:
+                self._response_buffer.clear()
+                self._prompt_event.clear()
+            try:
+                self._serial.write(
+                    (MKLINK_IDENTITY_COMMAND + "\n").encode("utf-8")
+                )
+            except serial.SerialException as error:
+                self._transport_error = error
+                self._ctx.state = DeviceState.ERROR
+                return False
+            except AttributeError:
+                self._ctx.state = DeviceState.ERROR
+                return False
+
+            deadline = time.monotonic() + _FAILED_STREAM_IDENTITY_TIMEOUT
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or not self._prompt_event.wait(timeout=remaining):
+                    self._ctx.state = DeviceState.ERROR
+                    return False
+                with self._buffer_lock:
+                    response = "".join(
+                        part.decode("utf-8", errors="replace")
+                        if isinstance(part, bytes)
+                        else part
+                        for part in self._response_buffer
+                    )
+                    self._prompt_event.clear()
+                if self._transport_error is not None:
+                    self._ctx.state = DeviceState.ERROR
+                    return False
+                if any(
+                    line.strip() == MKLINK_IDENTITY_TOKEN
+                    for line in response.splitlines()
+                ):
+                    with self._buffer_lock:
+                        self._response_buffer.clear()
+                    self._utf8_decoder.reset()
+                    self._ctx.state = DeviceState.READY
+                    return True
 
     def drain_stream_bytes(self, max_bytes: int | None = None) -> bytes:
         """读取并清空 VOFA / SystemView 二进制流缓冲区。
@@ -520,7 +736,17 @@ class MKLinkSerialBridge:
 
     def _write_raw(self, data: bytes) -> None:
         """直接写入串口（用于 RTT DownBuffer 等场景）。"""
-        self._serial.write(data)
+        if self._transport_error is not None:
+            self._ctx.state = DeviceState.ERROR
+            raise ConnectionError("串口连接已失效，无法写入原始数据") from (
+                self._transport_error
+            )
+        try:
+            self._serial.write(data)
+        except serial.SerialException as error:
+            self._transport_error = error
+            self._ctx.state = DeviceState.ERROR
+            raise ConnectionError(f"写入串口失败: {error}") from error
 
     # ------------------------------------------------------------------
     # 内部方法
@@ -531,13 +757,29 @@ class MKLinkSerialBridge:
 
         while self._running:
             try:
-                data = self._serial.read(4096)
-            except serial.SerialException:
+                # ``Serial.read(4096)`` waits for all 4096 bytes or the 10 ms
+                # timeout. Read exactly what the driver already has; when it
+                # is empty, block for one byte and drain the remainder on the
+                # next iteration. This removes timeout-sized aggregation from
+                # low/medium-rate binary streams without busy polling.
+                waiting = self._serial.in_waiting
+                read_size = min(65536, waiting) if isinstance(waiting, int) and waiting > 0 else 1
+                data = self._serial.read(read_size)
+            except serial.SerialException as error:
                 if self._running:
+                    self._transport_error = error
                     self._ctx.state = DeviceState.ERROR
                     self._prompt_event.set()  # 唤醒等待者
                 break
 
+            if not data:
+                continue
+
+            # A stream-producing command can return its final ``>>>`` prompt
+            # and the first stream bytes in one USB read.  Preserve those raw
+            # bytes (and anything received before _enter_stream runs) instead
+            # of decoding them as command output and clearing them.
+            data = self._capture_armed_stream_tail(data)
             if not data:
                 continue
 
@@ -574,24 +816,29 @@ class MKLinkSerialBridge:
             if PROMPT in line_buf:
                 idx = line_buf.index(PROMPT)
                 before = line_buf[:idx]
-                line_buf = line_buf[idx + len(PROMPT):]
+                # Anything after the prompt belongs to neither this completed
+                # command nor a later command.  Stream-producing commands have
+                # already split and preserved their raw tail above.
+                line_buf = ""
 
                 with self._buffer_lock:
                     self._response_buffer.append(before)
                 self._prompt_event.set()
             else:
-                # 缓冲输出，但保留尾部可能的不完整 >>>
-                # 处理 >>> 跨 read 分割的情况（如 >> + >）
+                # Commit only text that cannot be an incomplete prompt.  The
+                # previous implementation appended the trailing ``>``/``>>``
+                # immediately and returned those characters in the response
+                # when the final ``>`` arrived in a later USB read.
+                keep = (
+                    2 if line_buf.endswith(">>")
+                    else 1 if line_buf.endswith(">")
+                    else 0
+                )
+                committed = line_buf[:-keep] if keep else line_buf
                 with self._buffer_lock:
-                    self._response_buffer.append(text)
-
-                # 保留尾部可能的不完整提示符
-                if line_buf.endswith(">"):
-                    line_buf = line_buf[-len(PROMPT):]  # 保留最多 len(>>>) 字符
-                elif line_buf.endswith(">>"):
-                    line_buf = line_buf[-len(PROMPT):]
-                else:
-                    line_buf = ""
+                    if committed:
+                        self._response_buffer.append(committed)
+                line_buf = line_buf[-keep:] if keep else ""
 
     def _flush_echo_buffer(self, final: bool = False) -> None:
         """将尚未输出的串口响应增量回显到终端。"""

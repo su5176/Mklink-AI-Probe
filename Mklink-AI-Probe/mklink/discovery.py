@@ -152,6 +152,63 @@ def find_mklink_cdc_port(
     return None
 
 
+def discover_mklink_command_ports() -> list[object]:
+    """Return every MKLink command interface without probing unrelated ports.
+
+    Composite V3/V4 probes expose MI_02/MI_04/MI_06.  Only MI_04 accepts the
+    Python command protocol.  Older firmware may lack interface metadata, so
+    those physical serial candidates still use the identity handshake.  A
+    Bluetooth RFCOMM open can block for tens of seconds and can never be an
+    MKLink USB CDC command interface, therefore it is excluded entirely.
+    """
+    ports = list(list_ports.comports())
+    results: list[object] = []
+    fallback: list[object] = []
+
+    for port_info in ports:
+        interface_number = usb_interface_number(port_info)
+        if is_mklink_usb_port(port_info):
+            if interface_number == MKLINK_COMMAND_INTERFACE:
+                results.append(port_info)
+            elif interface_number is None:
+                fallback.append(port_info)
+            continue
+
+        hwid = str(getattr(port_info, "hwid", "") or "").upper()
+        if hwid.startswith("BTHENUM"):
+            continue
+        fallback.append(port_info)
+
+    def probe_priority(port_info: object) -> int:
+        mfr = str(getattr(port_info, "manufacturer", "") or "").lower()
+        desc = str(getattr(port_info, "description", "") or "").lower()
+        if any(
+            name in (mfr + " " + desc)
+            for name in ("microkeen", "microlink", "mklink")
+        ):
+            return 0
+        if (
+            getattr(port_info, "vid", None),
+            getattr(port_info, "pid", None),
+        ) in KNOWN_MKLINK_VID_PIDS:
+            return 0
+        if (
+            getattr(port_info, "vid", None) is not None
+            or str(getattr(port_info, "hwid", "") or "").upper().startswith("USB")
+        ):
+            return 1
+        return 2
+
+    fallback.sort(key=probe_priority)
+    seen = {str(item.device).strip().casefold() for item in results}
+    for port_info in fallback:
+        key = str(port_info.device).strip().casefold()
+        if key not in seen and _probe_port(port_info.device):
+            results.append(port_info)
+            seen.add(key)
+    return results
+
+
 def list_available_ports() -> list[dict]:
     """列出所有可用的串行端口。"""
     return [

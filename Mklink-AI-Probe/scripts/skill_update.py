@@ -67,7 +67,11 @@ def current_version(root: Path) -> str:
 
 
 def default_cache_file() -> Path:
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+    if os.environ.get("MKLINK_CACHE_DIR"):
+        base = Path(os.environ["MKLINK_CACHE_DIR"])
+    elif os.environ.get("MKLINK_BUILD_ROOT"):
+        base = Path(os.environ["MKLINK_BUILD_ROOT"]) / "cache"
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))

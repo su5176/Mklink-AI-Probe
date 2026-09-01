@@ -2,3 +2,4 @@
 /Mklink-AI-Probe/gui/node_modules/
 /Mklink-AI-Probe/release/
 /.worktrees/
+/.build/

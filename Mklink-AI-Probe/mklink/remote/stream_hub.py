@@ -17,7 +17,7 @@ SubscribeCallback = Callable[[Callable[..., int]], None]
 class StreamBatch:
     """An immutable payload carrying the hub-assigned batch metadata."""
 
-    payload: bytes
+    payload: bytes = field(repr=False)
     sequence: int
     item_count: int
     timestamp_ns: int = field(default_factory=time.time_ns)

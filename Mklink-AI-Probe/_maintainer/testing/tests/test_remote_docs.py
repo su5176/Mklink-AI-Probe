@@ -118,7 +118,7 @@ def _remote_added_content() -> str:
     triggers = _read(ROOT / "references" / "triggers.md")
     workflows = _read(ROOT / "references" / "workflows.md")
     gui = _read(ROOT / "references" / "commands-remote-gui.md")
-    skill_roles = _section(skill, "### 远程场景的两端角色", "## Agent 核心约束")
+    skill_routing = _section(skill, "## 按需路由")
     trigger_remote = _section(
         triggers,
         "## VPN/局域网直连远程调试",
@@ -147,7 +147,7 @@ def _remote_added_content() -> str:
     gui_routing = "\n".join(gui.splitlines()[:8])
     return "\n".join(
         (
-            skill_roles,
+            skill_routing,
             trigger_remote,
             workflow_remote,
             remote_error_rows,
@@ -159,7 +159,7 @@ def _remote_added_content() -> str:
 
 def test_remote_intent_routes_only_to_the_direct_reference_and_local_gui_remains():
     skill = _read(ROOT / "SKILL.md")
-    routing = _section(skill, "## 模块路由", "## 快速开始")
+    routing = _section(skill, "## 按需路由")
     route_lines = [
         line for line in routing.splitlines() if line.lstrip().startswith("|")
     ]
@@ -171,10 +171,12 @@ def test_remote_intent_routes_only_to_the_direct_reference_and_local_gui_remains
     ]
 
     assert len(direct_routes) == 1
-    assert "VPN/局域网远程调试" in direct_routes[0]
-    assert "远程烧录" in direct_routes[0]
+    assert "VPN/局域网" in direct_routes[0]
+    assert "Site Agent" in direct_routes[0]
+    assert "直连远程" in direct_routes[0]
     assert len(gui_routes) == 1
     assert "本地 Web GUI/API" in gui_routes[0]
+    assert "桌面应用" in gui_routes[0]
     assert "远程调试" not in gui_routes[0]
     assert "远程烧录" not in gui_routes[0]
 

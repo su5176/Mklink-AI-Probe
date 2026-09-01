@@ -45,8 +45,10 @@ from __future__ import annotations
 
 import binascii
 import struct
+import threading
 import time
-from typing import Optional
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 # ---------------------------------------------------------------------------
 # Protocol constants
@@ -67,6 +69,15 @@ MIN_B1_FRAME_LEN = B1_HEADER_LEN + 3 + B1_TRAILER_LEN  # 1 region(3) + 4 = 42
 
 MAX_FRAME_LEN = 65535
 MAX_REGIONS = 16
+# V4 firmware advertises 16 regions, but the text API needs 33 positional
+# arguments at that point (16 address/size pairs plus period), exactly equal to
+# the current PIKA_ARG_NUM_MAX. Field testing on V4.3.8 showed this exact
+# parameter-count boundary can wedge the REPL; it is independent of free heap.
+# Keep one argument-pair of headroom until firmware exposes a non-varargs/binary
+# configuration entry point or raises and validates its VM argument capacity.
+MAX_SAFE_REPL_REGIONS = 15
+MAX_REPL_COMMAND_BYTES = 511  # PIKA_LINE_BUFF_SIZE is 512 including NUL.
+DUMP_MEMORY_STOP_PERIOD = -1.0
 EXPECTED_BLOCK_SIZE = 2048  # firmware-fixed per spec
 
 # Maximum total bytes per dump_memory() call.
@@ -82,6 +93,8 @@ EXPECTED_BLOCK_SIZE = 2048  # firmware-fixed per spec
 # Use set_max_total_data_size() to lower the cap programmatically if needed.
 MAX_TOTAL_DATA_SIZE = 512 * 1024  # 524288
 
+_DUMP_MEMORY_CAPTURE_LOCK = threading.RLock()
+
 
 # FLAGS bit masks
 FLAG_TICK_OVERFLOW    = 0x0001
@@ -93,9 +106,60 @@ FLAG_SAMPLE_DROPPED   = 0x0008
 class DumpMemoryReadError(RuntimeError):
     """The dump stream returned a malformed or explicitly failed sample."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        gap_fact: str = "invalid_block_count",
+        gap_count: int = 1,
+    ) -> None:
+        super().__init__(message)
+        self.gap_fact = gap_fact
+        self.gap_count = max(1, int(gap_count))
+
 
 class DumpMemoryUnsupported(DumpMemoryReadError):
     """The connected firmware did not expose a usable dump-memory response."""
+
+
+class DumpMemoryBusyError(RuntimeError):
+    """Another bridge stream currently owns the connected probe."""
+
+
+@contextmanager
+def exclusive_dump_memory_capture() -> Iterator[None]:
+    """Serialize dump captures in this process, including multi-sample calls."""
+    with _DUMP_MEMORY_CAPTURE_LOCK:
+        yield
+
+
+def _enter_dump_stream(bridge) -> None:
+    """Atomically claim DUMP_STREAM, with a safe fallback for narrow adapters."""
+    from mklink._types import DeviceState
+
+    try_enter = getattr(bridge, "_try_enter_stream", None)
+    if callable(try_enter):
+        if try_enter(DeviceState.DUMP_STREAM):
+            return
+        state = getattr(bridge, "state", None)
+        state_name = getattr(state, "value", "unavailable")
+        raise DumpMemoryBusyError(
+            f"dump_memory requires an idle READY bridge; current state is {state_name}"
+        )
+
+    try:
+        state = bridge.state
+    except AttributeError:
+        # Narrow test doubles and older bridge adapters do not expose state.
+        bridge._enter_stream(DeviceState.DUMP_STREAM)
+        return
+    if state is DeviceState.READY:
+        bridge._enter_stream(DeviceState.DUMP_STREAM)
+        return
+    state_name = getattr(state, "value", "unavailable")
+    raise DumpMemoryBusyError(
+        f"dump_memory requires an idle READY bridge; current state is {state_name}"
+    )
 
 
 # Sentinel return values for _try_parse
@@ -350,6 +414,29 @@ def build_dump_mem_command(
                     Pass smaller ADDR:SIZE regions to split large requests at the host level
                     (e.g. on older firmware that truncates >64 KiB dumps — BUG-5).
     """
+    import math
+
+    if not region_pairs:
+        raise ValueError("dump-memory requires at least one region")
+    if len(region_pairs) > MAX_SAFE_REPL_REGIONS:
+        raise ValueError(
+            f"dump-memory text API safely supports at most "
+            f"{MAX_SAFE_REPL_REGIONS} regions; firmware protocol capacity is "
+            f"{MAX_REGIONS}, but the 16-region Pika varargs boundary is unsafe"
+        )
+    if not math.isfinite(float(period)) or float(period) < -1:
+        raise ValueError("dump-memory period must be -1, 0, or a positive finite value")
+    for index, pair in enumerate(region_pairs):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError(f"region_pairs[{index}] must be an (address, size) pair")
+        addr, size = pair
+        if type(addr) is not int or not 0 <= addr <= 0xFFFFFFFF:
+            raise ValueError(f"region_pairs[{index}] address is outside 32-bit range")
+        if type(size) is not int or size <= 0:
+            raise ValueError(f"region_pairs[{index}] size must be a positive integer")
+        if addr + size > 0x100000000:
+            raise ValueError(f"region_pairs[{index}] exceeds the 32-bit address space")
+
     total_size = sum(size for _, size in region_pairs)
     if total_size > MAX_TOTAL_DATA_SIZE:
         raise ValueError(
@@ -367,7 +454,13 @@ def build_dump_mem_command(
         if '.' not in s:
             s += ".0"
         parts.append(s)
-    return f"cmd.dump_memory({', '.join(parts)})"
+    command = f"cmd.dump_memory({', '.join(parts)})"
+    if len(command.encode("utf-8")) > MAX_REPL_COMMAND_BYTES:
+        raise ValueError(
+            f"dump-memory command is longer than the safe "
+            f"{MAX_REPL_COMMAND_BYTES}-byte Pika REPL line"
+        )
+    return command
 
 
 def read_dump_memory_once(
@@ -385,6 +478,9 @@ def read_dump_memory_once(
 
     parser = DumpMemoryParser(region_sizes=[size])
     command = build_dump_mem_command([(address, size)], 0)
+    stop_command = build_dump_mem_command(
+        [(address, 1)], DUMP_MEMORY_STOP_PERIOD,
+    )
     deadline = time.monotonic() + max(0.001, float(timeout))
     bridge._enter_stream(DeviceState.DUMP_STREAM)
     try:
@@ -400,7 +496,10 @@ def read_dump_memory_once(
         raise TimeoutError("timed out waiting for one dump-memory sample")
     finally:
         try:
-            bridge._write_raw(b"RTTView.stop()\n")
+            # ``RTTView.stop`` does not stop dump_memory and period=0 would
+            # request another one-shot sample.  Use the firmware's explicit
+            # dump stop value even when the one-shot read failed.
+            bridge._write_raw((stop_command + "\n").encode("utf-8"))
             try:
                 bridge.drain_stream_bytes()
             except Exception:
@@ -436,7 +535,9 @@ def read_dump_memory_range_once(
 
     parser = DumpMemoryParser(region_sizes=[size])
     command = build_dump_mem_command([(address, size)], 0)
-    stop_command = build_dump_mem_command([(address, 1)], -1)
+    stop_command = build_dump_mem_command(
+        [(address, 1)], DUMP_MEMORY_STOP_PERIOD,
+    )
     deadline = time.monotonic() + max(0.001, float(timeout))
     blocks: dict[int, bytes] = {}
     expected_blocks: int | None = None
@@ -532,6 +633,255 @@ def read_dump_memory_range_once(
         bridge._exit_stream()
 
 
+def read_dump_memory_regions_once(
+    bridge,
+    region_pairs: list[tuple[int, int]],
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.0005,
+) -> tuple[bytes, ...]:
+    """Read one sample while holding the process-wide dump capture lock."""
+    with exclusive_dump_memory_capture():
+        return _read_dump_memory_regions_once_locked(
+            bridge,
+            region_pairs,
+            timeout=timeout,
+            poll_interval=poll_interval,
+        )
+
+
+def _read_dump_memory_regions_once_locked(
+    bridge,
+    region_pairs: list[tuple[int, int]],
+    *,
+    timeout: float = 10.0,
+    poll_interval: float = 0.0005,
+) -> tuple[bytes, ...]:
+    """Read one validated multi-region sample on an already-owned bridge.
+
+    B1 blocks may split one region or cross a region boundary.  They are
+    collected by block index, checked for continuity, and only exposed after
+    every declared region has exact byte coverage.
+    """
+    if not isinstance(region_pairs, list) or not 1 <= len(region_pairs) <= MAX_REGIONS:
+        raise ValueError(f"dump-memory requires 1..{MAX_REGIONS} regions")
+    normalized: list[tuple[int, int]] = []
+    total_size = 0
+    for index, pair in enumerate(region_pairs):
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise ValueError(f"dump-memory region {index} must be (address, size)")
+        address, size = pair
+        if (
+            type(address) is not int
+            or address < 0
+            or address > 0xFFFFFFFFFFFFFFFF
+            or type(size) is not int
+            or size <= 0
+            or address + size > 0x10000000000000000
+        ):
+            raise ValueError(f"dump-memory region {index} has an invalid range")
+        total_size += size
+        if total_size > MAX_TOTAL_DATA_SIZE:
+            raise ValueError(
+                f"dump-memory total size must not exceed {MAX_TOTAL_DATA_SIZE} bytes"
+            )
+        normalized.append((address, size))
+
+    region_sizes = [size for _, size in normalized]
+    parser = DumpMemoryParser(region_sizes=region_sizes)
+    command = build_dump_mem_command(normalized, 0)
+    stop_command = build_dump_mem_command([(normalized[0][0], 1)], -1)
+    deadline = time.monotonic() + max(0.001, float(timeout))
+    blocks: dict[int, dict[int, bytes]] = {}
+    expected_blocks: int | None = None
+    expected_block_size: int | None = None
+    incomplete_region_count = 0
+    raw_tail = bytearray()
+    _enter_dump_stream(bridge)
+    try:
+        bridge._write_raw((command + "\n").encode("utf-8"))
+        while time.monotonic() < deadline:
+            raw = bridge.drain_stream_bytes(max_bytes=1024 * 1024)
+            if raw:
+                raw_tail.extend(raw[-4096:])
+            frames = parser.feed(raw) if raw else ()
+            if parser.crc_errors:
+                raise DumpMemoryReadError(
+                    "dump_memory frame CRC validation failed",
+                    gap_fact="crc_error_count",
+                    gap_count=parser.crc_errors,
+                )
+            for frame in frames:
+                flags = int(frame.get("flags", 0))
+                if flags:
+                    raise DumpMemoryReadError(
+                        "dump_memory returned firmware error flags",
+                        gap_fact="firmware_error_count",
+                    )
+                regions = frame.get("regions", ())
+                by_region: dict[int, bytes] = {}
+                valid_regions = True
+                for region_index, payload in regions:
+                    if (
+                        type(region_index) is not int
+                        or not 0 <= region_index < len(normalized)
+                        or region_index in by_region
+                        or not isinstance(payload, (bytes, bytearray, memoryview))
+                    ):
+                        valid_regions = False
+                        break
+                    by_region[region_index] = bytes(payload)
+                if not valid_regions:
+                    raise DumpMemoryReadError(
+                        "dump_memory region coverage is invalid",
+                        gap_fact="region_gap_count",
+                    )
+
+                if frame.get("format") == "OLD":
+                    if len(by_region) != len(normalized):
+                        incomplete_region_count = max(
+                            incomplete_region_count,
+                            len(normalized) - len(by_region),
+                        )
+                        continue
+                    mismatched_regions = sum(
+                        len(by_region.get(index, b"")) != size
+                        for index, size in enumerate(region_sizes)
+                    )
+                    if mismatched_regions:
+                        incomplete_region_count = max(
+                            incomplete_region_count,
+                            mismatched_regions,
+                        )
+                        continue
+                    return tuple(by_region[index] for index in range(len(normalized)))
+
+                if int(frame.get("total_size", 0)) != total_size:
+                    # The bridge may still contain a complete sample left by a
+                    # prior request; total size is the protocol's discriminator.
+                    continue
+                block_size = int(frame.get("block_size", 0))
+                block_index = int(frame.get("block_index", -1))
+                block_count = int(frame.get("block_count", 0))
+                calculated_count = (
+                    (total_size + block_size - 1) // block_size
+                    if block_size > 0
+                    else 0
+                )
+                if (
+                    block_size <= 0
+                    or block_count != calculated_count
+                    or block_index < 0
+                    or block_index >= block_count
+                ):
+                    raise DumpMemoryReadError(
+                        "dump_memory block metadata is invalid",
+                        gap_fact="invalid_block_count",
+                    )
+                if not bool(frame.get("block_crc_ok", False)):
+                    raise DumpMemoryReadError(
+                        "dump_memory block CRC validation failed",
+                        gap_fact="crc_error_count",
+                    )
+                if expected_blocks is None:
+                    expected_blocks = block_count
+                    expected_block_size = block_size
+                elif (
+                    expected_blocks != block_count
+                    or expected_block_size != block_size
+                ):
+                    raise DumpMemoryReadError(
+                        "dump_memory block layout changed",
+                        gap_fact="invalid_block_count",
+                    )
+                expected_payload = min(
+                    block_size,
+                    total_size - block_index * block_size,
+                )
+                if sum(len(data) for data in by_region.values()) != expected_payload:
+                    raise DumpMemoryReadError(
+                        "dump_memory block coverage is incomplete",
+                        gap_fact="region_gap_count",
+                    )
+                if block_index in blocks:
+                    raise DumpMemoryReadError(
+                        "dump_memory repeated a block index",
+                        gap_fact="invalid_block_count",
+                    )
+                blocks[block_index] = by_region
+                if len(blocks) == expected_blocks:
+                    if set(blocks) != set(range(expected_blocks)):
+                        raise DumpMemoryReadError(
+                            "dump_memory block sequence is incomplete",
+                            gap_fact="missing_block_count",
+                        )
+                    assembled = [bytearray() for _ in normalized]
+                    for current_index in range(expected_blocks):
+                        for region_index, data in blocks[current_index].items():
+                            assembled[region_index].extend(data)
+                            if len(assembled[region_index]) > region_sizes[region_index]:
+                                raise DumpMemoryReadError(
+                                    "dump_memory region coverage overflowed",
+                                    gap_fact="region_gap_count",
+                                )
+                    incomplete_regions = sum(
+                        len(data) != region_sizes[index]
+                        for index, data in enumerate(assembled)
+                    )
+                    if incomplete_regions:
+                        raise DumpMemoryReadError(
+                            "dump_memory region coverage is incomplete",
+                            gap_fact="region_gap_count",
+                            gap_count=incomplete_regions,
+                        )
+                    return tuple(bytes(data) for data in assembled)
+            if poll_interval:
+                time.sleep(poll_interval)
+
+        diagnostic = bytes(raw_tail).decode("utf-8", errors="replace").lower()
+        if (
+            "command not found" in diagnostic
+            or "attributeerror" in diagnostic
+            or "dump_memory fail" in diagnostic
+        ):
+            raise DumpMemoryUnsupported(
+                "cmd.dump_memory is not supported by the probe",
+                gap_fact="firmware_error_count",
+            )
+        if parser.crc_errors:
+            raise DumpMemoryReadError(
+                "dump_memory frame CRC validation failed",
+                gap_fact="crc_error_count",
+                gap_count=parser.crc_errors,
+            )
+        if incomplete_region_count:
+            raise DumpMemoryReadError(
+                "dump_memory region coverage is incomplete",
+                gap_fact="region_gap_count",
+                gap_count=incomplete_region_count,
+            )
+        missing = (
+            max(1, expected_blocks - len(blocks))
+            if expected_blocks is not None
+            else 1
+        )
+        raise DumpMemoryReadError(
+            "timed out waiting for a complete dump-memory sample",
+            gap_fact="missing_block_count",
+            gap_count=missing,
+        )
+    finally:
+        try:
+            bridge._write_raw((stop_command + "\n").encode("utf-8"))
+            stop_deadline = time.monotonic() + 0.2
+            while time.monotonic() < stop_deadline:
+                bridge.drain_stream_bytes(max_bytes=1024 * 1024)
+                time.sleep(0.002)
+        except Exception:
+            pass
+        bridge._exit_stream()
+
+
 class DumpMemoryStreamSession:
     """Own one MKLink ``cmd.dump_memory`` binary-stream lifecycle.
 
@@ -549,8 +899,11 @@ class DumpMemoryStreamSession:
     ):
         if not region_pairs:
             raise ValueError("dump-memory requires at least one region")
-        if len(region_pairs) > MAX_REGIONS:
-            raise ValueError(f"too many regions: {len(region_pairs)} > {MAX_REGIONS}")
+        if len(region_pairs) > MAX_SAFE_REPL_REGIONS:
+            raise ValueError(
+                f"too many regions for the safe text API: {len(region_pairs)} > "
+                f"{MAX_SAFE_REPL_REGIONS}"
+            )
         if period <= 0:
             raise ValueError("streaming period must be greater than zero")
         self.bridge = bridge
@@ -601,7 +954,9 @@ class DumpMemoryStreamSession:
         if not self.started:
             return
         try:
-            command = build_dump_mem_command(self.region_pairs, 0)
+            command = build_dump_mem_command(
+                self.region_pairs, DUMP_MEMORY_STOP_PERIOD,
+            )
             self.bridge._write_raw((command + "\n").encode("utf-8"))
             if self.stop_grace_s:
                 time.sleep(self.stop_grace_s)

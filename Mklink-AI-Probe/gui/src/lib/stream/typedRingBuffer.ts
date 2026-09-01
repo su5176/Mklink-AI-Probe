@@ -8,6 +8,11 @@ export interface RingBufferSnapshot {
   readonly channels: number[][]
 }
 
+export interface TypedRingBufferSnapshot {
+  readonly times: Float64Array
+  readonly values: Float32Array
+}
+
 export interface NumericEnvelopeSelection {
   readonly logicalIndices: Uint32Array
   readonly channelOffsets: Uint32Array
@@ -231,6 +236,22 @@ export class TypedRingBuffer {
       }
     }
     return { times, channels }
+  }
+
+  /** Copy retained history in logical order for an explicit export request. */
+  copyAll(): TypedRingBufferSnapshot {
+    const times = new Float64Array(this.sampleCount)
+    const values = new Float32Array(this.sampleCount * this.channelCount)
+    for (let logical = 0; logical < this.sampleCount; logical += 1) {
+      const slot = (this.startSlot + logical) % this.capacity
+      times[logical] = this.timestamps[slot]
+      const sourceOffset = slot * this.channelCount
+      values.set(
+        this.values.subarray(sourceOffset, sourceOffset + this.channelCount),
+        logical * this.channelCount,
+      )
+    }
+    return { times, values }
   }
 
   reset(): void {

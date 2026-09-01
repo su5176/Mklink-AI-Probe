@@ -150,7 +150,7 @@ import { useMklinkApi } from '../../composables/useMklinkApi'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
 import {
   DESKTOP_SETTINGS_CHANGED_EVENT,
-  isMapFilePath,
+  isSameFileSourcePath,
   isSymbolFilePath,
   loadDesktopSettings,
   saveDesktopSettings,
@@ -158,6 +158,7 @@ import {
   type RttEncoding,
 } from '../../lib/desktopSettings'
 import { RenderScheduler } from '../../lib/stream/renderScheduler'
+import { cancelRttAddressRefresh } from '../../lib/rttSymbolAddress'
 import { downloadTextFile, timestampedLogName } from '../../lib/downloadTextFile'
 import ControlToolbar from './ControlToolbar.vue'
 import RttTransmitBar from './RttTransmitBar.vue'
@@ -180,9 +181,7 @@ const {
 } = useDashboardSetup()
 const desktopStorage = localStorage
 const settings = ref<DesktopSettings>(loadDesktopSettings(desktopStorage))
-const hasAddressFileSource = computed(() => (
-  isMapFilePath(settings.value.mapPath) || isSymbolFilePath(settings.value.symbolPath)
-))
+const hasAddressFileSource = computed(() => isSymbolFilePath(settings.value.symbolPath))
 const rttAddress = ref(settings.value.rttAddress)
 const rttEncoding = ref<RttEncoding>(settings.value.rttEncoding)
 const addressError = ref('')
@@ -263,12 +262,25 @@ function persistSettings(next: DesktopSettings): void {
 
 function syncRttAddressFromSettings(): void {
   const latest = loadDesktopSettings(desktopStorage)
+  const sourceChanged = !sameRttSearchSource(settings.value.symbolPath, latest.symbolPath)
+  const addressChanged = latest.rttAddress !== rttAddress.value
+  if (sourceChanged || addressChanged) {
+    searchGeneration++
+    searching.value = false
+  }
   settings.value = latest
-  if (latest.rttAddress !== rttAddress.value) {
+  if (addressChanged) {
     rttAddress.value = latest.rttAddress
     addressError.value = ''
     addressSource.value = ''
   }
+}
+
+function sameRttSearchSource(left: string | undefined, right: string | undefined): boolean {
+  const leftPath = left?.trim() || ''
+  const rightPath = right?.trim() || ''
+  if (!leftPath || !rightPath) return leftPath === rightPath
+  return isSameFileSourcePath(leftPath, rightPath)
 }
 
 function isRttAddress(value: string): boolean {
@@ -276,6 +288,7 @@ function isRttAddress(value: string): boolean {
 }
 
 function onAddressInput(): void {
+  cancelRttAddressRefresh(desktopStorage)
   searchGeneration++
   searching.value = false
   addressError.value = ''
@@ -287,21 +300,29 @@ function onAddressInput(): void {
 }
 
 async function searchRttAddress(): Promise<void> {
+  cancelRttAddressRefresh(desktopStorage)
   const generation = ++searchGeneration
   searching.value = true
   addressError.value = ''
-  const symbolPath = settings.value.symbolPath.trim()
-  const mapPath = settings.value.mapPath.trim()
-  const source = symbolPath || mapPath || undefined
+  const initialSettings = loadDesktopSettings(desktopStorage)
+  settings.value = initialSettings
+  const initialAddress = initialSettings.rttAddress
+  const symbolPath = initialSettings.symbolPath.trim()
+  const source = symbolPath || undefined
   try {
     const result = await findRtt(source)
     if (disposed || generation !== searchGeneration) return
+    const latest = loadDesktopSettings(desktopStorage)
+    if (
+      !sameRttSearchSource(symbolPath, latest.symbolPath)
+      || latest.rttAddress !== initialAddress
+    ) return
     if (!result.addr || !isRttAddress(result.addr)) {
       throw new Error(result.details?.join(tr('；', '; ')) || result.warnings?.join(tr('；', '; ')) || tr('未找到 RTT 地址', 'RTT address not found'))
     }
     rttAddress.value = result.addr
     addressSource.value = result.source || (source ? tr('所选文件', 'Selected file') : tr('工程自动检测', 'Project auto-detection'))
-    persistSettings({ ...settings.value, rttAddress: result.addr })
+    persistSettings({ ...latest, rttAddress: result.addr })
   } catch (caught) {
     if (!disposed && generation === searchGeneration) {
       addressError.value = caught instanceof Error ? caught.message : String(caught)

@@ -266,7 +266,7 @@ describe('useOnlineFlashApi', () => {
 
   it('marks HPM targets as ROM API devices without custom FLM controls', async () => {
     const wrapper = mount(TargetPackPanel, { props: {
-      targets: [], selectedPart: 'HPM5300', status: null, busy: false,
+      targets: [], query: '', selectedPart: 'HPM5300', selectedInstalled: true, status: null, busy: false,
       cancelPending: false, progress: 0, phase: 'preparing', error: '',
       algorithms: [], algorithmBusy: false, algorithmError: '',
       canManageAlgorithms: false, algorithmNotRequired: true,
@@ -280,7 +280,7 @@ describe('useOnlineFlashApi', () => {
   it('fills the target search field as soon as target selection begins', async () => {
     const target = { ...installedTarget, part_number: 'STM32H7B0VBT6' }
     const wrapper = mount(TargetPackPanel, { props: {
-      targets: [target], selectedPart: target.part_number, status: null, busy: false,
+      targets: [target], query: '', selectedPart: target.part_number, selectedInstalled: true, status: null, busy: false,
       cancelPending: false, progress: 0, phase: 'preparing', error: '',
       algorithms: [], algorithmBusy: false, algorithmError: '',
       canManageAlgorithms: true, algorithmNotRequired: false,
@@ -564,6 +564,21 @@ function viewFetch(targets = [installedTarget]) {
     const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
     if (url.endsWith('/probes')) return json([probeFixture])
     if (url.includes('/targets?')) return json(targets)
+    if (url.includes('/targets/') && url.endsWith('/algorithms')) {
+      const targetPart = decodeURIComponent(url.split('/targets/')[1].split('/algorithms')[0])
+      if (targetPart.startsWith('HPM')) return json([{
+        algorithm_id: 'hpm-rom-api', target_part: targetPart, file_name: 'HPM ROM API',
+        flash_start: 0x80000000, flash_size: 0x10000000, default: true,
+        source_kind: 'hpm-rom-api', source_name: 'HPM ROM API',
+      }])
+      return json([{
+        algorithm_id: 'pack-1', target_part: targetPart, file_name: 'internal.flm',
+        flash_start: 0x08000000, flash_size: 0x80000, default: true,
+        source_kind: 'installed-pack', source_name: 'Vendor.Device_DFP@1.0.0',
+      }, ...algorithms.map(record => ({
+        ...record, default: false, source_kind: 'custom-flm', source_name: '用户 FLM',
+      }))])
+    }
     if (url.includes('/targets/') && url.endsWith('/memory-map')) return json([{
       name: 'flash', start: 0x08000000, length: 0x80000, sector_size: 0x800,
     }])
@@ -703,6 +718,45 @@ describe('online flash task workspace behavior', () => {
     wrapper.unmount()
   })
 
+  it('supports keyboard navigation in target suggestions', async () => {
+    const first = { ...installedTarget, part_number: 'STM32F103x4' }
+    const second = { ...installedTarget, part_number: 'STM32F103x6' }
+    const wrapper = mount(TargetPackPanel, { props: {
+      targets: [first, second], query: 'STM32F103', selectedPart: '', selectedInstalled: false, status: null, busy: false,
+      cancelPending: false, progress: 0, phase: 'preparing', error: '',
+      algorithms: [], algorithmBusy: false, algorithmError: '',
+      canManageAlgorithms: false, algorithmNotRequired: false,
+    } })
+    const input = wrapper.get('[data-testid="target-search"]')
+
+    await input.trigger('keydown', { key: 'ArrowDown' })
+    await input.trigger('keydown', { key: 'ArrowDown' })
+    await input.trigger('keydown', { key: 'Enter' })
+
+    expect(wrapper.emitted('select')?.[0]).toEqual([second])
+    expect((input.element as HTMLInputElement).value).toBe(second.part_number)
+    expect(input.attributes('aria-expanded')).toBe('false')
+    wrapper.unmount()
+  })
+
+  it('lists the selected target flash algorithms with their actual sources', () => {
+    const wrapper = mount(TargetPackPanel, { props: {
+      targets: [], query: '', selectedPart: 'STM32F103RC', selectedInstalled: true, status: null, busy: false,
+      cancelPending: false, progress: 0, phase: 'preparing', error: '', algorithms: [],
+      flashAlgorithms: [{
+        algorithm_id: 'pack-1', target_part: 'STM32F103RC', file_name: 'STM32F10x_128.FLM',
+        flash_start: 0x08000000, flash_size: 0x40000, default: true,
+        source_kind: 'installed-pack', source_name: 'Keil.STM32F1xx_DFP@2.4.1',
+      }],
+      algorithmBusy: false, algorithmError: '', canManageAlgorithms: true, algorithmNotRequired: false,
+    } })
+
+    expect(wrapper.get('[data-testid="flash-algorithm-pack-1"]').text()).toContain('STM32F10x_128.FLM')
+    expect(wrapper.get('[data-testid="flash-algorithm-pack-1"]').text()).toContain('Pack FLM')
+    expect(wrapper.get('[data-testid="flash-algorithm-pack-1"]').text()).toContain('0x08000000–0x08040000')
+    wrapper.unmount()
+  })
+
   it('keeps flash progress and logs visible after programming captured memory', async () => {
     const fetchMock = viewFetch()
     vi.stubGlobal('fetch', fetchMock)
@@ -760,18 +814,102 @@ describe('online flash task workspace behavior', () => {
   })
 
   it('imports a local Pack from the target panel and refreshes the catalog', async () => {
-    const fetchMock = viewFetch()
+    vi.useFakeTimers()
+    const currentTarget = { ...installedTarget, part_number: 'DEVICE_A' }
+    const importedTarget = {
+      ...installedTarget,
+      part_number: 'CW32L012C8',
+      pack_id: 'WHXY.CW32L012_DFP',
+      installed: false,
+      source: 'index',
+    }
+    let imported = false
+    const fallback = viewFetch([currentTarget])
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input)
+      const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
+      if (url.includes('/targets?')) {
+        const query = new URL(url, 'http://local').searchParams.get('q')
+        return json(query === 'CW32L012'
+          ? [{ ...importedTarget, installed: imported, source: imported ? 'installed' : 'index' }]
+          : [currentTarget])
+      }
+      if (url.endsWith('/packs/import')) {
+        imported = true
+        return json({
+          result: { status: 'installed', pack_id: 'WHXY.CW32L012_DFP', version: '1.0.2' },
+          events: [{ type: 'progress', progress: 1 }],
+        })
+      }
+      return fallback(input, options)
+    })
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mount(await onlineFlashView())
-    await vi.waitFor(() => expect(wrapper.find('[data-testid="pack-import-input"]').exists()).toBe(true))
+    await flushPromises()
+
+    await wrapper.get('[data-testid="target-search"]').setValue('CW32L012')
+    await choosePack(wrapper)
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    const targetQueries = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter(url => url.includes('/targets?'))
+      .map(url => new URL(url, 'http://local').searchParams.get('q'))
+    expect(targetQueries.at(-1)).toBe('CW32L012')
+    expect(wrapper.get('[data-testid="target-CW32L012C8"]').text()).toContain('本地 Pack')
+    expect(wrapper.text()).toContain('已导入 WHXY.CW32L012_DFP@1.0.2')
+    wrapper.unmount()
+  })
+
+  it('keeps a saved exact selection ready when an empty visible search is refreshed after import', async () => {
+    const savedPart = 'ZZZ_SAVED_DEVICE'
+    const savedTarget = { ...installedTarget, part_number: savedPart }
+    const visibleTarget = { ...installedTarget, part_number: 'AAA_VISIBLE_DEVICE' }
+    const storage = new Map<string, string>([
+      ['mklink.onlineFlash.settings', JSON.stringify({ targetPart: savedPart })],
+    ])
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => storage.get(key) ?? null,
+      setItem: (key: string, value: string) => storage.set(key, value),
+      removeItem: (key: string) => storage.delete(key),
+      clear: () => storage.clear(),
+    })
+    const fallback = viewFetch([visibleTarget])
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input)
+      const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
+      if (url.includes('/targets?')) {
+        const query = new URL(url, 'http://local').searchParams.get('q')
+        return json(query === savedPart ? [savedTarget] : [visibleTarget])
+      }
+      if (url.endsWith('/packs/import')) {
+        return json({
+          result: { status: 'installed', pack_id: 'WHXY.CW32L012_DFP', version: '1.0.2' },
+          events: [{ type: 'progress', progress: 1 }],
+        })
+      }
+      return fallback(input, options)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="pack-status"]').text()).toContain('已安装'))
+
+    expect(wrapper.get<HTMLInputElement>('[data-testid="target-search"]').element.value).toBe('')
+    expect(wrapper.find(`[data-testid="target-${savedPart}"]`).exists()).toBe(false)
+    const callsBeforeImport = fetchMock.mock.calls.length
 
     await choosePack(wrapper)
-    await vi.waitFor(() => expect(
-      fetchMock.mock.calls.some(([url]) => String(url).endsWith('/packs/import')),
-    ).toBe(true))
+    await vi.waitFor(() => expect(wrapper.text()).toContain('已导入 WHXY.CW32L012_DFP@1.0.2'))
 
-    expect(fetchMock.mock.calls.filter(([url]) => String(url).includes('/targets?')).length).toBeGreaterThan(1)
-    expect(wrapper.text()).toContain('已导入 Vendor.Device_DFP@1.0.0')
+    const refreshedQueries = fetchMock.mock.calls.slice(callsBeforeImport)
+      .map(([url]) => String(url))
+      .filter(url => url.includes('/targets?'))
+      .map(url => new URL(url, 'http://local').searchParams.get('q'))
+    expect(refreshedQueries).toContain('')
+    expect(refreshedQueries).toContain(savedPart)
+    expect(wrapper.get('[data-testid="pack-status"]').text()).toContain('已安装')
+    expect(wrapper.get(`[data-testid="target-${visibleTarget.part_number}"]`).text()).toContain('本地 Pack')
     wrapper.unmount()
   })
 
@@ -1169,6 +1307,130 @@ describe('online flash task workspace behavior', () => {
     expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/packs/install'))).toBe(true)
     expect(wrapper.get('[data-testid="pack-status"]').text()).toContain('未就绪')
     expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('refreshes the visible target and installed badge after an online Pack install', async () => {
+    vi.useFakeTimers()
+    const missing = { ...regularTarget, installed: false, source: 'index' }
+    let installed = false
+    const fallback = viewFetch([missing])
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input)
+      const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
+      if (url.includes('/targets?')) {
+        return json([{ ...missing, installed, source: installed ? 'installed' : 'index' }])
+      }
+      if (url.endsWith('/packs/install')) {
+        installed = true
+        return json({
+          result: { status: 'installed', part_number: missing.part_number },
+          events: [{ type: 'progress', progress: 1 }],
+        })
+      }
+      return fallback(input, options)
+    }))
+    const wrapper = mount(await onlineFlashView())
+    await flushPromises()
+
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get('[data-testid="target-DEVICE_A"]').text()).toContain('本地 Pack')
+    expect(wrapper.get('[data-testid="pack-status"]').text()).toContain('已安装')
+    expect(wrapper.text()).not.toContain('安装后索引仍未确认')
+    wrapper.unmount()
+  })
+
+  it('keeps install confirmation independent from a concurrent debounced search', async () => {
+    vi.useFakeTimers()
+    const missing = { ...regularTarget, installed: false, source: 'index' }
+    const installed = { ...missing, installed: true, source: 'installed' }
+    const other = { ...installedTarget, part_number: 'OTHER_DEVICE' }
+    const fallback = viewFetch([missing])
+    let resolveInstall!: (response: Response) => void
+    let resolveExact!: (response: Response) => void
+    let exactSignal: AbortSignal | null | undefined
+    let installCompleted = false
+    const installResponse = new Promise<Response>(resolve => { resolveInstall = resolve })
+    const exactResponse = new Promise<Response>(resolve => { resolveExact = resolve })
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input)
+      const json = (value: unknown) => Promise.resolve(new Response(JSON.stringify(value), { status: 200 }))
+      if (url.includes('/targets?')) {
+        const query = new URL(url, 'http://local').searchParams.get('q')
+        if (query === missing.part_number && installCompleted) {
+          exactSignal = options?.signal
+          return exactResponse
+        }
+        if (query === 'OTHER') return json([other])
+        return json([missing])
+      }
+      if (url.endsWith('/packs/install')) return installResponse
+      return fallback(input, options)
+    }))
+    const wrapper = mount(await onlineFlashView())
+    await flushPromises()
+
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    installCompleted = true
+    resolveInstall(new Response(JSON.stringify({
+      result: { status: 'installed', part_number: missing.part_number },
+      events: [{ type: 'progress', progress: 1 }],
+    }), { status: 200 }))
+    await flushPromises()
+    expect(exactSignal).toBeUndefined()
+
+    await wrapper.get('[data-testid="target-search"]').setValue('OTHER')
+    await vi.advanceTimersByTimeAsync(300)
+    await flushPromises()
+    resolveExact(new Response(JSON.stringify([installed]), { status: 200 }))
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.get<HTMLInputElement>('[data-testid="target-search"]').element.value).toBe('OTHER')
+    expect(wrapper.get(`[data-testid="target-${other.part_number}"]`).exists()).toBe(true)
+    expect(wrapper.get('[data-testid="pack-status"]').text()).toContain('已安装')
+    expect(wrapper.text()).not.toContain('安装后索引仍未确认')
+    wrapper.unmount()
+  })
+
+  it('reports an exact target refresh failure instead of claiming the index lacks the installed target', async () => {
+    vi.useFakeTimers()
+    const missing = { ...regularTarget, installed: false, source: 'index' }
+    let installed = false
+    const fallback = viewFetch([missing])
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
+      const url = String(input)
+      const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 })
+      if (url.includes('/targets?')) {
+        const query = new URL(url, 'http://local').searchParams.get('q')
+        if (query === missing.part_number && installed) {
+          return new Response(JSON.stringify({
+            detail: { code: 'PACK_INDEX_UNAVAILABLE', message: 'catalog refresh failed' },
+          }), { status: 503 })
+        }
+        return json([missing])
+      }
+      if (url.endsWith('/packs/install')) {
+        installed = true
+        return json({
+          result: { status: 'installed', part_number: missing.part_number },
+          events: [{ type: 'progress', progress: 1 }],
+        })
+      }
+      return fallback(input, options)
+    }))
+    const wrapper = mount(await onlineFlashView())
+    await flushPromises()
+
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await flushPromises()
+    await wrapper.vm.$nextTick()
+
+    expect(wrapper.text()).toContain('PACK_INDEX_UNAVAILABLE · catalog refresh failed')
+    expect(wrapper.text()).not.toContain('安装后索引仍未确认')
     wrapper.unmount()
   })
 

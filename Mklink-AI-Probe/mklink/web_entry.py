@@ -34,6 +34,8 @@ LOCK_FILE_NAME = "operation.lock"
 WINDOWS_OWNER_VALUE = "Mklink Web Entry Owner"
 WINDOWS_HANDLER_VALUE = "Mklink Web Entry Handler"
 WINDOWS_OWNER_ID = "com.microkeen.mklink-ai-probe.web-entry"
+WINDOWS_FRIENDLY_NAME = "MKLink Web GUI"
+WINDOWS_DESCRIPTION = "MKLink AI Probe Web GUI Launcher"
 QUICK_LAUNCH_FILE_NAME = "MKLink Web GUI.html"
 AUTO_LAUNCH_DELAY_SECONDS = 3
 WEB_START_TIMEOUT_SECONDS = 45
@@ -878,10 +880,15 @@ def _install_windows_protocol(
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as key:
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f"URL:{HANDLER_NAME}")
         winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        winreg.SetValueEx(key, "FriendlyTypeName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
+        winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
         winreg.SetValueEx(key, WINDOWS_OWNER_VALUE, 0, winreg.REG_SZ, WINDOWS_OWNER_ID)
         winreg.SetValueEx(
             key, WINDOWS_HANDLER_VALUE, 0, winreg.REG_SZ, str(handler.resolve()),
         )
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\Application") as key:
+        winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
+        winreg.SetValueEx(key, "ApplicationDescription", 0, winreg.REG_SZ, WINDOWS_DESCRIPTION)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\DefaultIcon") as key:
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, str(python_executable))
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\shell\open\command") as key:

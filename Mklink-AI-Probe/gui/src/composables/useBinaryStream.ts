@@ -13,6 +13,8 @@ export interface BinaryStreamClient {
   reset(): void
   configure(capacity: number, channelCount: number): void
   requestVisibleRange(requestId: number, start: number, end: number, pixelWidth: number): void
+  setWaveformDetail?(enabled: boolean): void
+  requestHistorySnapshot?(requestId: number): void
   dispose(): void
 }
 
@@ -28,6 +30,8 @@ export interface UseBinaryStreamOptions {
 type RenderEnvelope = Extract<WorkerOutput, { type: 'render-envelope' }>
 type SystemViewVisible = Extract<WorkerOutput, { type: 'systemview-visible' }>
 type WaveformBatch = Extract<WorkerOutput, { type: 'waveform-batch' }>
+type WaveformSummary = Extract<WorkerOutput, { type: 'waveform-summary' }>
+type HistorySnapshot = Extract<WorkerOutput, { type: 'history-snapshot' }>
 type RttLines = Extract<WorkerOutput, { type: 'rtt-lines' }>
 type RttTerminal = Extract<WorkerOutput, { type: 'rtt-terminal' }>
 type SuperWatchMetadata = Extract<WorkerOutput, { type: 'superwatch-metadata' }>
@@ -57,6 +61,8 @@ export function useBinaryStream(
   const envelope = shallowRef<RenderEnvelope | null>(null)
   const systemViewVisible = shallowRef<SystemViewVisible | null>(null)
   const waveformBatch = shallowRef<WaveformBatch | null>(null)
+  const waveformSummary = shallowRef<WaveformSummary | null>(null)
+  const historySnapshot = shallowRef<HistorySnapshot | null>(null)
   const rttLines = shallowRef<RttLines | null>(null)
   const rttTerminal = shallowRef<RttTerminal | null>(null)
   const superwatchMetadata = shallowRef<SuperWatchMetadata | null>(null)
@@ -85,6 +91,12 @@ export function useBinaryStream(
         break
       case 'waveform-batch':
         waveformBatch.value = message
+        break
+      case 'waveform-summary':
+        waveformSummary.value = message
+        break
+      case 'history-snapshot':
+        historySnapshot.value = message
         break
       case 'rtt-lines':
         rttLines.value = message
@@ -115,6 +127,7 @@ export function useBinaryStream(
     channelCount: options.channelCount,
     decoderMode: options.decoderMode,
     serializeWorkerFrames: stream === 'systemview',
+    waveformSummaryOnly: stream === 'superwatch',
     onState,
     onWorkerMessage,
   })
@@ -133,6 +146,8 @@ export function useBinaryStream(
     envelope.value = null
     systemViewVisible.value = null
     waveformBatch.value = null
+    waveformSummary.value = null
+    historySnapshot.value = null
     rttLines.value = null
     rttTerminal.value = null
     superwatchMetadata.value = null
@@ -147,6 +162,8 @@ export function useBinaryStream(
     telemetry.value = null
     envelope.value = null
     waveformBatch.value = null
+    waveformSummary.value = null
+    historySnapshot.value = null
     rttLines.value = null
     rttTerminal.value = null
     superwatchMetadata.value = null
@@ -164,6 +181,14 @@ export function useBinaryStream(
     client.requestVisibleRange(requestId, start, end, pixelWidth)
   }
 
+  function setWaveformDetail(enabled: boolean): void {
+    client.setWaveformDetail?.(enabled)
+  }
+
+  function requestHistorySnapshot(requestId: number): void {
+    client.requestHistorySnapshot?.(requestId)
+  }
+
   if (options.autoStart) start()
 
   onUnmounted(() => client.dispose())
@@ -176,6 +201,8 @@ export function useBinaryStream(
     envelope: readonly(envelope),
     systemViewVisible: readonly(systemViewVisible),
     waveformBatch: readonly(waveformBatch),
+    waveformSummary: readonly(waveformSummary),
+    historySnapshot: readonly(historySnapshot),
     rttLines: readonly(rttLines),
     rttTerminal: readonly(rttTerminal),
     superwatchMetadata: readonly(superwatchMetadata),
@@ -187,5 +214,7 @@ export function useBinaryStream(
     reset,
     configure,
     requestVisibleRange,
+    setWaveformDetail,
+    requestHistorySnapshot,
   }
 }

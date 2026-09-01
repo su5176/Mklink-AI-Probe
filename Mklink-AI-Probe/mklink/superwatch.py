@@ -1,8 +1,8 @@
-"""SuperWatch polling visualizer support.
+"""SuperWatch binary-stream visualizer support.
 
-SuperWatch reads typed variables and registers with cmd.read_ram. Unlike RTT
-and VOFA, the X axis comes from the device-side timestamp emitted as a prefix
-in each read_ram response.
+Continuous waveform acquisition uses the device ``cmd.dump_memory`` stream.
+The ``read_ram`` helpers in this module are retained for one-shot inspection
+and compatibility APIs; they are never a SuperWatch sampling fallback.
 """
 
 from __future__ import annotations
@@ -31,6 +31,10 @@ _TIMESTAMP_HEADER_RE = re.compile(
 )
 _DUMP_ROW_RE = re.compile(r"^\s*([0-9a-fA-F]{8})\s+((?:[0-9a-fA-F]{2}\s+){0,15}[0-9a-fA-F]{2})\b")
 
+# V4.3.8 measurements show that spanning even a 16-byte hole lowers dump
+# sample throughput. Binary streaming therefore merges only touching ranges.
+SUPERWATCH_DUMP_MERGE_GAP = 0
+
 
 @dataclass
 class TimestampedRead:
@@ -56,6 +60,52 @@ class ReadBlock:
     address: int
     size: int
     items: list[WatchItem]
+
+
+@dataclass(frozen=True)
+class CompiledDecodeField:
+    channel_index: int
+    offset: int
+    size: int
+    unpacker: struct.Struct
+
+
+class CompiledFrameDecoder:
+    """Decode one dump frame directly into a reusable numeric row.
+
+    The layout is compiled when the watch list changes. The hot path performs
+    ``Struct.unpack_from`` calls against region payloads and does not allocate
+    per-region/per-variable dictionaries or byte slices.
+    """
+
+    def __init__(
+        self,
+        channel_names: tuple[str, ...],
+        region_fields: tuple[tuple[CompiledDecodeField, ...], ...],
+    ):
+        self.channel_names = channel_names
+        self.channel_index = {name: index for index, name in enumerate(channel_names)}
+        self.region_fields = region_fields
+        self._values = [0.0] * len(channel_names)
+        self._seen = [0] * len(channel_names)
+        self._generation = 0
+
+    def decode(self, frame: dict) -> list[float] | None:
+        self._generation += 1
+        generation = self._generation
+        for region_index, region_data in frame.get("regions", ()):
+            if not 0 <= region_index < len(self.region_fields):
+                continue
+            for field in self.region_fields[region_index]:
+                if field.offset + field.size > len(region_data):
+                    return None
+                self._values[field.channel_index] = float(
+                    field.unpacker.unpack_from(region_data, field.offset)[0]
+                )
+                self._seen[field.channel_index] = generation
+        if any(marker != generation for marker in self._seen):
+            return None
+        return self._values
 
 
 @dataclass
@@ -135,6 +185,56 @@ def build_read_blocks(items: list[WatchItem], *, max_gap: int = 16) -> list[Read
     return blocks
 
 
+def compile_frame_decoder(
+    items: tuple[WatchItem, ...] | list[WatchItem],
+    blocks: tuple[ReadBlock, ...] | list[ReadBlock],
+) -> CompiledFrameDecoder:
+    """Compile typed offsets for direct sample-major dump decoding."""
+    from mklink.watch import TYPE_FORMATS
+
+    channels = tuple(items)
+    channel_names = tuple(item.name for item in channels)
+    if len(set(channel_names)) != len(channel_names):
+        raise ValueError("SuperWatch channel names must be unique")
+    index_by_name = {name: index for index, name in enumerate(channel_names)}
+    integer_formats = {
+        False: {1: "B", 2: "H", 4: "I", 8: "Q"},
+        True: {1: "b", 2: "h", 4: "i", 8: "q"},
+    }
+
+    region_fields: list[tuple[CompiledDecodeField, ...]] = []
+    for block in blocks:
+        fields = []
+        for item in block.items:
+            try:
+                channel_index = index_by_name[item.name]
+            except KeyError:
+                continue
+            size = int(item.size)
+            scalar_kind = getattr(item, "scalar_kind", None)
+            if scalar_kind == "float":
+                code = {4: "f", 8: "d"}.get(size)
+            elif scalar_kind == "bool":
+                code = integer_formats[False].get(size)
+            elif scalar_kind in {"signed", "unsigned", "enum"}:
+                code = integer_formats[scalar_kind == "signed"].get(size)
+            else:
+                format_size = TYPE_FORMATS.get(item.type_name.strip().lower())
+                code = format_size[0].removeprefix("<") if format_size else integer_formats[False].get(size)
+            if code is None:
+                raise ValueError(
+                    f"unsupported SuperWatch scalar layout: {item.type_name} ({size} bytes)"
+                )
+            offset = item.address - block.address
+            if offset < 0 or offset + size > block.size:
+                raise ValueError(f"SuperWatch item {item.name} is outside its read block")
+            fields.append(
+                CompiledDecodeField(channel_index, offset, size, struct.Struct("<" + code))
+            )
+        region_fields.append(tuple(fields))
+    return CompiledFrameDecoder(channel_names, tuple(region_fields))
+
+
 def _read_block_via_bridge(bridge, address: int, size: int, *, timeout: float = 10.0) -> tuple[bytes, str]:
     """Read a memory block using an existing bridge connection."""
     addr_s = f"0x{address:08X}"
@@ -186,19 +286,104 @@ def poll_blocks(
     duration: float = 0.0,
     period: float = 0.001,
     read_func=read_memory,
-    clock=time.time,
+    clock=time.monotonic,
     sleep_func=time.sleep,
 ) -> list[dict]:
     points: list[dict] = []
     origin_us: int | None = None
-    start = clock()
-    while True:
-        result = sample_blocks(blocks, port=port, read_func=read_func, origin_us=origin_us)
-        origin_us = result.origin_us
-        points.extend(result.points)
-        if duration > 0 and clock() - start >= duration:
-            break
-        sleep_func(max(0.0, period))
+    if not blocks:
+        return points
+    bridge = None
+    try:
+        if read_func is read_memory:
+            bridge = _open_sampling_bridge(port)
+        start = clock()
+        while True:
+            cycle_start = clock()
+            result = sample_blocks(blocks, port=port, read_func=read_func,
+                                   origin_us=origin_us, bridge=bridge)
+            origin_us = result.origin_us
+            points.extend(result.points)
+            now = clock()
+            if duration > 0 and now - start >= duration:
+                break
+            delay = max(0.0, period - (now - cycle_start))
+            if duration > 0:
+                delay = min(delay, max(0.0, duration - (now - start)))
+            sleep_func(delay)
+    finally:
+        if bridge is not None:
+            bridge.close()
+    return points
+
+
+def _open_sampling_bridge(port):
+    from mklink.bridge import MKLinkSerialBridge
+    from mklink.cli import _resolve_port
+    from mklink.device import initialize_target
+    from mklink.flash import MKLinkFlash
+
+    bridge = MKLinkSerialBridge(_resolve_port(port))
+    try:
+        if not bridge.connect():
+            raise ConnectionError("MKLink connection failed")
+        initialize_target(bridge, MKLinkFlash(bridge))
+    except BaseException:
+        bridge.close()
+        raise
+    return bridge
+
+
+def poll_blocks_dumpmem(
+    blocks: list[ReadBlock], *, port: str | None = None,
+    duration: float = 0.0, period: float = 0.001,
+    clock=time.monotonic, sleep_func=time.sleep,
+) -> list[dict]:
+    """Collect device-timestamped samples through the shared binary session."""
+    import math
+    from mklink.dump_memory import DumpMemoryStreamSession, decode_frame_to_points, FLAG_REGION_ERROR, DumpMemoryReadError
+
+    if not blocks:
+        return []
+    if not math.isfinite(period) or period <= 0:
+        raise ValueError("SuperWatch dump period must be finite and greater than zero")
+    block_addresses = [
+        (block.address, block.size, [
+            (item.name, item.type_name, item.address - block.address,
+             item.size, item.scalar_kind, item.enum_values)
+            for item in block.items
+        ]) for block in blocks
+    ]
+    bridge = _open_sampling_bridge(port)
+    session = None
+    points = []
+    origin_us = None
+    try:
+        session = DumpMemoryStreamSession(bridge, [(b.address, b.size) for b in blocks], period)
+        session.start()
+        start = clock()
+        received = False
+        while duration <= 0 or clock() - start < duration:
+            frames = session.read_frames(max_bytes=1024 * 1024)
+            if frames:
+                received = True
+            for frame in frames:
+                if int(frame.get("flags", 0)) & FLAG_REGION_ERROR:
+                    raise DumpMemoryReadError("SuperWatch target memory read failed (region error)")
+                decoded, origin_us = decode_frame_to_points(frame, block_addresses, origin_us)
+                points.extend(decoded)
+            if not frames:
+                if not received and clock() - start > max(3.0, period * 2):
+                    raise TimeoutError("No SuperWatch dump-memory samples received")
+                sleep_func(0.0005)
+        if not received:
+            raise TimeoutError("No SuperWatch dump-memory samples received")
+    finally:
+        try:
+            if session is not None:
+                session.stop()
+        finally:
+            bridge.close()
     return points
 
 
@@ -487,7 +672,9 @@ class SuperWatchRuntime:
         self.svd_registers = svd_registers or {}
         self.port = port
         self.read_lock = read_lock or threading.Lock()
-        self.blocks = build_read_blocks(self.items, max_gap=256)
+        self.blocks = build_read_blocks(
+            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
+        )
         self.blocks_version = 0
 
     def search(self, query: str) -> list[dict]:
@@ -562,7 +749,9 @@ class SuperWatchRuntime:
                 return {"error": f"Cannot resolve '{name}': skipped (address outside SRAM or not found)"}
             item = resolved[0]
         self.items.append(item)
-        self.blocks = build_read_blocks(self.items, max_gap=256)
+        self.blocks = build_read_blocks(
+            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
+        )
         self.blocks_version += 1
         return {"name": item.name, **make_channel_metadata([item])[item.name]}
 
@@ -571,7 +760,9 @@ class SuperWatchRuntime:
         self.items = [item for item in self.items if item.name != name]
         if len(self.items) == before:
             return {"removed": False, "name": name}
-        self.blocks = build_read_blocks(self.items, max_gap=256)
+        self.blocks = build_read_blocks(
+            self.items, max_gap=SUPERWATCH_DUMP_MERGE_GAP,
+        )
         self.blocks_version += 1
         return {"removed": True, "name": name}
 
@@ -650,7 +841,7 @@ def run_superwatch_visualizer(
     duration: float = 30.0,
     dwarf_info=None,
     svd_registers: dict[str, SvdRegister] | None = None,
-    dump_mem: bool = False,
+    dump_mem: bool = True,
 ) -> None:
     from mklink.rtt_viewer import VisualizationServer
 
@@ -702,37 +893,19 @@ def run_superwatch_visualizer(
             server.push_event("error", {"message": "Bridge connect failed"})
             return
         try:
-            if dump_mem:
-                _dump_mem_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock)
-            else:
-                _read_ram_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock, _interval_changed)
+            _dump_mem_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock)
         finally:
             bridge.close()
-
-    def _read_ram_poll_loop(bridge, server, runtime, origin_us_ref, stop_event, read_lock, interval_changed) -> None:
-        nonlocal origin_us
-        while not stop_event.is_set():
-            if server.collecting.is_set():
-                t0 = time.monotonic()
-                try:
-                    with read_lock:
-                        result = sample_blocks(runtime.blocks, origin_us=origin_us, bridge=bridge)
-                    origin_us = result.origin_us
-                    for point in result.points:
-                        server.push_data_point(point)
-                except Exception as exc:
-                    server.push_event("error", {"message": str(exc)})
-                elapsed = time.monotonic() - t0
-            else:
-                elapsed = 0.0
-            remaining = max(0.0, server._interval - elapsed)
-            interval_changed.clear()
-            interval_changed.wait(timeout=remaining)
 
     def _dump_mem_poll_loop(bridge, server, runtime, origin_us_ref, stop_event, read_lock) -> None:
         nonlocal origin_us
         from mklink._types import DeviceState
-        from mklink.dump_memory import DumpMemoryParser, build_dump_mem_command, decode_frame_to_points
+        from mklink.dump_memory import (
+            DUMP_MEMORY_STOP_PERIOD,
+            DumpMemoryParser,
+            build_dump_mem_command,
+            decode_frame_to_points,
+        )
 
         # Build block-to-region mapping
         blocks = runtime.blocks
@@ -744,15 +917,20 @@ def run_superwatch_visualizer(
         period = server._interval  # already in seconds
         cmd = build_dump_mem_command(region_pairs, period)
 
-        # Probe: try send_command first to check if cmd.dump_memory is supported
+        # Probe the command before switching the serial bridge to binary mode.
         try:
             resp = bridge.send_command(cmd, timeout=5.0)
         except Exception:
             resp = "Error"
 
         if "Error" in resp or resp.strip() == "-1":
-            server.push_event("info", {"message": "cmd.dump_memory not supported, falling back to read_ram polling"})
-            _read_ram_poll_loop(bridge, server, runtime, origin_us, stop_event, read_lock, _interval_changed)
+            server.push_event("error", {
+                "message": (
+                    "SuperWatch requires cmd.dump_memory binary streaming; "
+                    "read_ram fallback is disabled"
+                ),
+            })
+            stop_event.set()
             return
 
         # Device accepted — it's now streaming binary frames.
@@ -798,10 +976,13 @@ def run_superwatch_visualizer(
                     server.push_event("error", {"message": str(exc)})
                     break
         finally:
-            # Stop dump_mem streaming by sending period=0
+            # Use the firmware's explicit stop value.  period=0 requests one
+            # additional sample and can leave it queued for the next command.
             try:
                 bridge._exit_stream()
-                stop_cmd = build_dump_mem_command(region_pairs, 0)
+                stop_cmd = build_dump_mem_command(
+                    region_pairs, DUMP_MEMORY_STOP_PERIOD,
+                )
                 bridge.send_command(stop_cmd, timeout=3.0)
             except Exception:
                 pass
