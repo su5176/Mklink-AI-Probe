@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-01T16:29:53+08:00`
+- 更新时间：`2026-09-01T16:33:11+08:00`
 - 分支：`feature/eternal-chip-gui`
 - HEAD：`立芯分支以双父 merge commit 044568948783fb954ca7d5648761dda24b294dc4 纳入 origin/master 的完整 0.1.9，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
-- 远端 HEAD：`完成本轮提交后，origin/feature/eternal-chip-gui 与本地验证头同步；MicroKeen/Mklink-AI-Probe 的新 master 分支镜像 origin/master=e25060fa38ac4abfe21ef37d81776061378731b4，既有 main 不覆盖。`
+- 远端 HEAD：`origin/feature/eternal-chip-gui 已推送验证提交 a5af67e651c3e65fa6df0779d3d45574b0c26a86；MicroKeen/Mklink-AI-Probe 仍只有既有 main，使用当前 su5176 凭据创建 master 被 GitHub 以 403 拒绝。`
 - 工作树：最终提交与推送后保持干净；STCP DLL、egg-info、测试运行目录和 Tauri/Cargo 输出均为忽略或外部构建产物。
-- 当前任务：将 origin/master 的完整 0.1.9 语义合并进 feature/eternal-chip-gui，采用 master 的 UF2 与 AGENTS.md，保留立芯专属界面，并完成提交后的全量软件、真实 Chromium 与 HIL-Infra 门禁。
-- 状态：`eternal-chip-v0.1.9-synced`
+- 当前任务：origin/master 的完整 0.1.9 已语义合并并推送到 feature/eternal-chip-gui；采用 master 的 UF2 与 AGENTS.md，保留立芯专属界面，并完成全量软件、真实 Chromium 与 HIL-Infra 门禁。MicroKeen master 镜像仅因目标仓库写权限待处理。
+- 状态：`eternal-chip-v0.1.9-synced-microkeen-permission-pending`
 
 ## 里程碑
 
@@ -28,6 +28,7 @@
 - **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性均为 0 error / 0 warning / 0 waiver；bench-01、bench-gec1900、两份运行计划和资源语义映射通过。
 - **HIL 运行时与插件准入**：MKLink、Toomoss、PSU、Camera 的 5 个负向运行时拒绝探针通过；MKLink 自动化插件评审 11/11 OK，Camera 11/11 OK。判断层确认 program.erase 为 irreversible、无人值守面仅开放 observe/debug.read、safe_state 不夸大且插件保持联邦接入；结束后无活动锁。
 - **PR #15 固件资产**：按用户决策采用 PR 文件：HPMLink V4.3.8 SHA-256=D295858F3914998ABB7A19F6064157F6695C5B43E362CB00553D7A295A7E3FA8；MicroLink V3.3.8 SHA-256=E213B248A137C6519A9E926EAAC78718CE844C2A20555F3A3D2A48581B099BE8；MicroLink V4.3.9 SHA-256=F29821A6A34B75F3DAE96416595CA572A2DACAAF54C9DCC17521845F212DCEF6。
+- **远端同步**：origin/feature/eternal-chip-gui 已从 795e83e 推进到 a5af67e。MicroKeen 远端不存在 master；尝试以当前 su5176 HTTPS 凭据创建时收到 403，未覆盖既有 main，也未发生部分写入。
 
 ## 架构决策
 
@@ -46,9 +47,10 @@
 
 ## 下一动作
 
-1. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
-2. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
-3. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次分支同步或 MicroKeen master 镜像自动推断。
+1. 为 su5176 授予 MicroKeen/Mklink-AI-Probe Write 以上权限后，执行 git push microkeen origin/master:refs/heads/master；该操作只新建 master，不修改现有 main。
+2. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
+3. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
+4. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次分支同步或 MicroKeen master 镜像自动推断。
 
 ## 已知限制
 
@@ -56,6 +58,7 @@
 - Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。
 - Web 生产构建仍提示 DashboardView 压缩后约 551.14 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
 - 本轮机器没有可调用的 Go 工具链；STCP 源码未改且打包门禁通过，但若需要新的 Go 单测证据，应在安装 Go 后重新执行 go test ./... 并重建 DLL。
+- 当前 GitHub 身份 su5176 对 MicroKeen/Mklink-AI-Probe 没有写权限；创建 master 需要该仓库 Write 以上协作者/团队权限，或由有权限身份执行非强制推送。
 - HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。
 
 ## 延续协议
