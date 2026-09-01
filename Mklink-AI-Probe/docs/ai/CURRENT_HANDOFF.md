@@ -4,19 +4,19 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-01T14:01:42+08:00`
-- 分支：`codex/v0.1.9-upstream-pr`
-- HEAD：`PR #15 plus build-gate fixes, synchronized Web assets, and privacy-safe memory observability are locally validated.`
-- 远端 HEAD：`origin/pr/15 still points to the original PR head until the validated integration branch is pushed.`
+- 更新时间：`2026-09-01T14:07:55+08:00`
+- 分支：`master`
+- HEAD：`PR #15 is merged; master contains the validated build-gate fixes, synchronized Web assets, and privacy-safe memory observability.`
+- 远端 HEAD：`origin/master contains PR #15 merge commit 9485089b56075310d8f9b7c6ef0577dbb4bd5c2d; later documentation-only handoff updates may advance master.`
 - 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory.
-- 当前任务：完成 PR #15 修补、两个本地备份中的内存可观测性语义迁移、全量软件门禁与 HIL-Infra 只读门禁。
-- 状态：`v0.1.9-pr15-integrated-and-validated`
+- 当前任务：PR #15 修补、两个本地备份中的内存可观测性语义迁移、全量软件门禁、HIL-Infra 只读门禁和远端合并均已完成。
+- 状态：`v0.1.9-pr15-merged`
 
 ## 里程碑
 
 - **0.1.9 桌面端与 WebGUI** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
 - **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
-- **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；下一步仅为推送 PR 分支并按授权完成远端合并。
+- **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
 
 ## 验证证据
 
@@ -45,9 +45,8 @@
 
 ## 下一动作
 
-1. 将已验证分支推送到 PR #15 头分支，确认远端提交一致后按授权合并到 master。
-2. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
-3. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
+1. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
+2. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
 
 ## 已知限制
 
