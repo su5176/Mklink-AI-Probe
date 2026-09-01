@@ -4,34 +4,35 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-01T14:07:55+08:00`
-- 分支：`master`
-- HEAD：`PR #15 is merged; master contains the validated build-gate fixes, synchronized Web assets, and privacy-safe memory observability.`
-- 远端 HEAD：`origin/master contains PR #15 merge commit 9485089b56075310d8f9b7c6ef0577dbb4bd5c2d; later documentation-only handoff updates may advance master.`
-- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory.
-- 当前任务：PR #15 修补、两个本地备份中的内存可观测性语义迁移、全量软件门禁、HIL-Infra 只读门禁和远端合并均已完成。
-- 状态：`v0.1.9-pr15-merged`
+- 更新时间：`2026-09-01T16:29:53+08:00`
+- 分支：`feature/eternal-chip-gui`
+- HEAD：`立芯分支以双父 merge commit 044568948783fb954ca7d5648761dda24b294dc4 纳入 origin/master 的完整 0.1.9，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
+- 远端 HEAD：`完成本轮提交后，origin/feature/eternal-chip-gui 与本地验证头同步；MicroKeen/Mklink-AI-Probe 的新 master 分支镜像 origin/master=e25060fa38ac4abfe21ef37d81776061378731b4，既有 main 不覆盖。`
+- 工作树：最终提交与推送后保持干净；STCP DLL、egg-info、测试运行目录和 Tauri/Cargo 输出均为忽略或外部构建产物。
+- 当前任务：将 origin/master 的完整 0.1.9 语义合并进 feature/eternal-chip-gui，采用 master 的 UF2 与 AGENTS.md，保留立芯专属界面，并完成提交后的全量软件、真实 Chromium 与 HIL-Infra 门禁。
+- 状态：`eternal-chip-v0.1.9-synced`
 
 ## 里程碑
 
 - **0.1.9 桌面端与 WebGUI** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
 - **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
 - **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
+- **立芯分支同步 0.1.9** — `complete`。以 merge commit 0445689 同步当前 master；业务源码无文本冲突，交接文档与可再生 dist 冲突按 master 记忆基线和合并后 Vue 源码重建解决。立芯品牌、六套主题、About 对话框、演示 mock 与专属布局继续保留。
 
 ## 验证证据
 
-- **Python**：最终全量 1790 passed, 1 skipped，耗时 556.10 秒；观测与原 0.1.9 边界联合定向回归 59 passed。
-- **GUI 与 Web**：Vitest 59 files / 626 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 验证配置、仪表盘、脱机烧录、在线烧录路由与版本弹层；无静态资源或 Vue 运行时错误。
-- **Go/STCP**：官方 Go 1.25.12 工具链下 go test ./... 通过；当前源码 DLL SHA-256=C49908A030D16629253683C7B3B4837673863081E4602D8A1F25B54AA0B79087。
-- **Tauri Release 可执行文件**：Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=138647E4DE52BF8E85A4AAC43CBE39A44AF172250ACA47E3F7258B2CC47E661D。
-- **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性零错误零豁免；bench-01、bench-gec1900、运行计划和资源映射通过。
-- **HIL 运行时与插件准入**：MKLink、Toomoss、PSU、Camera 的负向运行时拒绝探针通过；MKLink 自动化插件评审 11/11 OK，Camera 11/11 OK；结束后无活动锁。本轮未烧录、复位、供电或发送 CAN。
+- **Python**：立芯合并提交后的最终全量 1790 passed, 1 skipped，耗时 612.29 秒；先构建/提供 STCP DLL 并启用 Python UTF-8 模式后，先前 4 个环境型失败用例定向复跑 4/4 通过。
+- **GUI 与 Web**：Vitest 61 files / 630 tests 全部通过；生产构建转换 1952 modules。真实 Chromium 验证配置、仪表盘、脱机烧录、在线烧录路由，以及立芯 About、六套主题和 0.1.9 版本弹层；控制台 0 error / 0 warning，关键 API 与品牌静态资源均为 200。
+- **Go/STCP**：master 集成证据中官方 Go 1.25.12 的 go test ./... 已通过；本轮机器无可调用 Go 工具链，复用与当前 go.mod/go.sum/main.go/main_test.go 逐文件同哈希的 x64 DLL，SHA-256=758E428FE9ED6BCBD9489D6DB1990FCE5A18680887137EA3CA6D348C27A77C07，并由全量 Site Agent 打包与归档审计通过。
+- **Tauri Release 可执行文件**：Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，19,225,600-byte EXE SHA-256=37A9C45A456393CFCA3FC555CAB5038082ABE269B00F14E8AEB637258A8C259D。
+- **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性均为 0 error / 0 warning / 0 waiver；bench-01、bench-gec1900、两份运行计划和资源语义映射通过。
+- **HIL 运行时与插件准入**：MKLink、Toomoss、PSU、Camera 的 5 个负向运行时拒绝探针通过；MKLink 自动化插件评审 11/11 OK，Camera 11/11 OK。判断层确认 program.erase 为 irreversible、无人值守面仅开放 observe/debug.read、safe_state 不夸大且插件保持联邦接入；结束后无活动锁。
 - **PR #15 固件资产**：按用户决策采用 PR 文件：HPMLink V4.3.8 SHA-256=D295858F3914998ABB7A19F6064157F6695C5B43E362CB00553D7A295A7E3FA8；MicroLink V3.3.8 SHA-256=E213B248A137C6519A9E926EAAC78718CE844C2A20555F3A3D2A48581B099BE8；MicroLink V4.3.9 SHA-256=F29821A6A34B75F3DAE96416595CA572A2DACAAF54C9DCC17521845F212DCEF6。
 
 ## 架构决策
 
 - UF2 固件文件和 AGENTS.md 采用 PR #15 版本。
-- 两个本地备份包含同一份核心内存可观测性实现；只迁移一次代码，旧交接文档不覆盖当前 0.1.9 记忆，Eternal Chip GUI 分支历史不混入 PR。
+- 立芯分支采用双父 merge commit 纳入当前 master，不重放旧 observability WIP；冲突策略固定为保留立芯品牌与主题交互、采用 master 的核心运行时、UF2、AGENTS.md 和 0.1.9 功能。
 - 观测数据的公开事件仅包含安全事实，原始内存、RTT 和 SystemView 内容走有界私有流；发布失败降级但不改变成功读取结果。
 - 构建、测试、日志和缓存统一位于 MKLINK_BUILD_ROOT 或主工作区忽略的 .build，并经 scripts/build_workspace.ps1 运行。
 - 实际烧录、复位、供电、CAN 发送等不可逆或有外部影响的动作必须获得针对本次操作的明确确认。
@@ -39,20 +40,22 @@
 
 ## 真机环境
 
-- **probe**：HIL-Infra bench-01 将 MKLink V4 命令口映射为 COM5；交接不依赖端口号，使用台架 selector 与互操作锁。
-- **target**：已有 v0.1.9 STM32F103RE 真机报告来自较早源码基线；本轮变更集中在构建门禁、Web 产物与主机侧可观测性，没有重烧目标。
-- **permission**：本轮只做 identify/capabilities/health/safe_state 与负向拒绝探针。若要重跑物理烧录闭环，需要用户明确授权目标、固件和写入动作。
+- **probe**：HIL-Infra bench-01 通过稳定 selector 与互操作锁寻址实插 MKLink V4；交接不记录端口号或完整探针标识。
+- **target**：已有 v0.1.9 STM32F103RE 真机报告来自 master 集成基线；本轮立芯相对 master 的运行时差异仅在 GUI 品牌与主题，没有重烧目标。
+- **permission**：本轮只做浏览器只读页面、identify/capabilities/health/safe_state、锁互操作与负向拒绝探针。若要重跑物理烧录闭环，需要用户明确授权目标、固件和写入动作。
 
 ## 下一动作
 
-1. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
-2. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
+1. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
+2. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
+3. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次分支同步或 MicroKeen master 镜像自动推断。
 
 ## 已知限制
 
-- 本轮没有重新执行物理烧录 HIL；docs/verification/v0.1.9-stm32f103re-release-hil.md 的原始日志未在当前工作区找到，因此只能作为既有叙述证据，不能冒充本轮新证据。
+- 本轮没有重新执行物理烧录 HIL；目标侧行为沿用 master 已验证的 0.1.9 基线，不能冒充本轮新烧录证据。
 - Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。
-- Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
+- Web 生产构建仍提示 DashboardView 压缩后约 551.14 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
+- 本轮机器没有可调用的 Go 工具链；STCP 源码未改且打包门禁通过，但若需要新的 Go 单测证据，应在安装 Go 后重新执行 go test ./... 并重建 DLL。
 - HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。
 
 ## 延续协议
