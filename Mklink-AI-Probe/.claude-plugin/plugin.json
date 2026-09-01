@@ -1,6 +1,6 @@
 {
   "name": "mklink-flash",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "MKLink/MicroLink 嵌入式调试工具：固件烧录、RTT/VOFA/SuperWatch 可视化、RAM/寄存器读写、AXF 符号与 HardFault 调试、Modbus RTU、通用串口调试。基础能力以 MCP tool 暴露（vendor-neutral），调试方法论以 skill 编排。",
   "author": { "name": "TonyZhang", "email": "sunyear@qq.com" }
 }

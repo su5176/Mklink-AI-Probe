@@ -1435,6 +1435,19 @@ def _cli_read_ram(port: str | None, addr: str, size: int, save: str | None):
     """读取目标芯片 RAM 数据。"""
     from mklink.bridge import MKLinkSerialBridge
 
+    try:
+        address = int(addr, 0)
+    except (TypeError, ValueError):
+        print("[FAIL] --addr must be a 32-bit integer such as 0x20000000")
+        return
+    if not 0 <= address <= 0xFFFFFFFF or not 0 < size <= 4096:
+        print("[FAIL] read-ram requires a 32-bit address and --size 1..4096")
+        print("       use dump-memory for larger reads")
+        return
+    if address + size > 0x100000000:
+        print("[FAIL] address + size exceeds the 32-bit address space")
+        return
+
     port = _resolve_port(port)
     print(f"[*] 连接 {port} ...")
     bridge = MKLinkSerialBridge(port)
@@ -1620,37 +1633,47 @@ def _cli_read_reg(
 
 def _cli_write_ram(port: str | None, addr: str, data_bytes: list[str]):
     """写入数据到目标芯片 RAM 并回读验证。"""
-    from mklink.bridge import MKLinkSerialBridge
-
     if not data_bytes:
         print("[FAIL] 未指定写入数据，用法: python -m mklink write-ram --addr 0x20001000 0xDE 0xAD 0xBE 0xEF")
         return
 
-    port = _resolve_port(port)
-    print(f"[*] 连接 {port} ...")
-    bridge = MKLinkSerialBridge(port)
-    if not bridge.connect():
-        print("[FAIL] 连接失败")
+    try:
+        address = int(addr, 0)
+        payload = bytes(int(value, 0) for value in data_bytes)
+    except (ValueError, OverflowError):
+        print("[FAIL] 地址或数据格式无效；地址和每个字节应使用 0x 前缀，字节范围为 0x00..0xFF")
+        return
+    if not 0 <= address <= 0xFFFFFFFF or address + len(payload) > 0x100000000:
+        print("[FAIL] 写入范围超出 32 位地址空间")
+        return
+    if len(payload) > 4096:
+        print("[FAIL] write-ram 单次最多写入 4096 字节，请分块写入")
         return
 
-    try:
-        _init_target_bridge(bridge)
-        byte_args = ", ".join(data_bytes)
-        write_cmd = f'cmd.write_ram({addr}, {byte_args})'
-        print(f"[*] 写入: {write_cmd}")
-        resp = bridge.send_command(write_cmd, timeout=10.0)
-        print(resp.strip())
+    port = _resolve_port(port)
+    print(f"[*] 连接 {port} ...")
+    from mklink.device import connect
 
-        # 回读验证
-        n = len(data_bytes)
-        read_cmd = f'cmd.read_ram({addr}, {n})'
-        print(f"\n[*] 回读验证: {read_cmd}")
-        resp = bridge.send_command(read_cmd, timeout=10.0)
-        print(resp.strip())
+    device = None
+    try:
+        device = connect(port=port, project_root=".")
+        print(f"[*] 写入 0x{address:08X}，共 {len(payload)} 字节")
+        # 统一使用 Device 的 flush_memory 分块/折叠路径。旧固件的
+        # cmd.write_ram 逐参数路径曾出现静默不生效，不能只依赖命令回显。
+        device.write_memory(address, payload)
+        actual = device.read_memory(address, len(payload))
+        if actual != payload:
+            print(
+                f"[FAIL] 回读不一致：期望 {payload.hex(' ')}，"
+                f"实际 {actual.hex(' ') if actual else '<无可解析数据>'}"
+            )
+            return
+        print(f"[OK] 回读验证通过: {actual.hex(' ')}")
     except Exception as e:
         print(f"[FAIL] {e}")
     finally:
-        bridge.close()
+        if device is not None:
+            device.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1786,7 +1809,7 @@ def _cli_flush_memory(
 
     与 write-ram 的关键区别：
       - 成功时设备不输出 hexdump 预览（仅 echo 命令 + >>>）
-      - 适合与 dump_memory 并发流式采样时使用，不会污染数据流
+      - 成功时不输出 hexdump；仍须在 dump_memory 停止并释放连接后再调用
       - 多地址一次提交，单笔 MCU-RTT 往返完成多块写入
 
     Args:
@@ -1969,7 +1992,7 @@ def _cli_dump_memory(
     duration: float = 2.0,
     save: str | None = None,
     json_output: bool = False,
-):
+) -> int:
     """Public dump_memory CLI.
 
     The firmware emits binary MPMDMPMD frames. Collection is bounded by default
@@ -1982,40 +2005,44 @@ def _cli_dump_memory(
     from mklink._types import DeviceState
     from mklink.bridge import MKLinkSerialBridge
     from mklink.dump_memory import (
+        DUMP_MEMORY_STOP_PERIOD,
         DumpMemoryParser,
-        MAX_REGIONS,
+        MAX_SAFE_REPL_REGIONS,
         build_dump_mem_command,
     )
 
     if not regions:
         print("[FAIL] no regions specified")
         print("      usage: python -m mklink dump-memory 0x20000000:16")
-        return
-    if frames < 0:
-        print("[FAIL] --frames must be >= 0")
-        return
-    if duration < 0:
-        print("[FAIL] --duration must be >= 0")
-        return
+        return 2
+    if frames < 0 or frames > 100000:
+        print("[FAIL] --frames must be between 0 and 100000")
+        return 2
+    if duration < 0 or duration > 300:
+        print("[FAIL] --duration must be between 0 and 300 seconds")
+        return 2
     if frames == 0 and duration == 0:
         print("[FAIL] --frames 0 requires --duration > 0")
-        return
+        return 2
 
     try:
         region_pairs = [_parse_dump_region(raw) for raw in regions]
-        if len(region_pairs) > MAX_REGIONS:
-            raise ValueError(f"too many regions: {len(region_pairs)} > {MAX_REGIONS}")
+        if len(region_pairs) > MAX_SAFE_REPL_REGIONS:
+            raise ValueError(
+                f"too many regions for the safe Pika API boundary: "
+                f"{len(region_pairs)} > {MAX_SAFE_REPL_REGIONS}"
+            )
         cmd = build_dump_mem_command(region_pairs, period)
     except ValueError as exc:
         print(f"[FAIL] invalid dump-memory request: {exc}")
-        return
+        return 2
 
     port = _resolve_port(port)
     print(f"[*] Connecting {port} ...")
     bridge = MKLinkSerialBridge(port)
     if not bridge.connect():
         print("[FAIL] connect failed")
-        return
+        return 1
 
     _init_target_bridge(bridge)
 
@@ -2025,6 +2052,7 @@ def _cli_dump_memory(
     raw_seen = bytearray()
     sample_count = 0
     stream_started = False
+    exit_code = 0
 
     def _is_complete_sample(frame: dict) -> bool:
         if frame.get("format") != "B1":
@@ -2083,6 +2111,7 @@ def _cli_dump_memory(
                     f"crc_errors={parser.crc_errors} dropped_bytes={parser.dropped_bytes}"
                 )
         else:
+            exit_code = 1
             diag = raw_seen.decode("utf-8", errors="replace").strip()
             if diag:
                 print(f"[FAIL] no dump_memory frames parsed; device response: {diag[:300]}")
@@ -2090,13 +2119,17 @@ def _cli_dump_memory(
                 print("[FAIL] no dump_memory frames parsed")
     except KeyboardInterrupt:
         print("\n[*] interrupted")
+        exit_code = 130
     except Exception as exc:
         print(f"[FAIL] {exc}")
+        exit_code = 1
     finally:
         if stream_started:
             try:
                 if period != 0:
-                    stop_cmd = build_dump_mem_command(region_pairs, 0)
+                    stop_cmd = build_dump_mem_command(
+                        region_pairs, DUMP_MEMORY_STOP_PERIOD,
+                    )
                     bridge._write_raw((stop_cmd + "\n").encode("utf-8"))
                     time.sleep(0.1)
                     try:
@@ -2107,6 +2140,7 @@ def _cli_dump_memory(
             except Exception:
                 pass
         bridge.close()
+    return exit_code
 
 
 def _cli_resources(args):
@@ -2459,14 +2493,14 @@ def _cli_watch(args):
 
 
 def _cli_superwatch(args):
-    """Start SuperWatch read_ram-based variable/register visualization."""
+    """Start SuperWatch dump_memory variable/register visualization."""
     import json
 
     from mklink.superwatch import (
         build_read_blocks,
         find_project_svd,
         load_svd_registers,
-        poll_blocks,
+        poll_blocks_dumpmem,
         resolve_watch_items,
         run_superwatch_visualizer,
     )
@@ -2520,13 +2554,13 @@ def _cli_superwatch(args):
             duration=args.duration,
             dwarf_info=dwarf_info,
             svd_registers=svd_registers,
-            dump_mem=getattr(args, 'dump_mem', False),
+            dump_mem=True,
         )
         return
 
     try:
-        points = poll_blocks(
-            build_read_blocks(items),
+        points = poll_blocks_dumpmem(
+            build_read_blocks(items, max_gap=0),
             port=args.port,
             duration=args.duration,
             period=args.period,
@@ -2551,49 +2585,55 @@ def _cli_vofa(
     source: str | None = None,
     elf_backend: str | None = None,
     project_root: str | None = None,
-):
+) -> int:
     """启动或停止 VOFA+ 实时变量观测。"""
     from mklink.bridge import MKLinkSerialBridge
     from mklink._types import DeviceState
+    from mklink.vofa_viewer import build_vofa_command
+
+    original_variables = list(variables)
+    resolved_variables = list(variables)
+    if source and resolved_variables:
+        from mklink.vofa_viewer import resolve_variable_names
+        resolved_variables = resolve_variable_names(
+            resolved_variables,
+            source,
+            backend=elf_backend,
+            project_root=project_root,
+        )
+
+    try:
+        if stop and not resolved_variables:
+            cmd, var_args, channel_count, _mode = build_vofa_command(
+                ["0x20000000", "uint8_t"], 0,
+            )
+        else:
+            if not resolved_variables:
+                print("[FAIL] 请指定观测变量，用法:")
+                print('  python -m mklink vofa 0x20000030 uint8_t 0x2000154c float --period 0.00001')
+                return 2
+            cmd, var_args, channel_count, _mode = build_vofa_command(
+                resolved_variables, 0 if stop else period,
+            )
+    except ValueError as exc:
+        print(f"[FAIL] 无效 VOFA 请求: {exc}")
+        return 2
 
     port = _resolve_port(port)
     print(f"[*] 连接 {port} ...")
     bridge = MKLinkSerialBridge(port)
     if not bridge.connect():
         print("[FAIL] 连接失败")
-        return
+        return 1
 
+    exit_code = 0
     try:
         if stop:
-            # 停止：用上次的变量列表发送 period=0，或直接发空命令
-            # 简单方案：发送一个 period=0 的 vofa.send
-            if variables:
-                var_args = ", ".join(variables)
-                cmd = f'vofa.send({var_args}, 0)'
-            else:
-                cmd = 'vofa.send(0x20000000, "uint8_t", 0)'
             print(f"[*] 停止 VOFA: {cmd}")
             resp = bridge.send_command(cmd, timeout=5.0)
             print(resp.strip())
             print("[OK] VOFA 已停止")
         else:
-            if not variables:
-                print("[FAIL] 请指定观测变量，用法:")
-                print('  python -m mklink vofa 0x20000030 uint8_t 0x2000154c float --period 0.00001')
-                return
-
-            original_variables = list(variables)
-            if source:
-                from mklink.vofa_viewer import resolve_variable_names
-                variables = resolve_variable_names(
-                    variables,
-                    source,
-                    backend=elf_backend,
-                    project_root=project_root,
-                )
-
-            var_args = ", ".join(f'"{v}"' if not v.startswith("0x") and not v.replace(".", "").isdigit() else v for v in variables)
-            cmd = f'vofa.send({var_args}, {period})'
             print(f"[*] 启动 VOFA: {cmd}")
 
             # 切换到流模式
@@ -2606,7 +2646,7 @@ def _cli_vofa(
                 channel_names = [n.strip() for n in names.split(",")] if names else None
                 run_vofa_visualizer(
                     bridge,
-                    variables=variables,
+                    variables=resolved_variables,
                     var_args=var_args,
                     period=period,
                     duration=duration,
@@ -2622,9 +2662,8 @@ def _cli_vofa(
                 )
             else:
                 # --- 控制台模式 ---
-                from mklink.vofa_viewer import JustFloatParser, _infer_channel_count, _infer_channel_names
-                channel_count = _infer_channel_count(variables)
-                ch_names = _infer_channel_names(variables, channel_count)
+                from mklink.vofa_viewer import JustFloatParser, _infer_channel_names
+                ch_names = _infer_channel_names(resolved_variables, channel_count)
                 parser = JustFloatParser(channel_count, ch_names)
 
                 print(f"[OK] VOFA 已启动，采样周期 {period}s，通道数 {channel_count}")
@@ -2662,6 +2701,7 @@ def _cli_vofa(
                 print("[OK] VOFA 已停止")
     except Exception as e:
         print(f"[FAIL] {e}")
+        exit_code = 1
         # 异常时尝试停止 VOFA 流，防止设备锁死在流模式
         if bridge.state in (DeviceState.VOFA_STREAM, DeviceState.READY):
             try:
@@ -2671,6 +2711,7 @@ def _cli_vofa(
                 pass
     finally:
         bridge.close()
+    return exit_code
 
 
 def _enable_utf8_console():
@@ -2804,12 +2845,12 @@ def _cli_modbus_read(args):
                 bits = client.read_coils(start, qty, slave)
                 print(f"[OK] FC01 读 {qty} 个线圈 (从站 {slave}, 地址 {start}):")
                 for i, b in enumerate(bits):
-                    print(f"  {start + i:>6}: {fmt_on_off(b, fmt)}")
+                    print(f"  {start + i:>6}: {_fmt_on_off(b, fmt)}")
             elif fc == 2:
                 bits = client.read_discrete_inputs(start, qty, slave)
                 print(f"[OK] FC02 读 {qty} 个离散输入 (从站 {slave}, 地址 {start}):")
                 for i, b in enumerate(bits):
-                    print(f"  {start + i:>6}: {fmt_on_off(b, fmt)}")
+                    print(f"  {start + i:>6}: {_fmt_on_off(b, fmt)}")
             elif fc == 3:
                 regs = client.read_holding_registers(start, qty, slave)
                 print(f"[OK] FC03 读 {qty} 个保持寄存器 (从站 {slave}, 地址 {start}):")
@@ -4005,7 +4046,7 @@ def main():
     dump_memory_parser.add_argument(
         "regions",
         nargs="+",
-        help="内存区域，格式 ADDR:SIZE；可重复，例如 0x20000000:16 0x20001000:4",
+        help="内存区域 ADDR:SIZE；最多 15 组，例如 0x20000000:16 0x20001000:4",
     )
     dump_memory_parser.add_argument(
         "--period",
@@ -4031,7 +4072,7 @@ def main():
     flush_memory_parser = subparsers.add_parser(
         "flush-memory",
         aliases=["flush-memroy"],  # 旧拼写向后兼容（但用法是新的）
-        help="静默写 RAM（cmd.flush_memory，多地址多字节；适合与 dump_memory 并发）",
+        help="静默写 RAM（cmd.flush_memory，多地址多字节；不得与流式采集并发）",
     )
     flush_memory_parser.add_argument("--port", help="COM 端口（默认自动检测）")
     flush_memory_parser.add_argument(
@@ -4125,7 +4166,7 @@ def main():
     _add_elf_backend_arg(watch_parser)
 
     # ---- Modbus RTU 子命令组 ----
-    superwatch_parser = subparsers.add_parser("superwatch", help="SuperWatch read_ram timestamped viewer")
+    superwatch_parser = subparsers.add_parser("superwatch", help="SuperWatch dump_memory binary-stream viewer")
     superwatch_parser.add_argument("variables", nargs="*", help="variables, struct.field paths, or registers")
     superwatch_parser.add_argument("--project-root", default=".", help="project root")
     superwatch_parser.add_argument("--port", help="COM port")
@@ -4140,7 +4181,7 @@ def main():
     superwatch_parser.add_argument("--max-points", type=int, default=500, help="maximum chart points")
     superwatch_parser.add_argument("--duration", type=float, default=30.0, help="run duration seconds; 0=forever")
     superwatch_parser.add_argument("--dump-mem", action="store_true",
-        help="use dump_mem binary streaming protocol for higher throughput")
+        help="compatibility flag; SuperWatch always uses dump_memory binary streaming")
     _add_elf_backend_arg(superwatch_parser)
 
     modbus_parser = subparsers.add_parser(
@@ -4559,7 +4600,7 @@ def main():
     elif args.command == "write-ram":
         _cli_write_ram(args.port, args.addr, args.data)
     elif args.command in ("dump-memory", "dump"):
-        _cli_dump_memory(
+        return _cli_dump_memory(
             args.port,
             args.regions,
             period=args.period,
@@ -4583,7 +4624,7 @@ def main():
     elif args.command == "read-flash":
         _cli_read_flash(args.port, args.addr, args.size, args.save, _resolve_project_root(args))
     elif args.command == "vofa":
-        _cli_vofa(
+        return _cli_vofa(
             args.port, args.variables, args.period, args.stop,
             visualize=args.visualize,
             host=args.host,

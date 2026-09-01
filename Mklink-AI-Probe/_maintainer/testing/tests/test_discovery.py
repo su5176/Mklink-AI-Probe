@@ -14,6 +14,7 @@ def port(
     serial_number=None,
     location="",
     interface=None,
+    description="",
 ):
     return SimpleNamespace(
         device=device,
@@ -24,6 +25,7 @@ def port(
         serial_number=serial_number,
         location=location,
         interface=interface,
+        description=description,
     )
 
 
@@ -65,6 +67,61 @@ def test_discovery_selects_mi04_without_opening_other_interfaces(monkeypatch):
 
     assert discovery.find_mklink_cdc_port() == "COM55"
     assert discovery.find_mklink_cdc_port(serial_number="PROBE-V4") == "COM55"
+
+
+def test_discover_all_command_ports_skips_non_command_and_bluetooth(monkeypatch):
+    ports = [
+        port(
+            "COM227",
+            hwid=r"USB\VID_0D28&PID_0202&MI_02",
+            vid=0x0D28,
+            pid=0x0202,
+        ),
+        port(
+            "COM228",
+            hwid=r"USB\VID_0D28&PID_0202&MI_04",
+            vid=0x0D28,
+            pid=0x0202,
+        ),
+        port(
+            "COM229",
+            hwid=r"USB\VID_0D28&PID_0202&MI_06",
+            vid=0x0D28,
+            pid=0x0202,
+        ),
+        port("COM98", hwid=r"BTHENUM\device"),
+    ]
+    monkeypatch.setattr(discovery.list_ports, "comports", lambda: ports)
+    monkeypatch.setattr(
+        discovery,
+        "_probe_port",
+        lambda _device: (_ for _ in ()).throw(
+            AssertionError("known non-command and Bluetooth ports must not open")
+        ),
+    )
+
+    assert [item.device for item in discovery.discover_mklink_command_ports()] == [
+        "COM228"
+    ]
+
+
+def test_discover_all_command_ports_keeps_legacy_identity_fallback(monkeypatch):
+    ports = [
+        port("COM44", hwid="USB VID:PID=0D28:0202", vid=0x0D28, pid=0x0202),
+        port("COM45", hwid="USB VID:PID=0D28:0202", vid=0x0D28, pid=0x0202),
+    ]
+    probed = []
+    monkeypatch.setattr(discovery.list_ports, "comports", lambda: ports)
+    monkeypatch.setattr(
+        discovery,
+        "_probe_port",
+        lambda device: probed.append(device) or device == "COM45",
+    )
+
+    assert [item.device for item in discovery.discover_mklink_command_ports()] == [
+        "COM45"
+    ]
+    assert probed == ["COM44", "COM45"]
 
 
 def test_discovery_uses_mi04_from_the_requested_composite_device(monkeypatch):

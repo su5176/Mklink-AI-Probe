@@ -9,6 +9,9 @@
 
 #### `python -m mklink read-ram --addr <地址> [--size <字节数>] [--port COM6] [--save <文件名>]`
 读取目标芯片 RAM 数据，输出十六进制 dump。RAM 读取不需要 FLM 算法。
+`--size` 限制为 **1..4096 字节**；更大范围改用 `dump-memory`，不要把大段文本
+hexdump 返回给 AI。MCP 同样限制 `read_memory` 为 4096B；同时读取多个变量时用
+`read_memory_regions`（最多 16 项、总计 4096B），连续或重叠区域会自动合并为一次读取。
 
 ```
 python -m mklink read-ram --addr 0x20000000 --size 256
@@ -33,7 +36,9 @@ python -m mklink read-reg --addr 0xE000ED28 --width 32
 ### 写入 RAM
 
 #### `python -m mklink write-ram --addr <地址> <字节1> <字节2> ... [--port COM6]`
-写入数据到 RAM 并自动回读验证。RAM 写入不需要 FLM 算法。
+写入数据到 RAM 并自动回读验证，单次最多 4096B。CLI 使用 `Device.write_memory` 的
+`flush_memory` 分块/重复字节折叠路径，不再直接依赖旧 `cmd.write_ram` 的命令回显。
+RAM 写入不需要 FLM 算法。
 
 ```
 python -m mklink write-ram --addr 0x20001000 0xDE 0xAD 0xBE 0xEF
@@ -51,7 +56,10 @@ cmd.write_ram(0x20001090, 0x22)
 # 两次共 ~95ms,无串行开销
 ```
 
-**参数数量限制**:实测 V4.3.1 固件在 N>16 个参数时 PikaScript 解析器异常(空响应 / NameError / 设备进入流模式)。`write_ram` 限制为 ≤16 字节单次写入。更大批量用 `flush-memory` 一次提交多地址,或 `dump_memory` 协议。
+直接调用旧固件 `cmd.write_ram` 时仍受 Pika 位置参数上限约束；CLI 已不走该入口。
+V4.3.8 在 STM32H743 上实测旧入口、bytes 字面量、重复字节折叠及 Device 路径均可完成
+`11 22 33 44 -> 00 00 00 00` 并回读。为防旧固件或偶发静默失败，自动化写入必须以回读
+一致作为成功条件，不能只看 `>>>` 或命令回显。
 
 **避免覆盖活跃内存区**:写入前先核对 `build/keil/List/rt-thread.map` 与 AXF 符号:
 - `0x20000000..0x200000DC`: `.mklink_res` (test fixture 控制块, magic 0x4D4B5245 "ERKM")
@@ -86,6 +94,11 @@ python -m mklink dump-memory 0x08000000:256 --frames 0 --duration 1 --save flash
 ```
 
 - `--save` 保存的是已解析出的 region payload，不是包含 magic/CRC 的原始协议帧。
+- **最多 15 个 region**。固件数据结构容量虽为 16，但 16 组 `(addr,size)` 加 period
+  正好占满 Pika 的 33 参数上限；V4.3.8 实测会使 REPL 失去响应。不得用 SDK 或串口
+  绕过。16 个常见连续变量应合并为一个区域；离散快照用 MCP `read_memory_regions`。
+- CLI 还限制 `--duration <= 300`、`--frames <= 100000`；AI 发起的单次采集进一步
+  限制为 **30 秒**，需要更长观察时分段并在每段后确认设备状态。
 - `total_size <= 2048` 走 OLD 帧；`total_size > 2048` 走 B1 分块帧，CLI 会等到 B1 最后一块后计为 1 个完整样本。
 - 单次 `cmd.dump_memory()` 总长度默认 **512 KiB**（固件 V4.3.3 实测整片 Flash 稳定，256 个 B1 块全 `flags=0x0000`）。**老固件**（pre-V4.3.3，BUG-5：>64 KiB 末块截尾 512B）请传 ≤32 KiB 的 `ADDR:SIZE` region 规避。
 - 如果没有解析到任何帧，CLI 会打印设备返回的可见文本，常见原因是固件未暴露 `cmd.dump_memory` 或设备仍处于异常流模式。
@@ -94,7 +107,8 @@ python -m mklink dump-memory 0x08000000:256 --frames 0 --duration 1 --save flash
 静默写 RAM,支持多地址多字节(内部调用 PikaScript `cmd.flush_memory()`)。与 `write-ram` 的关键区别:
 
 - **成功无 ACK** — 设备只回显命令 + `>>>`,不输出 hexdump 预览。
-- **适合与 `dump_memory` 并发** — 不会污染二进制数据流(`write_ram` 的 hexdump 预览会打断 DumpMemoryParser 的帧解析)。
+- **不得与流并发** — 虽然成功时没有 hexdump，仍必须先停止 dump/VOFA/RTT/SystemView、
+  释放连接，再在普通命令会话中写入。
 - **多字节 / 多地址** — 单次 PikaScript 调用提交多块写入,远比 `write-ram` 的循环高效。
 - **批写支持** — `--repeat N` + `--interval-ms MS` 实现周期写入(压力测试、抖动测试用)。
 
@@ -165,12 +179,14 @@ PikaScript 端的 `cmd.read_ram` 显示屏对部分地址会**不显示数据行
 
 ##### 📌 边界与分块约束（三类边界务必区分）
 
-`flush-memory` 受**三类独立边界**约束：① 固件协议边界（单地址 ≥16300B、多地址 ≤8 项）；② PC CLI 安全阈值（命令串 ≤230B、≤8 项/批）；③ Windows 命令行长度限制（逐字节展开 ≈16KB 即撞墙）。
+`flush-memory` 单批最多 **12 KiB / 8 个地址项**。更大输入必须串行分批并等待提示符。
+固件极限、命令串和 Windows 命令行限制见[静默写边界](flush-memory.md)；推荐边界不得
+用直接 SDK/Pika 调用绕过。
 
 - 非重复数据 CLI **不自动分块**，超 230B 直接 `FAIL`。
-- **重复字节**用紧凑语法 `ADDR:BYTE*N`（如 `flush-memory "0x20008000:0xAA*16300"`），CLI 自动转 `bytes([0xVV])*N` 短表达式，绕开 ②③，单次可写数 KB。
+- **重复字节**用紧凑语法 `ADDR:BYTE*N`（如 `flush-memory "0x20008000:0xAA*12288"`），CLI 自动转 `bytes([0xVV])*N` 短表达式，绕开 ②③；AI/MCP 单次最多写 12 KiB。
 - **PowerShell**：始终用单引号包裹整个 item（`'0x...:0xAA*N'`），否则逗号会被预处理改写参数。
-- 完整边界表与 host 端分块策略见 **[references/flush-memory.md](references/flush-memory.md)**。
+- 完整边界表与 host 端分块策略见 **[flush-memory.md](flush-memory.md)**。
 
 ### 读取 Flash
 
@@ -184,7 +200,7 @@ python -m mklink read-flash --addr 0x08005000 --size 4096 --save flash_dump.bin
 
 ### VOFA+ 实时变量观测
 
-MKLink 通过 SWD 直接读取目标芯片内存中的变量数据，实时封装为 VOFA+ 协议（JustFloat）经 USB CDC 虚拟串口发送至 PC。**不占用 MCU 串口资源，不侵入业务代码**，可替代 J-Link J-Scope。固件最多一次支持读取 **16 个变量**，最小采样周期 **1us**。
+MKLink 通过 SWD 直接读取目标芯片内存中的变量数据，实时封装为 VOFA+ 协议（JustFloat）经 USB CDC 虚拟串口发送至 PC。**不占用 MCU 串口资源，不侵入业务代码**，可替代 J-Link J-Scope。快速连续布局最多读取 **16 路 float**；精确离散布局最多读取 **15 个地址/类型对**。最小采样周期为 **1us**。
 
 #### 使用方式1：连续读取 float 变量（快速模式）
 
@@ -198,41 +214,17 @@ python -m mklink vofa <起始地址> <个数> --period <秒>
 - `<个数>`：连续读取的 float 数量（1~16）
 - `--period`：采样周期（秒），最小 1us（0.000001），设为 0 停止
 
-#### dump_memory / VOFA 流停止机制
+#### dump_memory 流停止与 AI 恢复边界
 
-`dump_memory(addr, size, period)` 和 `vofa.send(addr, type, period)` 的第 3 参数是**采样周期**(秒),**不是停止位**。`period=0` 不会停止流 — 它会立刻发一帧(或不延迟连续发)。
+当前 V4.3.8 中 `period>0` 持续采样，`period=0` 输出一个完整样本后回到 idle，
+`period=-1` 用于显式停止。主机停止后至少保留默认 **50 ms** 排空时间；V4 实测把
+等待缩到 10 ms 会残留二进制流并污染后续命令。不要快速 start/stop，也不要在同一
+下载器上并行发命令。
 
-正确的停止方式(V4.3.1 固件实测):
-
-```bash
-# 方式 1:RTTView.stop() — 通用流停止,推荐
-RTTView.stop()
-
-# 方式 2:vofa.send(0, 0) — VOFA 流专用,设置 period=0
-vofa.send(0x20000000, "uint8_t", 0)
-```
-
-| period 值 | 行为(实测) |
-|---|---|
-| 0 | 1 帧(单次 or 不延迟) — **不是停止** |
-| 1 | 1 帧(1 秒后才有下一帧) |
-| 0.001 | ~28 KB/秒(1ms 周期,接近物理上限) |
-| 0.5 | ~1 KB/秒(500ms 周期) |
-| 100 | 1 帧(100 秒后才有下一帧) |
-
-设备进入流模式后,普通 `cmd.read_ram` 会被 dump 帧污染(`wRamAddr`/`wCount` 文本混入响应)。恢复手段:
-
-```python
-# Python (mcp_bridge):
-import serial, time
-s = serial.Serial('COM5', 115200, exclusive=True)
-s.write(b'RTTView.stop()\n')
-time.sleep(0.3)
-s.read(8192)  # 清空缓冲
-s.write(b'vofa.send(0x20000000, "uint8_t", 0)\n')  # 双重保险
-time.sleep(0.3)
-s.read(8192)
-```
+结束 dump/VOFA/RTT/SystemView 后关闭当前连接；普通 `read_ram` 等命令重新连接后再发。
+若 MCP tool 超时，只调用一次 `device_status`，随后结束旧会话并只执行一次
+`disconnect` → `connect`。任一步失败就停止并请用户拔插 USB；不得自动重试超时原
+调用，也不得循环发送 stop、`reboot_probe` 或 `reboot()`。
 
 ```
 # 从 0x20000030 开始，连续读取 5 个 float，周期 10us
@@ -245,6 +237,12 @@ python -m mklink vofa 0x20000000 3 --period 0.001
 #### 使用方式2：多地址、多类型读取（精确模式）
 
 MKLink 固件支持的 `vofa.send` 命令形式之二，用于读取不同地址、不同类型的变量。每个变量指定地址和类型，固件将数据以 VOFA+ JustFloat 协议输出。
+
+精确模式最多 **15 个** `(地址, 类型)` 对。16 对再加采样周期会形成 33 个
+Pika 位置参数，触及已知会使 REPL 失去响应的边界。主机还会按 UTF-8 字节数校验
+完整 `vofa.send(...)` 命令，安全上限为 **511B**；超限请求会在发现端口前拒绝。
+快速模式只使用 `起始地址、通道数、周期` 3 个参数，因此保留独立的 **1~16 路**
+连续 float 上限，不能把这个通道上限套用到精确模式。
 
 ```
 python -m mklink vofa <地址1> <类型1> [<地址2> <类型2> ...] --period <秒>
@@ -338,7 +336,7 @@ python -m mklink vofa g_config.setpoint float --source path/to/firmware.axf --vi
 
 **VOFA 类型显示：**
 - 快速模式 `vofa <addr> <count>` 默认每个通道是 `float`，`Size` 为 `4B`。
-- 精确模式 `vofa <addr> <type> ...` 会在 Watch 表显示规范 C 类型和字节数。
+- 精确模式 `vofa <addr> <type> ...` 最多 15 路，会在 Watch 表显示规范 C 类型和字节数。
 - Watch 表中的 `Type` 是变量 C 类型；`Size` 是该类型字节数；`Unit` 是物理单位（如 `V`、`rpm`、`degC`），没有单位时显示 `-`。
 - 支持的类型别名见上文「MKLink 固件接受的变量类型字符串」表格。
 
@@ -385,7 +383,9 @@ python -m mklink watch g_config.setpoint --source path/to/firmware.axf --period 
 ```
 
 #### `python -m mklink superwatch <变量/字段/寄存器...> [--source <firmware.axf>] [--svd <device.svd>] [--visualize]`
-基于 MKLink `read_ram` 响应中的设备时间戳连续采样，适合同时观察 RAM 变量、`struct.field` 路径和寄存器。变量解析依赖 AXF/DWARF；寄存器可使用内置寄存器表，或通过 `--svd`/Keil Pack 自动发现 CMSIS-SVD 后支持外设寄存器名。未加 `--visualize` 时输出采样 JSON；加 `--visualize` 时启动 Web 看板，可搜索/添加 AXF 符号或寄存器。
+基于 MKLink `cmd.dump_memory` 二进制帧内的设备时间戳连续采样，适合同时观察 RAM 变量、`struct.field` 路径和寄存器。变量解析依赖 AXF/DWARF；寄存器可使用内置寄存器表，或通过 `--svd`/Keil Pack 自动发现 CMSIS-SVD 后支持外设寄存器名。未加 `--visualize` 时输出采样 JSON；加 `--visualize` 时启动 Web 看板，可搜索/添加 AXF 符号或寄存器。
+
+`read_ram`/`read_memory` 只用于单次 RAM 快照、变量详情和 AI 故障分析，不用于 SuperWatch 曲线采样，也不作为固件或连接不支持二进制流时的后备方案。此时 SuperWatch 会明确报错并停止。
 
 常用参数：
 - `--period 0.1`：采样周期，单位秒
@@ -401,16 +401,18 @@ python -m mklink superwatch g_config.setpoint,SCB.CFSR --source path/to/firmware
 python -m mklink superwatch TIM2.CNT,ADC1.DR --svd path/to/device.svd --visualize --duration 0
 ```
 
-**Dump Memory 高速模式 (`--dump-mem`)**
+**Dump Memory 连续采样协议**
 
-使用官方 `cmd.dump_memory(addr1, size1, addr2, size2, ..., period)` 二进制流协议替代逐个 `read_ram` 轮询。设备端一条命令配置所有区域后主动推送 `MPMDMPMD` 帧（64 位时间戳 + frame CRC32 校验），延迟更低、吞吐更高。同一协议也可通过公共 CLI `python -m mklink dump-memory ...` 直接使用。
+SuperWatch 固定使用官方 `cmd.dump_memory(addr1, size1, addr2, size2, ..., period)` 二进制流协议。设备端一条命令配置所有区域后主动推送 `MPMDMPMD` 帧（64 位时间戳 + frame CRC32 校验）。同一协议也可通过公共 CLI `python -m mklink dump-memory ...` 直接使用。旧命令中的 `--dump-mem` 参数继续接受，但不再切换行为。
 
 ```bash
-python -m mklink superwatch g_counter,g_sensor --source path/to/firmware.axf --dump-mem --visualize --period 0.01
+python -m mklink superwatch g_counter,g_sensor --source path/to/firmware.axf --visualize --period 0.01
 ```
 
 - `total_size <= 2048`: OLD 普通帧。
 - `total_size > 2048`: B1 分块帧，每块最大 2048B，包含 `block_index` / `block_count` / `block_crc32`。
+- SuperWatch 只合并相接或重叠的地址，不跨地址空洞多读；V4.3.8 真机测量显示跨 16B 空洞已降低采样率。
+- SuperWatch 最多提交 **15 个离散 region**。固件帧虽可容纳 16 个 region，但 V4.3.8 的 Pika 文本入口在 16 组地址/长度加 period 时会超过安全参数边界。
 - `build_dump_mem_command()` 默认允许单次最多 **512 KiB**（V4.3.3 实测整片 Flash 稳定）；老固件请传 ≤32 KiB region；更大范围仍应由 host 分块。
 - V4.3.1 官方 API 直测（2026-06-07）：`0x08000000/256`、`0x20010200/32`、`0x08020000/2049` 均 PASS，flags=`0x0000`，B1 为 2048B + 1B 两块。
 - 若 flags=`0x0004`，含义是 `Region error`，优先排查目标供电、Vref、SWD、NRST、MCU 运行/低功耗/复位状态；这不是 host parser CRC 失败。

@@ -7,6 +7,9 @@
 
 通用 UART 串口调试工具，独立于 MKLink 调试器，直接操作 COM 端口。
 
+日志示例中的 `<LOG_DIR>` 须替换为[已选工作根目录](work-files.md)下本次任务的
+日志目录绝对路径，并先创建该目录，不能直接写到当前目录。
+
 ### 列出可用端口
 
 ```bash
@@ -26,7 +29,7 @@ python -m mklink serial open --port COM3 --baud 115200
 python -m mklink serial open --port COM3 --baud 115200 --mode hex --profile my_protocol.json
 
 # 带日志和自动应答
-python -m mklink serial open --port COM3 --baud 115200 --log data.txt --auto-reply rules.json
+python -m mklink serial open --port COM3 --baud 115200 --log "<LOG_DIR>/data.txt" --auto-reply rules.json
 ```
 
 终端快捷键：Ctrl+Q 退出、Ctrl+H 切换 HEX/ASCII、Ctrl+F 设置过滤、Ctrl+L 清屏。
@@ -45,13 +48,13 @@ python -m mklink serial send --port COM3 --hex --count 5 --delay 0.5 "AA550103"
 ### 多端口监听
 
 ```bash
-python -m mklink serial monitor --port COM3 --port COM4 --baud 115200 --log multi.csv
+python -m mklink serial monitor --port COM3 --port COM4 --baud 115200 --log "<LOG_DIR>/multi.csv"
 ```
 
 ### 无头日志模式
 
 ```bash
-python -m mklink serial log --port COM3 --baud 115200 --output data.csv --format csv --duration 60
+python -m mklink serial log --port COM3 --baud 115200 --output "<LOG_DIR>/data.csv" --format csv --duration 60
 ```
 
 ### Web Dashboard

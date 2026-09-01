@@ -14,9 +14,13 @@ from mklink.remote.dashboards import VofaStreamManager
 from mklink.remote.stream_hub import StreamHub
 from mklink.vofa_viewer import (
     VOFA_SAMPLE_MAJOR_FLOAT32,
+    VOFA_MAX_FAST_CHANNELS,
+    VOFA_MAX_PRECISE_CHANNELS,
+    build_vofa_command,
     build_vofa_read_groups,
     decode_vofa_samples,
     encode_vofa_samples,
+    validate_vofa_repl_command,
     normalize_vofa_channels,
 )
 from mklink.dump_memory import MAGIC
@@ -28,6 +32,140 @@ def _channels(count=3):
          "type": "float", "size": 4}
         for index in range(count)
     ]
+
+
+def _discrete_channels(count):
+    return [
+        {"name": f"ch{index}", "addr": 0x20000000 + index * 0x1000,
+         "type": "float", "size": 4}
+        for index in range(count)
+    ]
+
+
+def _precise_variables(count):
+    return [
+        value
+        for index in range(count)
+        for value in (f"0x{0x20000000 + index * 4:08X}", "float")
+    ]
+
+
+def test_vofa_command_builder_keeps_fast_and_precise_limits_independent():
+    precise_command, _args, precise_count, precise_mode = build_vofa_command(
+        _precise_variables(VOFA_MAX_PRECISE_CHANNELS), 0.001,
+    )
+    assert precise_command.startswith("vofa.send(")
+    assert precise_count == 15
+    assert precise_mode == "precise"
+
+    with pytest.raises(ValueError, match="at most 15"):
+        build_vofa_command(_precise_variables(16), 0.001)
+
+    fast_command, _args, fast_count, fast_mode = build_vofa_command(
+        ["0x20000000", str(VOFA_MAX_FAST_CHANNELS)], 0.001,
+    )
+    assert fast_command == "vofa.send(0x20000000, 16, 0.001)"
+    assert fast_count == 16
+    assert fast_mode == "fast"
+
+    with pytest.raises(ValueError, match="between 1 and 16"):
+        build_vofa_command(["0x20000000", "17"], 0.001)
+
+
+def test_vofa_command_limit_counts_utf8_bytes_not_python_characters():
+    long_type = "测" * 160
+    visible_command = f'vofa.send(0x20000000, "{long_type}", 0.001)'
+    assert len(visible_command) < 511
+    assert len(visible_command.encode("utf-8")) > 511
+
+    with pytest.raises(ValueError, match="UTF-8 bytes"):
+        validate_vofa_repl_command(visible_command)
+
+
+@pytest.mark.parametrize("variables, message", [
+    (["0x20000000);reboot()#", "float"], "invalid 32-bit address"),
+    (["0x20000000", "float\");reboot();#"], "unsupported type"),
+    (["0x20000000", "float"], "finite non-negative"),
+])
+def test_vofa_command_builder_rejects_code_injection_and_non_finite_period(
+    variables, message,
+):
+    period = float("nan") if message == "finite non-negative" else 0.001
+    with pytest.raises(ValueError, match=message):
+        build_vofa_command(variables, period)
+
+
+@pytest.mark.parametrize("variables, message", [
+    (_precise_variables(16), "at most 15"),
+    (["0x20000000", "测" * 160], "unsupported type"),
+])
+def test_cli_rejects_unsafe_vofa_before_port_discovery(
+    monkeypatch, capsys, variables, message,
+):
+    from mklink import cli
+
+    def unexpected_port(_port):
+        raise AssertionError("unsafe VOFA request reached port discovery")
+
+    monkeypatch.setattr(cli, "_resolve_port", unexpected_port)
+    exit_code = cli._cli_vofa(None, variables, 0.001, False)
+
+    assert exit_code == 2
+    assert message in capsys.readouterr().out
+
+
+def test_vofa_dump_stream_selection_uses_15_group_safe_boundary(monkeypatch):
+    from mklink import dump_memory
+
+    session_started = threading.Event()
+
+    class Session:
+        def __init__(self, bridge, region_pairs, period):
+            assert bridge is dump_bridge
+            assert len(region_pairs) == 15
+            self.stats = {}
+
+        def start(self):
+            session_started.set()
+
+        def read_frames(self, max_bytes=None):
+            time.sleep(0.001)
+            return []
+
+        def stop(self):
+            return None
+
+    monkeypatch.setattr(dump_memory, "DumpMemoryStreamSession", Session)
+    dump_bridge = object()
+    dump_device = type("Device", (), {"_bridge": dump_bridge})()
+    dump_manager = VofaStreamManager()
+    dump_manager.start(dump_device, _discrete_channels(15), interval=0.001)
+    try:
+        assert session_started.wait(1.0)
+        assert dump_manager.get_status()["acquisition_mode"] == "dump-memory"
+    finally:
+        dump_manager.stop()
+
+    class ReadDevice:
+        _bridge = object()
+
+        def read_memory(self, address, size):
+            return bytes(size)
+
+    read_manager = VofaStreamManager()
+    read_manager.start(ReadDevice(), _discrete_channels(16), interval=0.001)
+    try:
+        deadline = time.perf_counter() + 1.0
+        while (
+            read_manager.get_status()["completed_samples"] < 1
+            and time.perf_counter() < deadline
+        ):
+            time.sleep(0.001)
+        status = read_manager.get_status()
+        assert status["completed_samples"] >= 1
+        assert status["acquisition_mode"] == "read-memory"
+    finally:
+        read_manager.stop()
 
 
 def test_vofa_status_exposes_binary_stream_stats():
@@ -78,7 +216,8 @@ def test_running_manager_uses_probe_dump_stream_and_exposes_integrity_metrics():
     assert status["stream_integrity"]["parser_crc_errors"] == 0
     assert manager._history[-1]["ch0"] == pytest.approx(7.25)
     assert bridge.writes[0] == b"cmd.dump_memory(0x20000000, 4, 0.0001)\n"
-    assert bridge.writes[-1] == b"cmd.dump_memory(0x20000000, 4, 0)\n"
+    assert bridge.writes[-1] == b"cmd.dump_memory(0x20000000, 4, -1.0)\n"
+    assert b"cmd.dump_memory(0x20000000, 4, 0)\n" not in bridge.writes
 
 
 def test_sample_major_payload_preserves_10000_ids_and_channel_alignment():

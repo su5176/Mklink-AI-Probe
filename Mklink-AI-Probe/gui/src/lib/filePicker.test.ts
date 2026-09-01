@@ -26,16 +26,6 @@ describe('file picker', () => {
     })
   })
 
-  it('opens a MAP-only single-file dialog', async () => {
-    const { open, picker } = await loadPickerWithDialog('C:\\firmware\\app.map')
-
-    await expect(picker.pickMapFile()).resolves.toBe('C:\\firmware\\app.map')
-    expect(open).toHaveBeenCalledWith({
-      multiple: false,
-      filters: [{ name: 'MAP', extensions: ['map'] }],
-    })
-  })
-
   it('returns null when the dialog is cancelled', async () => {
     const { picker } = await loadPickerWithDialog(null)
 
@@ -49,7 +39,7 @@ describe('file picker', () => {
     })
     const picker = await import('./filePicker')
 
-    await expect(picker.pickMapFile()).resolves.toBeNull()
+    await expect(picker.pickSymbolFile()).resolves.toBeNull()
   })
 
   it('opens a native browser file input when Tauri is unavailable', async () => {

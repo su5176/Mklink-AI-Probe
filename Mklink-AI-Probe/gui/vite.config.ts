@@ -24,7 +24,14 @@ if (!buildCommit) {
 
 // https://vite.dev/config/
 export default defineConfig({
+  cacheDir: process.env.MKLINK_VITE_CACHE_DIR || 'node_modules/.vite',
   plugins: [vue()],
+  build: {
+    // Retire cached incorrect MIME headers, including unchanged lazy chunks/CSS.
+    // Let Vite rewrite the entire graph; HTML-only URL rewriting misses preloads.
+    // Bump this epoch only when asset response semantics change, not each build.
+    assetsDir: 'assets/mime-v1',
+  },
   define: {
     __APP_VERSION__: JSON.stringify(tauriConfig.version || '0.0.0'),
     __APP_BUILD_COMMIT__: JSON.stringify(buildCommit),
@@ -34,6 +41,11 @@ export default defineConfig({
     globals: true,
     // Memory gates use process.memoryUsage(); parallel files contaminate their baseline.
     fileParallelism: false,
+    // The Windows release gate runs several large mount-heavy files serially.
+    // Keep a bounded budget that tolerates host contention without weakening
+    // explicit waitFor/assertion timeouts inside individual tests.
+    testTimeout: 15_000,
+    hookTimeout: 15_000,
   },
   clearScreen: false,
   server: {

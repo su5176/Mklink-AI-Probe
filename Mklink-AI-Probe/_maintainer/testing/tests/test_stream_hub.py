@@ -15,6 +15,12 @@ def test_stream_batch_freezes_a_publish_timestamp():
     assert second.timestamp_ns >= first.timestamp_ns
 
 
+def test_stream_batch_repr_does_not_expose_payload_bytes():
+    batch = StreamBatch(b"private-target-bytes", 1, 20)
+
+    assert "private-target-bytes" not in repr(batch)
+
+
 def test_each_subscriber_has_an_independent_bounded_queue():
     async def scenario():
         hub = StreamHub(max_batches_per_client=2)

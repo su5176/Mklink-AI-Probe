@@ -19,9 +19,12 @@
 
 先从 `.mklink/project_info.json` 或 `python -m mklink project-init` 获取 `uvprojx_path` 和 `target_name`，再定位 `UV4.exe`。默认执行编译后下载：
 
+先按[工作目录约定](work-files.md)确定并创建本次日志目录，将其绝对路径赋给
+`$MklinkLogDir`；不要使用系统临时目录。
+
 ```powershell
-$BuildLog = Join-Path $env:TEMP 'mklink-keil-build.log'
-$FlashLog = Join-Path $env:TEMP 'mklink-keil-flash.log'
+$BuildLog = Join-Path $MklinkLogDir 'mklink-keil-build.log'
+$FlashLog = Join-Path $MklinkLogDir 'mklink-keil-flash.log'
 
 & $Uv4 -b $Uvprojx -t $Target -j0 -o $BuildLog
 if ($LASTEXITCODE -ge 2) { throw 'Keil build failed' }

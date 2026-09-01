@@ -17,9 +17,7 @@ export interface RttSendHistoryEntry {
 export interface DesktopSettings {
   version: 1
   symbolPath: string
-  mapPath: string
   symbolDisplayPath?: string
-  mapDisplayPath?: string
   rttAddress: string
   rttEncoding: RttEncoding
   transmitMode: RttTransmitMode
@@ -38,10 +36,6 @@ export function isSymbolFilePath(path: string): boolean {
   return /\.(axf|elf|out)$/i.test(path.trim())
 }
 
-export function isMapFilePath(path: string): boolean {
-  return /\.map$/i.test(path.trim())
-}
-
 export function isSameFileSourcePath(
   left: string | null | undefined,
   right: string | null | undefined,
@@ -58,9 +52,7 @@ function defaults(): DesktopSettings {
   return {
     version: DESKTOP_SETTINGS_VERSION,
     symbolPath: '',
-    mapPath: '',
     symbolDisplayPath: '',
-    mapDisplayPath: '',
     rttAddress: '',
     rttEncoding: 'utf-8',
     transmitMode: 'text',
@@ -118,9 +110,7 @@ function normalize(value: unknown): DesktopSettings {
   return {
     version: DESKTOP_SETTINGS_VERSION,
     symbolPath: typeof value.symbolPath === 'string' ? value.symbolPath : '',
-    mapPath: typeof value.mapPath === 'string' ? value.mapPath : '',
     symbolDisplayPath: typeof value.symbolDisplayPath === 'string' ? value.symbolDisplayPath : '',
-    mapDisplayPath: typeof value.mapDisplayPath === 'string' ? value.mapDisplayPath : '',
     rttAddress: isRttAddress(value.rttAddress) ? value.rttAddress : '',
     rttEncoding: isRttEncoding(value.rttEncoding) ? value.rttEncoding : 'utf-8',
     transmitMode: isTransmitMode(value.transmitMode) ? value.transmitMode : 'text',

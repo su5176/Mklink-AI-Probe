@@ -105,12 +105,12 @@ python -m mklink gui --no-browser
 ### 第一次打开怎么用
 
 1. 将 MKLink 探针连接电脑和目标板。
-2. 打开“配置”，选择工程目录和探针；也可以直接选择本机的 AXF/ELF/OUT 与 MAP 文件。
+2. 打开“配置”，选择工程目录和探针；也可以直接选择本机的 AXF/ELF/OUT 文件。
 3. 点击连接，确认目标与符号信息加载成功。
 4. 根据需要进入“在线烧录”“脱机烧录”或“Dashboard”。
 5. 在 Dashboard 中使用 RTT View、VOFA+、SystemView、SuperWatch、内存、串口或 Modbus。
 
-浏览器不能把本机绝对路径直接交给后端，因此网页版选择 AXF/ELF/OUT 或 MAP 时，会把文件上传到当前连接的 Mklink 服务所管理的 `.mklink/uploads/file-sources` 目录。默认本机模式不会把文件发送到互联网；单个文件上限为 256 MiB。Windows 桌面版使用原生文件对话框，不走这一步上传。
+AXF/ELF/OUT 已包含 SuperWatch 所需的符号和类型信息，也可用于 RTT/SystemView 地址搜索，不需要用户另外加载 MAP 文件。浏览器不能把本机绝对路径直接交给后端，因此网页版选择 AXF/ELF/OUT 时，会把文件上传到当前连接的 Mklink 服务所管理的 `.mklink/uploads/file-sources` 目录。默认本机模式不会把文件发送到互联网；单个文件上限为 256 MiB。Windows 桌面版使用原生文件对话框，不走这一步上传。
 
 RTT View 与 SuperWatch 共用目标调试资源。切换后点击开始时，系统会先停止原来的采集功能，再启动新的功能，避免同时占用探针。
 

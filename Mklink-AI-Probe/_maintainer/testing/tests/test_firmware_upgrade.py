@@ -257,6 +257,8 @@ def test_firmware_check_filters_v4_candidates_by_probe_family(
     hpmlink = firmware_root / "HPMLink_V4.3.7.uf2"
     hpmlink.write_bytes(b"hpm-uf2")
     monkeypatch.setattr(fc, "_probe_disk", lambda: str(disk))
+    # This fixture checks local family selection, independent of new releases.
+    monkeypatch.setattr(fc, "_remote_firmwares", lambda: None)
 
     result = fc.check_probe_firmware(None, firmware_root)
 

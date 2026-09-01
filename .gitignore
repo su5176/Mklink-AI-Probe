@@ -6,3 +6,4 @@
 /Mklink-AI-Probe/output/playwright/
 /Mklink-AI-Probe/release/
 /.worktrees/
+/.build/

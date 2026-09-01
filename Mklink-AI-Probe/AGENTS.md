@@ -1,71 +1,78 @@
-# Repository Agent Protocol
+# MKLink Repository Maintenance
 
-Resolve the project source root before using any relative path in this file.
-The source root is the directory containing this `AGENTS.md`,
-`docs/ai/project-memory.json`, `scripts/ai_memory.py`, and
-`skills/maintaining-mklink-ai-probe/SKILL.md`. It may be a direct child of the
-Git/workspace root. Do not assume the current working directory or Git
-top-level is the source root.
+These rules apply when the user asks to change or maintain MKLink itself.
+Installing or using MKLink to flash/debug another project is an end-user task:
+use the root `SKILL.md`, without loading repository memory or build/release
+workflows. Do not copy this file or maintainer skills into a user installation.
 
-All coding agents and models must use the repository-bundled skill at
-`skills/maintaining-mklink-ai-probe/SKILL.md`. It is the shared maintenance
-workflow; global or user-installed skills are optional and must not be required
-for another contributor to continue the work.
+Paths below are relative to the source root containing this file and
+`scripts/ai_memory.py`; it may be one level below the Git root.
 
-## Start
+## Start And Authority
 
-1. Run `python scripts/ai_memory.py validate`.
-2. Read `docs/ai/CURRENT_HANDOFF.md` and `docs/ai/project-memory.json`.
-3. Run `git status --short --branch`, `git log -12 --oneline`, and
-   `git worktree list`; reconcile live state with the handoff.
-4. Read and follow `skills/maintaining-mklink-ai-probe/SKILL.md`.
+- On first entry, read `docs/ai/CURRENT_HANDOFF.md`, validate it with
+  `python scripts/ai_memory.py validate`, and reconcile `git status --short
+  --branch`, recent commits, and `git worktree list`. Read the underlying JSON
+  only when updating memory or investigating inconsistencies. During the same
+  task, check changed state instead of rereading unchanged instructions.
+- An explicit request to fix/build/change authorizes in-scope edits and
+  non-destructive validation without another planning approval. A review or
+  diagnosis alone does not authorize implementation. Ask when a choice changes
+  scope materially, breaks compatibility, or introduces destructive operations.
+- Preserve unrelated user changes. Never infer authorization for merging
+  `master`, signing, tags, releases, update pointers, or Gitee synchronization.
 
-Do not modify code or repeat completed work until the current state is clear.
-If repository memory is stale, verify reality and correct the memory.
+## Continuous Prerelease Work
 
-## Branch Workflow
+- Use the active prerelease branch recorded in the handoff. Do not create an
+  issue branch/worktree, restart fixes from `master`, or develop on `master`.
+  A new release branch requires a maintainer request.
+- Fetch the matching GitHub branch before editing; reconcile divergence without
+  force pushes or rewriting shared history.
+- Finish each issue with the relevant checks, `git diff --check`, and an update
+  to `docs/ai/project-memory.json`; run `python scripts/ai_memory.py render` and
+  `python scripts/ai_memory.py validate`. Commit separately and promptly push
+  to the matching branch on GitHub `origin` under standing maintainer authority.
+  Verify the remote tip, report failures, and leave unrelated work untouched.
 
-- Before editing a runtime or user-facing feature or bug fix, start from a clean,
-  current `master` and create a dedicated `feature/<topic>` or `fix/<topic>`
-  branch. A separate worktree is optional; the branch is mandatory.
-- Do not develop or commit feature and bug-fix work directly on `master`.
-  Documentation-only maintenance and release handoff work are exempt unless the
-  maintainer requests a branch.
-- Complete the required automated tests, production build, project-memory
-  update, and affected real-hardware closed loop on the feature or fix branch
-  before merging it into `master`.
-- If `master` changes after final verification, update the branch with the
-  current `master` and rerun the final gate. Any implementation or conflict
-  resolution after verification invalidates the old evidence.
-- Merge only after the branch passes its final gate. After merging, verify that
-  `master` contains the tested branch tip, project memory validates, and the
-  worktree is clean. Push only when authorized.
+## Verification
 
-## Authority
+- For each fix, test the changed behavior and its affected surface: real browser
+  for Web behavior, actual installation/upgrade for installer behavior, and
+  physical hardware for device behavior. Documentation changes need document,
+  link, packaging, or instruction-boundary checks, not unrelated hardware runs.
+- Before an authorized merge/release, run the full Python and GUI suites,
+  production build, and affected real-surface gates. Incorporate newer `master`
+  first; subsequent code changes invalidate earlier evidence. Verify the merged
+  tip and clean state. Missing required facilities need an explicit waiver.
+- Record environment failures and unverified behavior. Component tests or
+  fixtures do not prove real installation/hardware success; a prerelease push
+  does not mean release qualification.
 
-- Make the smallest change that fully solves the developer's actual need.
-- Before changing a product, interaction, architecture, workflow, or testing
-  strategy, present the observed problem, viable options, tradeoffs, recommended
-  choice, and concrete acceptance criteria to the maintainer. Do not implement
-  the strategy until the maintainer explicitly confirms it. Once a strategy is
-  confirmed, root-cause fixes that preserve it may proceed without asking again.
-- Ask only when ambiguity materially changes the result or requires new
-  authority; otherwise use a small reversible assumption.
-- Never discard unrelated user changes.
-- Never infer authority to sign or publish a release. Official release and
-  Gitee synchronization are maintainer-only operations described in the skill's
-  `references/releasing.md`.
+## Storage And Product Constraints
 
-## Finish
+- Run build/test commands through `scripts/build_workspace.ps1`. All scratch
+  belongs in `MKLINK_BUILD_ROOT` when configured, otherwise in the main
+  checkout's ignored `.build`; never use the Windows system drive.
+  Reuse caches, clean per-run scratch, and never upload `.build` or local logs.
+  Preserve tracked `gui/dist` and official `release` assets. Report inaccessible
+  or linked cleanup paths for manual handling; do not force deletion.
+- Default ELF/DWARF parsing is bundled `pyelftools`; external tools require an
+  explicit choice. HPM uses ROM API, never FLM or a second generic SWD reset.
+  VCC changes require confirmation of the specific voltage for each operation.
+- Standard installer output is NSIS. MSI/offline WebView2 needs authorization.
+  Do not commit firmware, Packs, FLM, screenshots, device identifiers, local
+  hardware paths, or secrets without a specific applicable exception.
+- Public Skill packages contain only runtime files. Keep maintainer memory,
+  tests, build/release instructions, and maintainer skills out of user packages.
 
-For every runtime or user-facing feature and bug fix, run the full Python and
-GUI suites plus the production build on its branch before merge. Complete a
-real-hardware closed loop on the affected Web, Tauri, or device workflow before
-merge and release; mocked or component tests alone are not integration or
-release evidence. If the required hardware surface is unavailable, stop and
-obtain an explicit maintainer waiver instead of silently reducing the gate.
+## Read Only When Needed
 
-Run the required verification and `git diff --check`. Update
-`docs/ai/project-memory.json`, then run `python scripts/ai_memory.py render` and
-`python scripts/ai_memory.py validate`. Commit and push when authorized, and
-leave the worktree clean.
+- Build storage/commands: `docs/ai/build-storage.md`.
+- Source development: `docs/ai/development.md`.
+- Desktop packaging: `skills/tauri-gui-builder/SKILL.md`.
+- Explicitly authorized publication:
+  `skills/maintaining-mklink-ai-probe/references/releasing.md`.
+
+The maintainer Skill is an optional reference index, not a second mandatory
+workflow. Installed/global skills are not required for repository maintenance.

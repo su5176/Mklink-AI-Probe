@@ -4,6 +4,17 @@ from mklink.profiles import load_mcu_profiles
 from mklink.remote.dashboards import SystemViewStreamManager
 
 
+def _prime_validated_rtt_control_block(device, address):
+    """Keep clock-order tests focused on pre-stream symbol reads."""
+    device.validate_rtt_stream_request = lambda *_args, **_kwargs: None
+    device._find_rtt_control_block = lambda *_args, **_kwargs: address
+    device._read_rtt_control_block = lambda _addr: {
+        "up_buffers": [],
+        "down_buffers": [],
+    }
+    device._validate_rtt_channel = lambda *_args, **_kwargs: None
+
+
 def test_systemview_start_reads_system_core_clock_before_stream(monkeypatch):
     calls = []
 
@@ -31,6 +42,7 @@ def test_systemview_start_reads_system_core_clock_before_stream(monkeypatch):
     dev._bridge = FakeBridge()
     dev._connected = True
     dev._dwarf_info = object()
+    _prime_validated_rtt_control_block(dev, 0x20000000)
 
     def read_variable(name):
         calls.append(("read_variable", dev._bridge.state))
@@ -80,6 +92,7 @@ def test_systemview_start_reads_hpm_core_clock_before_project_default(tmp_path, 
     dev._bridge = FakeBridge()
     dev._connected = True
     dev._dwarf_info = object()
+    _prime_validated_rtt_control_block(dev, 0x0008E488)
 
     def read_variable(name):
         calls.append((name, dev._bridge.state))
@@ -142,6 +155,7 @@ def test_hpm_project_seeds_systemview_id_base_without_guessing_clock(tmp_path, m
     dev = Device(project_root=str(tmp_path))
     dev._bridge = FakeBridge()
     dev._connected = True
+    _prime_validated_rtt_control_block(dev, 0x0008E488)
 
     result = dev.systemview_start()
 

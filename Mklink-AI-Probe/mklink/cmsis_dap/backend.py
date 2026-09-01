@@ -13,6 +13,7 @@ from typing import Any, Callable, Iterator, Mapping, Optional, Tuple
 
 from .errors import FlashError, FlashErrorCode
 from .models import ImageInspection, MemoryRegion
+from .pyocd_runtime import import_pyocd_attr
 
 
 _LOCKED_ERROR_PATTERN = re.compile(
@@ -185,8 +186,11 @@ def _install_custom_flm_regions(
     ram_region: Optional[Tuple[int, int]] = None,
     flash_regions: Tuple[Tuple[int, int], ...] = (),
 ) -> None:
-    from pyocd.core.memory_map import FlashRegion, RamRegion
-    from pyocd.target.pack.flash_algo import PackFlashAlgo
+    FlashRegion = import_pyocd_attr("pyocd.core.memory_map", "FlashRegion")
+    RamRegion = import_pyocd_attr("pyocd.core.memory_map", "RamRegion")
+    PackFlashAlgo = import_pyocd_attr(
+        "pyocd.target.pack.flash_algo", "PackFlashAlgo"
+    )
 
     target.memory_map = target.memory_map.clone()
     if ram_region is not None:
@@ -733,14 +737,14 @@ class PyOcdBackend:
                 resolved_probe = self._resolve_probe(probe)
                 factory = self._session_factory
                 if factory is None:
-                    from pyocd.core.session import Session
+                    Session = import_pyocd_attr("pyocd.core.session", "Session")
 
                     factory = lambda selected_probe, selected_options: Session(
                         selected_probe, options=selected_options
                     )
                 session_target = target
                 if resolved_pack is None and resolved_flms:
-                    from pyocd.target import TARGET
+                    TARGET = import_pyocd_attr("pyocd.target", "TARGET")
 
                     known = {str(name).casefold() for name in TARGET}
                     known.update(
@@ -837,7 +841,9 @@ class PyOcdBackend:
                     )
                 factory = self._programmer_factory
                 if factory is None:
-                    from pyocd.flash.file_programmer import FileProgrammer
+                    FileProgrammer = import_pyocd_attr(
+                        "pyocd.flash.file_programmer", "FileProgrammer"
+                    )
 
                     factory = FileProgrammer
                 image_start = (
@@ -1023,7 +1029,7 @@ class PyOcdBackend:
                 if mode == "default":
                     session.target.reset()
                     return
-                from pyocd.core.target import Target
+                Target = import_pyocd_attr("pyocd.core.target", "Target")
 
                 reset_types = {
                     "hardware": Target.ResetType.HARDWARE,
@@ -1195,7 +1201,7 @@ class PyOcdBackend:
         raise RuntimeError("target does not support block memory reads")
 
     def _eraser(self, erase_mode: str) -> Any:
-        from pyocd.flash.eraser import FlashEraser
+        FlashEraser = import_pyocd_attr("pyocd.flash.eraser", "FlashEraser")
 
         return self._eraser_factory or FlashEraser, FlashEraser.Mode[erase_mode]
 
@@ -1303,7 +1309,9 @@ class PyOcdBackend:
             return probe
         provider = self._probe_provider
         if provider is None:
-            from pyocd.probe.aggregator import DebugProbeAggregator
+            DebugProbeAggregator = import_pyocd_attr(
+                "pyocd.probe.aggregator", "DebugProbeAggregator"
+            )
 
             provider = DebugProbeAggregator.get_all_connected_probes
         for candidate in provider():

@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 from typing import Callable, Dict, IO, List, Mapping, Optional, Sequence, Tuple, Type
 from urllib.parse import quote, urljoin, urlparse
@@ -252,6 +253,9 @@ def _unlink_transaction_file(path: Path) -> None:
             FlashErrorCode.PACK_INTEGRITY_ERROR,
             "transaction path is not a file",
         )
+    current_mode = path.stat().st_mode
+    if not current_mode & stat.S_IWRITE:
+        path.chmod(current_mode | stat.S_IWRITE)
     path.unlink()
 
 
@@ -529,7 +533,7 @@ def _prepare_pack_transaction(
         transaction_dir = stage_data_dir.parent / "transaction"
         transaction_dir.mkdir()
         pack_temp = transaction_dir / "pack.prepared"
-        shutil.copy2(str(staged_pack), str(pack_temp))
+        shutil.copyfile(str(staged_pack), str(pack_temp))
         replacements.append((pack_temp, destination))
         for index, (target, value) in enumerate(metadata):
             temporary = transaction_dir / "metadata-{}.prepared".format(index)
@@ -758,6 +762,48 @@ def _read_pack_descriptor(pack_path: Path, subject: str) -> bytes:
     return pdsc_data
 
 
+def _normalize_local_import_descriptor(pdsc_data: bytes) -> bytes:
+    """Make locally imported descriptors consumable without changing the Pack.
+
+    Some vendor Packs omit the top-level ``url`` element because they are only
+    distributed as local files. cmsis-pack-manager silently skips every device
+    in those descriptors, even though a download URL is irrelevant for a local
+    import. Add an empty element only to the staged descriptor copy that is fed
+    to the indexer; the original archive remains the installed artifact.
+    """
+
+    try:
+        root = ElementTree.fromstring(pdsc_data)
+    except ElementTree.ParseError:
+        raise WorkerFailure(
+            FlashErrorCode.PACK_INTEGRITY_ERROR,
+            "imported pack descriptor is invalid",
+        )
+    if root.tag.rsplit("}", 1)[-1] != "package":
+        return pdsc_data
+    namespace = ""
+    if root.tag.startswith("{") and "}" in root.tag:
+        namespace = root.tag.split("}", 1)[0] + "}"
+    children = list(root)
+    url_tag = namespace + "url"
+    if any(child.tag == url_tag for child in children):
+        return pdsc_data
+
+    url = ElementTree.Element(url_tag)
+    insert_at = len(children)
+    for anchor in ("description", "name", "vendor"):
+        anchor_tag = namespace + anchor
+        for index, child in enumerate(children):
+            if child.tag == anchor_tag:
+                insert_at = index + 1
+                break
+        else:
+            continue
+        break
+    root.insert(insert_at, url)
+    return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 def _install(
     payload: Mapping[str, object],
     paths: PackPaths,
@@ -910,7 +956,7 @@ def _import_pack(
     stage_index.mkdir()
     stage_data.mkdir()
     staged_pack = stage_data / "import.pack"
-    shutil.copy2(str(source), str(staged_pack))
+    shutil.copyfile(str(source), str(staged_pack))
     cache = cache_factory(
         False,
         False,
@@ -919,7 +965,8 @@ def _import_pack(
         emitter=emit,
     )
     staged_descriptor = stage_index / "import.pdsc"
-    staged_descriptor.write_bytes(_read_pack_descriptor(staged_pack, "imported pack"))
+    descriptor = _read_pack_descriptor(staged_pack, "imported pack")
+    staged_descriptor.write_bytes(_normalize_local_import_descriptor(descriptor))
     cache.add_pack_from_path(str(staged_descriptor))
     metadata = {_pack_metadata(device) for device in cache.index.values()}
     if len(metadata) != 1:

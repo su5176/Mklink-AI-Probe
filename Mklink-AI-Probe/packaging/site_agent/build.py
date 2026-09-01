@@ -1377,7 +1377,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("release") / "site-agent",
+        default=Path(os.environ.get("MKLINK_BUILD_OUTPUT_DIR", "release")) / "site-agent",
     )
     parser.add_argument(
         "--stcp-library",
@@ -1385,6 +1385,15 @@ def main() -> int:
         help="prebuilt mklink-stcp.dll; defaults to native/stcp_bridge/build",
     )
     args = parser.parse_args()
+    if os.name == "nt":
+        storage = os.environ.get("MKLINK_BUILD_ROOT")
+        if not storage:
+            parser.error("run via scripts/build_workspace.ps1 -Action run")
+        storage_root = Path(storage).resolve()
+        if storage_root.drive.casefold() in {"c:", os.environ.get("SystemDrive", "C:").casefold()}:
+            parser.error("build storage must not be on C: or the Windows system drive")
+        if not args.output.resolve().is_relative_to(storage_root):
+            parser.error("--output must be inside MKLINK_BUILD_ROOT")
     build(args.output, stcp_library=args.stcp_library)
     return 0
 

@@ -25,6 +25,7 @@ from mklink.cmsis_dap.backend import _pack_flm_address_offset
 from mklink.cmsis_dap.errors import FlashError, FlashErrorCode
 from mklink.cmsis_dap.models import JobRequest, JobState, MemoryRegion, TargetRecord
 from mklink.cmsis_dap.probes import filter_mklink_probes
+from mklink.cmsis_dap.pyocd_runtime import import_pyocd_attr
 from mklink.remote.resource_manager import ResourceError
 
 
@@ -72,7 +73,9 @@ class OnlineFlashServices:
 
 
 def _production_probe_provider() -> Sequence[object]:
-    from pyocd.probe.aggregator import DebugProbeAggregator
+    DebugProbeAggregator = import_pyocd_attr(
+        "pyocd.probe.aggregator", "DebugProbeAggregator"
+    )
 
     return DebugProbeAggregator.get_all_connected_probes()
 
@@ -631,6 +634,20 @@ def _custom_flm_payload(record: object) -> Dict[str, object]:
     }
 
 
+def _flash_algorithm_payload(record: object) -> Dict[str, object]:
+    """Return public metadata for an algorithm that can serve a target."""
+    return {
+        "algorithm_id": str(getattr(record, "algorithm_id")),
+        "target_part": str(getattr(record, "target_part")),
+        "file_name": str(getattr(record, "file_name")),
+        "flash_start": int(getattr(record, "flash_start")),
+        "flash_size": int(getattr(record, "flash_size")),
+        "default": bool(getattr(record, "default", False)),
+        "source_kind": str(getattr(record, "source_kind")),
+        "source_name": str(getattr(record, "source_name")),
+    }
+
+
 def _target_flash_configuration(
     services: OnlineFlashServices,
     part_number: str,
@@ -1151,6 +1168,64 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             and region.sector_size > 0
         ]
 
+    @router.get("/targets/{part_number}/algorithms")
+    async def target_flash_algorithms(part_number: str) -> object:
+        target = await _blocking(_resolved_target, services.catalog, part_number)
+        from mklink.hpm_config import is_hpm_target
+
+        if is_hpm_target(target.part_number):
+            return [{
+                "algorithm_id": "hpm-rom-api",
+                "target_part": target.part_number,
+                "file_name": "HPM ROM API",
+                "flash_start": 0x80000000,
+                "flash_size": 0x10000000,
+                "default": True,
+                "source_kind": "hpm-rom-api",
+                "source_name": "HPM ROM API",
+            }]
+
+        from mklink.cmsis_dap.algorithm_catalog import (
+            FlashAlgorithmError,
+            discover_flash_algorithms,
+        )
+
+        try:
+            records = await _blocking(
+                discover_flash_algorithms,
+                target.part_number,
+                paths=services.paths,
+            )
+        except FlashAlgorithmError as error:
+            _raise_http(FlashError(
+                FlashErrorCode.TARGET_NOT_SUPPORTED,
+                str(error),
+            ))
+        payload = [_flash_algorithm_payload(record) for record in records]
+        if target.source == "builtin":
+            regions = await _blocking(
+                services.target_memory_provider,
+                target.part_number,
+            )
+            builtin = [
+                {
+                    "algorithm_id": "pyocd-builtin:{}:{:08x}".format(
+                        target.part_number.casefold(), region.start,
+                    ),
+                    "target_part": target.part_number,
+                    "file_name": "{} · {}".format(target.part_number, region.name),
+                    "flash_start": region.start,
+                    "flash_size": region.length,
+                    "default": index == 0,
+                    "source_kind": "pyocd-builtin",
+                    "source_name": "pyOCD",
+                }
+                for index, region in enumerate(regions)
+                if region.is_flash and region.length > 0
+            ]
+            payload = builtin + payload
+        return payload
+
     @router.post("/memory/read")
     async def read_memory(body: ReadMemoryBody) -> Response:
         """Read a target range and return it as a downloadable BIN file.
@@ -1278,6 +1353,9 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             body.part_number,
             lambda event: events.append(dict(event)),
         )
+        refresh = getattr(services.catalog, "refresh", None)
+        if callable(refresh):
+            await _blocking(refresh)
         return {
             "result": _json_primitive(result, hide_paths=True),
             "events": _json_primitive(events, hide_paths=True),
@@ -1310,6 +1388,9 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
                 temporary,
                 lambda event: events.append(dict(event)),
             )
+            refresh = getattr(services.catalog, "refresh", None)
+            if callable(refresh):
+                await _blocking(refresh)
             return {
                 "result": _json_primitive(result, hide_paths=True),
                 "events": _json_primitive(events, hide_paths=True),
@@ -1604,7 +1685,7 @@ def default_target_memory_provider(
     except (ImportError, OSError, TypeError, ValueError):
         pass
     try:
-        from pyocd.target import TARGET
+        TARGET = import_pyocd_attr("pyocd.target", "TARGET")
 
         entries = TARGET.items() if hasattr(TARGET, "items") else ((name, TARGET[name]) for name in TARGET.get_all_target_names())
         matches = []
@@ -1675,7 +1756,9 @@ def _memory_map_regions(memory_map: object) -> List[MemoryRegion]:
 
 def _pack_memory_regions(part_number: str, pack_path: Path) -> List[MemoryRegion]:
     """Load a Pack target memory map; pyOCD derives sector geometry from its FLM."""
-    from pyocd.target.pack.cmsis_pack import CmsisPack
+    CmsisPack = import_pyocd_attr(
+        "pyocd.target.pack.cmsis_pack", "CmsisPack"
+    )
 
     pack = CmsisPack(str(pack_path))
     matches = [

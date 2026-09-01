@@ -14,6 +14,7 @@ import uuid
 
 from .models import TargetRecord
 from .paths import PackPaths
+from .pyocd_runtime import import_pyocd_attr
 
 
 class FlashAlgorithmError(ValueError):
@@ -133,7 +134,9 @@ def _pack_algorithms(record: TargetRecord, part_number: str) -> list[FlashAlgori
     pack_path = Path(record.pack_path).resolve()
     if not pack_path.is_file():
         return []
-    from pyocd.target.pack.cmsis_pack import CmsisPack
+    CmsisPack = import_pyocd_attr(
+        "pyocd.target.pack.cmsis_pack", "CmsisPack"
+    )
 
     pack = CmsisPack(str(pack_path))
     try:
@@ -310,7 +313,9 @@ def _extract_bytes(algorithm: FlashAlgorithm) -> bytes:
     if len(matches) != 1 or matches[0].algorithm_path != algorithm.algorithm_path:
         raise FlashAlgorithmError("Pack algorithm metadata changed after discovery")
 
-    from pyocd.target.pack.cmsis_pack import CmsisPack
+    CmsisPack = import_pyocd_attr(
+        "pyocd.target.pack.cmsis_pack", "CmsisPack"
+    )
 
     pack = CmsisPack(str(pack_path))
     try:

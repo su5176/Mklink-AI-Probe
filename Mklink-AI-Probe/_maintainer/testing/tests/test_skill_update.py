@@ -46,6 +46,15 @@ def test_version_comparison_handles_stable_and_prerelease(updater):
         updater.version_key("latest")
 
 
+def test_skill_update_cache_uses_explicit_task_cache(updater, monkeypatch, tmp_path):
+    cache_root = tmp_path / "task-cache"
+    monkeypatch.setenv("MKLINK_CACHE_DIR", str(cache_root))
+
+    assert updater.default_cache_file() == (
+        cache_root / "mklink-ai-probe" / "skill-update-check.json"
+    )
+
+
 def test_repository_plugin_version_matches_package(updater):
     root = SCRIPT_PATH.parents[1]
     plugin = json.loads(
@@ -332,6 +341,11 @@ def test_desktop_installer_uses_its_per_machine_default(updater, monkeypatch, tm
 
 def test_skill_instructions_require_proactive_check_and_user_approval():
     text = (SCRIPT_PATH.parents[1] / "SKILL.md").read_text(encoding="utf-8")
+    install = (SCRIPT_PATH.parents[1] / "references" / "install.md").read_text(
+        encoding="utf-8"
+    )
     assert "skill_update.py check --json" in text
-    assert "install --yes --json" in text
     assert "只有用户明确同意后" in text
+    assert "(references/install.md)" in text
+    assert "install --yes --json" in install
+    assert install.index("只有用户明确同意后") < install.index("install --yes --json")

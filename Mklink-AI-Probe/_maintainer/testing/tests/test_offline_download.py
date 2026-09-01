@@ -8,6 +8,8 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
+from mklink.cmsis_dap.algorithm_catalog import FlashAlgorithm
+from mklink.cmsis_dap.models import MemoryRegion, TargetRecord
 from mklink.firmware_check import Version, read_bridge_version, read_device_version
 from mklink.offline_download import (
     OfflineDownloadError,
@@ -76,6 +78,60 @@ def _config(model="V4"):
             },
         ],
     }
+
+
+def _local_stm32_config(source: Path, base_address="0x08005000"):
+    return {
+        "model": "V4",
+        "script_name": "stm32f103re.py",
+        "auto_download_count": 1,
+        "wait_idcode_timeout_ms": 10000,
+        "swd_clock_hz": 10000000,
+        "target_part": "STM32F103RE",
+        "algorithms": [{
+            "id": "internal",
+            "file_name": "STM32F10x_512.FLM",
+            "flash_base": "0x08000000",
+            "ram_base": "0x20000000",
+            "source_kind": "existing",
+        }],
+        "firmwares": [{
+            "id": "app",
+            "file_name": "rtthread.bin",
+            "format": "bin",
+            "base_address": base_address,
+            "algorithm_id": "internal",
+            "source_path": str(source),
+        }],
+    }
+
+
+def _configure_offline_target_metadata(
+    app,
+    monkeypatch,
+    *,
+    target_part="STM32F103RE",
+    regions=None,
+    algorithms=None,
+):
+    services = app.state.online_flash
+    target = TargetRecord(
+        part_number=target_part,
+        vendor="Test",
+        installed=True,
+        source="installed",
+    )
+    services.catalog.search = lambda query, **_kwargs: (
+        [target] if query.casefold() == target_part.casefold() else []
+    )
+    services.target_memory_provider = lambda _part: tuple(regions or (
+        MemoryRegion("flash", 0x08000000, 0x80000, True, True, 0x800),
+    ))
+    services.custom_flms = None
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda _part, paths: list(algorithms or ()),
+    )
 
 
 def test_probe_model_controls_script_filename():
@@ -412,6 +468,163 @@ def test_preview_api_generates_the_resolved_script():
     assert 'load.hex("rt-thread.hex")' in payload["script"]
 
 
+def test_preview_accepts_local_stm32f103re_app_after_bootloader(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x1C210)
+    payload = _local_stm32_config(source)
+    algorithm = FlashAlgorithm(
+        algorithm_id="stm32f103re-internal",
+        target_part="STM32F103RE",
+        file_name="STM32F10x_512.FLM",
+        flash_start=0x08000000,
+        flash_size=0x80000,
+        ram_start=0x20000000,
+        ram_size=0x10000,
+        default=True,
+        source_kind="installed-pack",
+        source_name="Keil.STM32F1xx_DFP@2.4.1",
+        source_token="catalog:test",
+    )
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch, algorithms=(algorithm,))
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert 'load.bin("rtthread.bin", 0x08005000)' in response.json()["script"]
+
+
+def test_preview_rejects_local_bin_outside_target_flash(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x2000)
+    payload = _local_stm32_config(source, "0x20000000")
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 422
+    assert "outside writable Flash" in response.json()["detail"]
+
+
+def test_preview_rejects_local_bin_address_overflow(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x20)
+    payload = _local_stm32_config(source, "0xFFFFFFF0")
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch)
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 422
+    assert "overflows 32-bit address space" in response.json()["detail"]
+
+
+def test_preview_rejects_local_bin_beyond_selected_algorithm(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x2000)
+    payload = _local_stm32_config(source, "0x0801F000")
+    algorithm = FlashAlgorithm(
+        algorithm_id="small-internal",
+        target_part="STM32F103RE",
+        file_name="STM32F10x_512.FLM",
+        flash_start=0x08000000,
+        flash_size=0x20000,
+        ram_start=0x20000000,
+        ram_size=0x10000,
+        default=True,
+        source_kind="installed-pack",
+        source_name="test",
+        source_token="catalog:test",
+    )
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch, algorithms=(algorithm,))
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 422
+    assert "exceeds selected FLM coverage" in response.json()["detail"]
+
+
+def test_preview_falls_back_to_target_flash_when_unrelated_pack_is_broken(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x2000)
+    payload = _local_stm32_config(source)
+    payload["algorithms"][0].update({
+        "source_kind": "pack",
+        "source_token": "catalog:installed:selected",
+    })
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch)
+
+    def fail_discovery(*_args, **_kwargs):
+        raise OSError("unrelated installed Pack is unreadable")
+
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        fail_discovery,
+    )
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert 'load.bin("rtthread.bin", 0x08005000)' in response.json()["script"]
+
+
+def test_preview_requires_target_for_local_bin(tmp_path):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"app")
+    payload = _local_stm32_config(source)
+    payload.pop("target_part")
+    app = create_app(auth_token=None, project_root=".")
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "BIN firmware validation requires target_part"
+
+
+def test_preview_keeps_local_hpm_bin_outside_cmsis_gate(tmp_path):
+    source = tmp_path / "hpm-app.bin"
+    source.write_bytes(b"hpm-app")
+    payload = {
+        "model": "V4",
+        "script_name": "hpm-offline.py",
+        "auto_download_count": 1,
+        "wait_idcode_timeout_ms": 10000,
+        "swd_clock_hz": 10000000,
+        "target_part": "HPM5301xEGx",
+        "board": "hpm5301evklite",
+        "algorithms": [],
+        "firmwares": [{
+            "id": "app",
+            "file_name": "hpm-app.bin",
+            "format": "bin",
+            "base_address": "0x80000400",
+            "algorithm_id": "",
+            "source_path": str(source),
+        }],
+    }
+    app = create_app(auth_token=None, project_root=".")
+    app.state.online_flash.catalog.search = lambda *_args, **_kwargs: pytest.fail(
+        "HPM preview must not use the CMSIS target catalog"
+    )
+    app.state.online_flash.target_memory_provider = lambda *_args: pytest.fail(
+        "HPM preview must not use the CMSIS target memory map"
+    )
+
+    with TestClient(app) as client:
+        response = client.post("/api/offline-download/preview", json=payload)
+
+    assert response.status_code == 200, response.text
+    assert 'hpm.program("hpm-app.bin", 0x80000400)' in response.json()["script"]
+
+
 def test_trigger_api_runs_the_configured_v4_script_with_both_resources_leased(monkeypatch):
     calls = []
 
@@ -615,7 +828,7 @@ def test_trigger_stream_keeps_resources_until_the_serial_thread_finishes():
             payload={"model": "V4", "script_name": "factory-line-a.py"},
         )
         iterator = response.body_iterator
-        await anext(iterator)
+        await iterator.__anext__()
         await iterator.aclose()
         await asyncio.sleep(0)
         assert manager.get_active_lease(ResourceGroup.MKLINK_BRIDGE) is not None
@@ -631,10 +844,21 @@ def test_trigger_stream_keeps_resources_until_the_serial_thread_finishes():
     asyncio.run(exercise_disconnect())
 
 
-def test_deploy_api_writes_uploaded_bundle_to_microkeen_disk(tmp_path):
+def test_deploy_api_writes_uploaded_bundle_to_microkeen_disk(tmp_path, monkeypatch):
     disk = tmp_path / "MICROKEEN"
     disk.mkdir()
+    payload = _config()
+    payload["target_part"] = "DEVICE_A"
     app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(
+        app,
+        monkeypatch,
+        target_part="DEVICE_A",
+        regions=(
+            MemoryRegion("internal", 0x08000000, 0x80000, True, True, 0x800),
+            MemoryRegion("external", 0x90000000, 0x100000, True, True, 0x1000),
+        ),
+    )
     files = [
         ("firmware_files", ("boot.bin", b"boot", "application/octet-stream")),
         ("firmware_files", ("rt-thread.hex", b":00000001FF", "application/octet-stream")),
@@ -645,7 +869,7 @@ def test_deploy_api_writes_uploaded_bundle_to_microkeen_disk(tmp_path):
     with patch("mklink.discovery.find_microkeen_disk", return_value=str(disk)), TestClient(app) as client:
         response = client.post(
             "/api/offline-download/deploy",
-            data={"config_json": json.dumps(_config())},
+            data={"config_json": json.dumps(payload)},
             files=files,
         )
 
@@ -655,16 +879,50 @@ def test_deploy_api_writes_uploaded_bundle_to_microkeen_disk(tmp_path):
     assert (disk / "FLM" / "STM32F10x_1024.FLM").read_bytes() == b"internal"
 
 
-def test_deploy_api_reads_current_local_firmware_paths(tmp_path):
+def test_deploy_rejects_uploaded_bin_outside_target_flash(tmp_path, monkeypatch):
+    disk = tmp_path / "MICROKEEN"
+    disk.mkdir()
+    payload = _local_stm32_config(tmp_path / "unused.bin", "0x20000000")
+    payload["firmwares"][0].pop("source_path")
+    payload["firmwares"][0]["upload_index"] = 0
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch)
+
+    with patch("mklink.discovery.find_microkeen_disk", return_value=str(disk)), TestClient(app) as client:
+        response = client.post(
+            "/api/offline-download/deploy",
+            data={"config_json": json.dumps(payload)},
+            files=[(
+                "firmware_files",
+                ("rtthread.bin", b"\0" * 0x2000, "application/octet-stream"),
+            )],
+        )
+
+    assert response.status_code == 422
+    assert "outside writable Flash" in response.json()["detail"]
+    assert list(disk.iterdir()) == []
+
+
+def test_deploy_api_reads_current_local_firmware_paths(tmp_path, monkeypatch):
     disk = tmp_path / "MICROKEEN"
     disk.mkdir()
     payload = _config()
+    payload["target_part"] = "DEVICE_A"
     for index, firmware in enumerate(payload["firmwares"]):
         source = tmp_path / firmware["file_name"]
         source.write_bytes(f"current-{index}".encode("ascii"))
         firmware.pop("upload_index")
         firmware["source_path"] = str(source)
     app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(
+        app,
+        monkeypatch,
+        target_part="DEVICE_A",
+        regions=(
+            MemoryRegion("internal", 0x08000000, 0x80000, True, True, 0x800),
+            MemoryRegion("external", 0x90000000, 0x100000, True, True, 0x1000),
+        ),
+    )
     files = [
         ("flm_files", ("internal.flm", b"internal", "application/octet-stream")),
         ("flm_files", ("external.flm", b"external", "application/octet-stream")),
@@ -681,3 +939,39 @@ def test_deploy_api_reads_current_local_firmware_paths(tmp_path):
     assert (disk / "boot.bin").read_bytes() == b"current-0"
     assert (disk / "rt-thread.hex").read_bytes() == b"current-1"
     assert (disk / "assets.bin").read_bytes() == b"current-2"
+
+
+def test_deploy_revalidates_local_bin_after_preview(tmp_path, monkeypatch):
+    source = tmp_path / "rtthread.bin"
+    source.write_bytes(b"\0" * 0x100)
+    payload = _local_stm32_config(source)
+    algorithm = FlashAlgorithm(
+        algorithm_id="small-internal",
+        target_part="STM32F103RE",
+        file_name="STM32F10x_512.FLM",
+        flash_start=0x08000000,
+        flash_size=0x20000,
+        ram_start=0x20000000,
+        ram_size=0x10000,
+        default=True,
+        source_kind="installed-pack",
+        source_name="test",
+        source_token="catalog:test",
+    )
+    app = create_app(auth_token=None, project_root=".")
+    _configure_offline_target_metadata(app, monkeypatch, algorithms=(algorithm,))
+    disk = tmp_path / "MICROKEEN"
+    disk.mkdir()
+
+    with patch("mklink.discovery.find_microkeen_disk", return_value=str(disk)), TestClient(app) as client:
+        preview = client.post("/api/offline-download/preview", json=payload)
+        source.write_bytes(b"\0" * 0x20000)
+        deployed = client.post(
+            "/api/offline-download/deploy",
+            data={"config_json": json.dumps(payload)},
+        )
+
+    assert preview.status_code == 200, preview.text
+    assert deployed.status_code == 422
+    assert "exceeds selected FLM coverage" in deployed.json()["detail"]
+    assert list(disk.iterdir()) == []

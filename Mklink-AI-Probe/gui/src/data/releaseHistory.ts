@@ -9,6 +9,32 @@ export interface ReleaseHistoryEntry {
 
 export const releaseHistory: ReleaseHistoryEntry[] = [
   {
+    version: '0.1.9',
+    date: '2026-08-31',
+    summary: '完善在线烧录、实时采集、串口升级与 AI 安全边界',
+    summaryEn: 'Improved online flashing, live capture, serial updates, and AI safety',
+    changes: [
+      '在线烧录新增器件输入联想和实际烧录算法范围，修复 Pack 在线/本地安装失败，并在安装后自动刷新器件目录。',
+      'AXF 可独立提供符号与内存布局，恢复 Keil 压缩 RW 段中的全局变量，界面不再要求额外加载 MAP 文件。',
+      'SuperWatch 优化 16 路批量解码、采样吞吐和地址合并，并在暂停或停止后保留可缩放浏览的完整历史。',
+      '串口助手新增 YMODEM 文件传输，终端显示进度、重试和结果；修复浏览器与桌面端 Ctrl+A、Ctrl+C、Ctrl+V。',
+      '重构 Modbus RTU 工作台，支持 8 个常用功能码、完整串口参数、单次或循环请求、响应解析和带 CRC 校验的真实帧日志。',
+      '加固 Skill、CLI、MCP、REST 的内存、RTT、SystemView 和批量调用边界，危险调用安全失败后仍可重连。',
+      '修复 0.1.7/0.1.8 自动升级可能丢失安装和桌面图标的问题，并让 U 盘快速启动入口以 MKLink Web 上位机名称启动。',
+      '串行化 pyOCD 首次加载，修复在线烧录页面冷启动时探针与器件目录并发请求偶发失败。',
+    ],
+    changesEn: [
+      'Add device typeahead and actual flash algorithm ranges, repair online/local Pack installation, and refresh the catalog after install.',
+      'Use AXF alone for symbols and memory layout, recover globals from compressed Keil RW sections, and remove the GUI requirement for MAP files.',
+      'Optimize 16-channel SuperWatch batch decoding, capture throughput, and address grouping while retaining zoomable history after pause or stop.',
+      'Add YMODEM transfers to the Serial Assistant with terminal progress and retries, and fix Ctrl+A, Ctrl+C, and Ctrl+V in browser and desktop builds.',
+      'Rebuild the Modbus RTU workbench with eight common function codes, complete serial settings, one-shot or looped requests, response decoding, and CRC-checked frame logs.',
+      'Harden Skill, CLI, MCP, and REST boundaries for memory, RTT, SystemView, and batch calls while preserving reconnect after rejected operations.',
+      'Fix 0.1.7/0.1.8 automatic upgrades that could lose the installation or desktop shortcut, and identify the USB quick launcher as MKLink Web.',
+      'Serialize the first pyOCD load to prevent cold-start probe and target catalog requests from intermittently failing.',
+    ],
+  },
+  {
     version: '0.1.8',
     date: '2026-08-25',
     summary: '新增探针固件升级与 USB 端口角色命名',

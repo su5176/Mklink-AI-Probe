@@ -207,7 +207,7 @@ export interface SymbolTypeInfo {
 
 export interface RttFindResponse {
   found: boolean
-  addr?: string
+  addr?: string | null
   source?: string
   source_path?: string
   details?: string[]

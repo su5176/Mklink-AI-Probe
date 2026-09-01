@@ -14,12 +14,19 @@ from mklink.remote.dashboards import (
     normalize_superwatch_interval,
 )
 from mklink.dump_memory import MAGIC
+from mklink.superwatch import (
+    ReadBlock,
+    SuperWatchRuntime,
+    WatchItem,
+    compile_frame_decoder,
+)
 from mklink.remote.stream_hub import StreamHub
 from mklink.remote.stream_protocol import (
     RTT_RAW_UTF8_LINES,
     RTT_TERMINAL_UTF8,
     SUPERWATCH_METADATA_JSON,
     SUPERWATCH_SAMPLE_MAJOR_FLOAT32,
+    SUPERWATCH_TIMESTAMPED_FLOAT32,
     StreamType,
     decode_rtt_lines,
     decode_superwatch_metadata,
@@ -67,21 +74,144 @@ def _watch_item(name, address):
     )
 
 
+def test_compiled_superwatch_decoder_reuses_one_numeric_row_without_slices_or_dicts():
+    items = [
+        WatchItem("signed", 0x20000000, "int16_t", 2, scalar_kind="signed"),
+        WatchItem("value", 0x20000004, "float", 4, scalar_kind="float"),
+        WatchItem("flag", 0x20000100, "bool", 1, scalar_kind="bool"),
+    ]
+    blocks = [
+        ReadBlock(0x20000000, 8, items[:2]),
+        ReadBlock(0x20000100, 1, items[2:]),
+    ]
+    decoder = compile_frame_decoder(items, blocks)
+    first = decoder.decode({
+        "regions": [
+            (0, struct.pack("<hxxf", -7, 1.25)),
+            (1, b"\x01"),
+        ],
+    })
+    second = decoder.decode({
+        "regions": [
+            (0, struct.pack("<hxxf", 8, 2.5)),
+            (1, b"\x00"),
+        ],
+    })
+
+    assert first is second
+    assert second == pytest.approx([8.0, 2.5, 0.0])
+    assert decoder.channel_index == {"signed": 0, "value": 1, "flag": 2}
+    assert decoder.decode({"regions": [(0, b"\x00" * 8)]}) is None
+
+
+def test_superwatch_dump_layout_never_spans_address_holes():
+    items = [
+        WatchItem("a", 0x20000000, "float", 4),
+        WatchItem("touching", 0x20000004, "float", 4),
+        WatchItem("b", 0x20000014, "float", 4),  # 16-byte hole
+        WatchItem("c", 0x20000058, "float", 4),  # 64-byte hole
+        WatchItem("d", 0x2000015C, "float", 4),  # 256-byte hole
+    ]
+    runtime = SuperWatchRuntime(items=items)
+
+    assert [(block.address, block.size) for block in runtime.blocks] == [
+        (0x20000000, 8),
+        (0x20000014, 4),
+        (0x20000058, 4),
+        (0x2000015C, 4),
+    ]
+
+
+def test_superwatch_binary_batch_uses_sample_byte_and_latency_limits():
+    now = [0.0]
+    hub = Mock()
+    manager = SuperWatchStreamManager(
+        stream_hub=hub,
+        batch_samples=1000,
+        batch_bytes=1024,
+        batch_max_latency=0.020,
+        clock=lambda: now[0],
+    )
+    manager._runtime = SimpleNamespace(items=[SimpleNamespace(name="a")])
+
+    assert manager.publish_sample_points([{"_t": 0.0, "a": 1.0}])
+    assert not [call for call in hub.publish.call_args_list if call.kwargs.get("item_count")]
+    now[0] = 0.021
+    assert manager.publish_sample_points([{"_t": 0.001, "a": 2.0}])
+    sample_calls = [call for call in hub.publish.call_args_list if call.kwargs.get("item_count")]
+    assert len(sample_calls) == 1
+    assert sample_calls[0].kwargs["item_count"] == 2
+
+    hub.reset_mock()
+    now[0] = 1.0
+    manager = SuperWatchStreamManager(
+        stream_hub=hub,
+        batch_samples=1000,
+        batch_bytes=1024,
+        batch_max_latency=1.0,
+        clock=lambda: now[0],
+    )
+    manager._runtime = SimpleNamespace(items=[
+        SimpleNamespace(name=f"v{index}") for index in range(16)
+    ])
+    row = {f"v{index}": float(index) for index in range(16)}
+    for sample in range(15):
+        assert manager.publish_sample_points([{"_t": sample / 1000, **row}])
+    sample_calls = [call for call in hub.publish.call_args_list if call.kwargs.get("item_count")]
+    assert len(sample_calls) == 1
+    assert sample_calls[0].kwargs["item_count"] == 15
+
+
+def test_superwatch_low_rate_sample_flushes_immediately():
+    hub = Mock()
+    manager = SuperWatchStreamManager(
+        stream_hub=hub, batch_samples=512, batch_max_latency=0.020,
+    )
+    manager._runtime = SimpleNamespace(items=[SimpleNamespace(name="a")])
+    manager.set_interval(0.1)
+
+    assert manager.publish_sample_points([{"_t": 0.0, "a": 1.0}])
+    sample_calls = [call for call in hub.publish.call_args_list if call.kwargs.get("item_count")]
+    assert len(sample_calls) == 1
+    assert sample_calls[0].kwargs["item_count"] == 1
+
+
 class _MutableWatchRuntime:
     def __init__(self):
         self.items = [_watch_item("a", 0x20000000)]
-        self.blocks = ["a"]
+        self._rebuild_blocks()
+
+    def _rebuild_blocks(self):
+        self.blocks = [ReadBlock(
+            address=self.items[0].address,
+            size=(self.items[-1].address + self.items[-1].size) - self.items[0].address,
+            items=list(self.items),
+        )] if self.items else []
 
     def add(self, name):
         if name == "b" and all(item.name != name for item in self.items):
             self.items.append(_watch_item("b", 0x20000004))
-        self.blocks = [item.name for item in self.items]
+        self._rebuild_blocks()
         return {"name": name}
 
     def remove(self, name):
         self.items = [item for item in self.items if item.name != name]
-        self.blocks = [item.name for item in self.items]
+        self._rebuild_blocks()
         return {"removed": True, "name": name}
+
+
+class _SuperWatchDumpBridge:
+    def _enter_stream(self, _state):
+        pass
+
+    def _write_raw(self, _data):
+        pass
+
+    def drain_stream_bytes(self, max_bytes=None):
+        return b""
+
+    def _exit_stream(self):
+        return ""
 
 
 class _RecordingHub:
@@ -668,8 +798,9 @@ def test_superwatch_sample_rows_are_aligned_and_metadata_is_versioned():
         decoded_meta = decode_superwatch_metadata(metadata.payload)
         assert decoded_meta["version"] == 2
         assert [channel["name"] for channel in decoded_meta["channels"]] == ["a", "b"]
-        assert samples.flags == SUPERWATCH_SAMPLE_MAJOR_FLOAT32
-        assert decode_waveform_samples(samples.payload, 2, 2) == ((1.0, 2.0), (3.0, 4.0))
+        assert samples.flags == 0x03
+        assert struct.unpack_from("<2d", samples.payload) == (0.0, 100.0)
+        assert decode_waveform_samples(samples.payload[16:], 2, 2) == ((1.0, 2.0), (3.0, 4.0))
         hub.unsubscribe(queue)
 
     asyncio.run(scenario())
@@ -750,6 +881,20 @@ def test_superwatch_actual_rate_counts_only_complete_samples_on_a_monotonic_wind
     assert status["actual_rate"] == pytest.approx(4.0)
 
 
+def test_superwatch_preserves_device_sample_times_across_host_batch_jitter():
+    hub = Mock()
+    manager = SuperWatchStreamManager(stream_hub=hub, batch_samples=2)
+    manager._runtime = SimpleNamespace(items=[SimpleNamespace(name="a")])
+    for timestamp in (0.0, 0.00013, 0.00026, 0.025):
+        assert manager.publish_sample_points([{"_t": timestamp, "a": timestamp}])
+    batches = [call for call in hub.publish.call_args_list if call.kwargs.get("item_count") == 2]
+    assert len(batches) == 2
+    for call, times in zip(batches, [(0.0, 0.13), (0.26, 25.0)]):
+        assert call.kwargs["flags"] == 0x03
+        assert struct.unpack_from("<2d", call.args[0]) == pytest.approx(times)
+        assert struct.unpack_from("<2f", call.args[0], 16) == pytest.approx(tuple(t / 1000 for t in times))
+
+
 def test_superwatch_rejects_partial_and_nonfinite_samples_atomically():
     hub = StreamHub(max_batches_per_client=2)
     manager = SuperWatchStreamManager(stream_hub=hub, batch_samples=1)
@@ -796,7 +941,8 @@ def test_superwatch_layout_change_reports_pending_samples_dropped_without_hub():
     assert manager.publish_sample_points([{"a": 1.0}])
     manager.add_watch("b")
     assert manager.get_status()["binary_drops"] == {"batches": 1, "items": 1}
-    assert manager._pending_samples == []
+    assert manager._pending_sample_count == 0
+    assert len(manager._pending_values) == 0
 
 
 def test_superwatch_stop_flushes_a_partial_batch():
@@ -826,18 +972,29 @@ def test_superwatch_subscribe_replays_cached_metadata_without_waiting_for_read(m
         release_sample = threading.Event()
         sample_finished = threading.Event()
 
-        def sample_blocks(blocks, **_kwargs):
-            assert tuple(blocks) == ("a",)
-            sample_started.set()
-            try:
-                assert release_sample.wait(2.0)
-                return SimpleNamespace(origin_us=1, points=[{"a": 1.0}])
-            finally:
-                sample_finished.set()
+        class BlockingSession:
+            stats = {}
 
-        monkeypatch.setattr("mklink.superwatch.sample_blocks", sample_blocks)
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def read_frames(self, **_kwargs):
+                sample_started.set()
+                try:
+                    assert release_sample.wait(2.0)
+                    return []
+                finally:
+                    sample_finished.set()
+
+            def stop(self):
+                pass
+
+        monkeypatch.setattr("mklink.dump_memory.DumpMemoryStreamSession", BlockingSession)
         manager.set_interval(1.0)
-        manager.start(SimpleNamespace(_bridge=object()))
+        manager.start(SimpleNamespace(_bridge=_SuperWatchDumpBridge()))
         try:
             assert await asyncio.to_thread(sample_started.wait, 1.0)
             queue = hub.subscribe()
@@ -865,15 +1022,32 @@ def test_superwatch_layout_change_does_not_wait_for_read_and_discards_stale_cycl
     sample_finished = threading.Event()
     add_finished = threading.Event()
 
-    def sample_blocks(blocks, **_kwargs):
-        assert tuple(blocks) == ("a",)
-        sample_started.set()
-        assert release_sample.wait(1.0)
-        sample_finished.set()
-        return SimpleNamespace(origin_us=1, points=[{"a": 1.0}])
+    first_read = [True]
 
-    monkeypatch.setattr("mklink.superwatch.sample_blocks", sample_blocks)
-    device = SimpleNamespace(_bridge=object())
+    class BlockingSession:
+        stats = {}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def read_frames(self, **_kwargs):
+            if first_read[0]:
+                first_read[0] = False
+                sample_started.set()
+                assert release_sample.wait(1.0)
+                sample_finished.set()
+                return [{"timestamp_us": 1, "regions": [(0, struct.pack("<f", 1.0))]}]
+            time.sleep(0.0002)
+            return []
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("mklink.dump_memory.DumpMemoryStreamSession", BlockingSession)
+    device = SimpleNamespace(_bridge=_SuperWatchDumpBridge())
     manager.set_interval(1.0)
     manager.start(device)
     assert sample_started.wait(1.0)
@@ -906,22 +1080,38 @@ def test_superwatch_concurrent_poll_add_remove_pressure_keeps_batches_aligned(mo
     manager.publish_metadata()
     sampled = 0
 
-    def sample_blocks(blocks, **_kwargs):
-        nonlocal sampled
-        sampled += 1
-        time.sleep(0.0002)
-        point = {name: float(sampled + index) for index, name in enumerate(blocks)}
-        return SimpleNamespace(origin_us=sampled, points=[point])
+    class SamplingSession:
+        stats = {}
 
-    monkeypatch.setattr("mklink.superwatch.sample_blocks", sample_blocks)
+        def __init__(self, _bridge, regions, _period):
+            self.channel_count = regions[0][1] // 4
+
+        def start(self):
+            pass
+
+        def read_frames(self, **_kwargs):
+            nonlocal sampled
+            sampled += 1
+            time.sleep(0.0002)
+            payload = struct.pack(
+                "<" + "f" * self.channel_count,
+                *(float(sampled + index) for index in range(self.channel_count)),
+            )
+            return [{"timestamp_us": sampled, "regions": [(0, payload)]}]
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr("mklink.dump_memory.DumpMemoryStreamSession", SamplingSession)
     manager.set_interval(0.00001)
-    manager.start(SimpleNamespace(_bridge=object()))
+    manager.start(SimpleNamespace(_bridge=_SuperWatchDumpBridge()))
     try:
         for _ in range(100):
             manager.add_watch("b")
             manager.remove_watch("b")
+        target_cycles = manager.get_status()["read_cycles"] + 8
         deadline = time.monotonic() + 1.0
-        while manager.get_status()["read_cycles"] < 1 and time.monotonic() < deadline:
+        while manager.get_status()["read_cycles"] < target_cycles and time.monotonic() < deadline:
             time.sleep(0.001)
     finally:
         manager.stop()
@@ -931,12 +1121,21 @@ def test_superwatch_concurrent_poll_add_remove_pressure_keeps_batches_aligned(mo
     for batch in hub.snapshot():
         if batch.flags == SUPERWATCH_METADATA_JSON:
             active_channel_count = len(decode_superwatch_metadata(batch.payload)["channels"])
-        elif batch.flags == SUPERWATCH_SAMPLE_MAJOR_FLOAT32:
+        elif batch.flags in (SUPERWATCH_SAMPLE_MAJOR_FLOAT32, SUPERWATCH_TIMESTAMPED_FLOAT32):
             assert active_channel_count in (1, 2)
-            decode_waveform_samples(batch.payload, batch.item_count, active_channel_count)
+            payload = (
+                batch.payload[batch.item_count * 8:]
+                if batch.flags == SUPERWATCH_TIMESTAMPED_FLOAT32
+                else batch.payload
+            )
+            decode_waveform_samples(payload, batch.item_count, active_channel_count)
             sample_channel_counts.add(active_channel_count)
     assert sampled > 0
-    assert sample_channel_counts
+    status = manager.get_status()
+    assert sample_channel_counts, {
+        key: status[key]
+        for key in ("read_cycles", "read_errors", "read_drops", "binary_drops")
+    }
     assert manager.get_status()["read_drops"] > 0
     assert manager.get_status()["binary_drops"] == {"batches": 0, "items": 0}
 
@@ -1062,7 +1261,48 @@ def test_superwatch_uses_dump_stream_and_reports_protocol_integrity():
     assert hub.stats().produced_items == 1
     assert bridge.writes[0] == b"cmd.dump_memory(0x20000000, 4, 0.001)\n"
     assert expected_restart in bridge.writes
-    assert bridge.writes[-1] == b"cmd.dump_memory(0x20000000, 4, 0)\n"
+    assert bridge.writes[-1] == b"cmd.dump_memory(0x20000000, 4, -1.0)\n"
+    assert b"cmd.dump_memory(0x20000000, 4, 0)\n" not in bridge.writes
+
+
+def test_superwatch_rejects_bridge_without_dump_stream_instead_of_read_ram_fallback():
+    manager = SuperWatchStreamManager()
+    manager._runtime = SuperWatchRuntime(items=[
+        WatchItem("value", 0x20000000, "float", 4),
+    ])
+    events = Mock()
+    manager._bridge = events
+
+    manager.start(SimpleNamespace(_bridge=object()))
+    manager._thread.join(timeout=1.0)
+
+    assert not manager.running
+    assert any(
+        call.args[0].get("event") == "error"
+        and "read_ram fallback is disabled" in call.args[0].get("message", "")
+        for call in events.put.call_args_list
+    )
+    assert manager.get_status()["acquisition_mode"] != "read-memory"
+
+
+def test_superwatch_rejects_more_than_safe_dump_region_limit():
+    manager = SuperWatchStreamManager()
+    manager._runtime = SuperWatchRuntime(items=[
+        WatchItem(f"value_{index}", 0x20000000 + index * 0x100, "float", 4)
+        for index in range(16)
+    ])
+    events = Mock()
+    manager._bridge = events
+
+    manager.start(SimpleNamespace(_bridge=_SuperWatchDumpBridge()))
+    manager._thread.join(timeout=1.0)
+
+    assert not manager.running
+    assert any(
+        call.args[0].get("event") == "error"
+        and "more than 15 dump_memory regions" in call.args[0].get("message", "")
+        for call in events.put.call_args_list
+    )
 
 
 def _symbol_write_device(tmp_path, *, write_error=None):
@@ -1334,7 +1574,7 @@ def test_superwatch_array_snapshot_reads_only_requested_slice(tmp_path):
     manager.prepare(device)
 
     selected = manager.select_array_snapshot("samples", start_index=2, count=3)
-    scalar_items, sampled_items, blocks = manager._sampling_layout_locked()
+    scalar_items, sampled_items, dump_blocks = manager._sampling_layout_locked()
 
     assert selected["snapshot"]["start_index"] == 2
     assert selected["snapshot"]["count"] == 3
@@ -1342,7 +1582,7 @@ def test_superwatch_array_snapshot_reads_only_requested_slice(tmp_path):
     assert [item.name for item in sampled_items] == [
         "samples[2]", "samples[3]", "samples[4]",
     ]
-    assert [(block.address, block.size) for block in blocks] == [
+    assert [(block.address, block.size) for block in dump_blocks] == [
         (0x20000024, 6),
     ]
     assert manager._update_array_snapshot_locked([{

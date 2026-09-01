@@ -30,8 +30,8 @@ Never commit, print, log, transmit, or copy these secrets into project files.
 3. Run tests appropriate to the release, then:
 
 ```powershell
-python skills/tauri-gui-builder/scripts/build.py --check
-python skills/tauri-gui-builder/scripts/build.py --bundle
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('skills/tauri-gui-builder/scripts/build.py', '--check')
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('skills/tauri-gui-builder/scripts/build.py', '--bundle')
 ```
 
 Build standard NSIS only unless the user explicitly requests MSI or a
@@ -40,27 +40,28 @@ adjacent `.exe.sig`.
 
 ## Prepare Five Payloads And Two Integrity Files
 
-Create an empty workspace-level `release/<YYYYMMDD-HHMMSS>/` directory outside
-the source repository. From the repository root:
+Create an empty directory under the main checkout's ignored `.build/artifacts/`.
+Do not use C: or create another ad hoc build tree. Preserve existing official
+`release/` assets. From the source root:
 
 ```powershell
 $Version = "X.Y.Z"
 $SourceCommit = git rev-parse HEAD
-$ReleaseDir = "..\release\<YYYYMMDD-HHMMSS>"
-$PortableWork = "..\release\<YYYYMMDD-HHMMSS>-portable-work"
-$NsisFiles = @(Get-ChildItem "gui\src-tauri\target\release\bundle\nsis\*.exe")
+$BuildRoot = (./scripts/build_workspace.ps1 -Action paths | ConvertFrom-Json).root
+$ReleaseDir = Join-Path $BuildRoot "artifacts\<YYYYMMDD-HHMMSS>"
+$PortableWork = Join-Path $BuildRoot "artifacts\<YYYYMMDD-HHMMSS>-portable"
+$NsisFiles = @(Get-ChildItem (Join-Path $BuildRoot "cache\cargo\release\bundle\nsis\*.exe"))
 if ($NsisFiles.Count -ne 1) { throw "Expected exactly one NSIS executable" }
 $Nsis = $NsisFiles[0]
-python packaging/site_agent/build.py --output "$PortableWork\core"
-Push-Location site-agent-gui\src-tauri
-cargo build --release
-Pop-Location
-python packaging/site_agent/build_gui.py `
-  --output "$PortableWork\gui" `
-  --core-zip "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.zip" `
-  --core-manifest "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.manifest.json" `
-  --gui-exe "site-agent-gui\src-tauri\target\release\MKLink-Site-Agent.exe" `
-  --source-root .
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('packaging/site_agent/build.py', '--output', "$PortableWork\core")
+./scripts/build_workspace.ps1 -Action run -WorkingDirectory site-agent-gui\src-tauri -Executable cargo -ArgumentList @('build', '--release')
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @(
+  'packaging/site_agent/build_gui.py', '--output', "$PortableWork\gui",
+  '--core-zip', "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.zip",
+  '--core-manifest', "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.manifest.json",
+  '--gui-exe', (Join-Path $BuildRoot 'cache\cargo\release\MKLink-Site-Agent.exe'),
+  '--source-root', '.'
+)
 
 python _maintainer/release/prepare_release.py `
   --version $Version `

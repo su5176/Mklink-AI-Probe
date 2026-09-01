@@ -149,16 +149,22 @@ def test_public_skill_archive_excludes_repository_maintenance(
         cwd=release_module.REPO_ROOT,
         text=True,
     ).strip()
+    source_plugin = json.loads(subprocess.check_output(
+        ["git", "show", f"{source_commit}:./.claude-plugin/plugin.json"],
+        cwd=release_module.REPO_ROOT,
+        text=True,
+    ))
+    version = source_plugin["version"]
     archive_path = tmp_path / "public-skill.zip"
 
     release_module._build_skill_archive(
-        version="0.1.8",
+        version=version,
         source_commit=source_commit,
         output=archive_path,
     )
 
     with zipfile.ZipFile(archive_path) as archive:
-        root = "Mklink-AI-Probe-v0.1.8/"
+        root = f"Mklink-AI-Probe-v{version}/"
         files = {
             info.filename.removeprefix(root)
             for info in archive.infolist()

@@ -43,6 +43,7 @@ from mklink.remote.online_flash_api import shutdown_online_flash_services
 class Catalog:
     def __init__(self):
         self.calls = []
+        self.refresh_count = 0
 
     def search(self, query, vendor=None, installed=None, limit=100):
         self.calls.append((query, vendor, installed, limit))
@@ -56,6 +57,7 @@ class Catalog:
         return {"index_available": True, "target_count": 2, "last_error": None}
 
     def refresh(self):
+        self.refresh_count += 1
         return self.status()
 
 
@@ -279,6 +281,47 @@ def test_probe_target_and_pack_status_routes_use_injected_services(app, services
     assert status.json()["index_available"] is True
 
 
+@pytest.mark.parametrize("query", ["acme", "control family", "value series"])
+def test_target_search_route_matches_vendor_family_and_series(
+    app, services, tmp_path, query,
+):
+    paths = PackPaths(tmp_path / "catalog")
+    paths.index_dir.mkdir(parents=True)
+    paths.index_file.write_text(json.dumps({
+        "PART-A": {
+            "vendor": "Acme Semiconductor",
+            "family": "Control Family",
+            "sub_family": "Value Series",
+            "from_pack": {
+                "vendor": "Acme Semiconductor",
+                "pack": "Part_DFP",
+                "version": "1.0.0",
+            },
+        },
+    }), encoding="utf-8")
+    services.catalog = PackCatalog(paths, builtin_provider=lambda: [])
+
+    response = request(app, "GET", "/api/online-flash/targets", params={"q": query})
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "part_number": "PART-A",
+        "vendor": "Acme Semiconductor",
+        "pack_id": "Acme Semiconductor.Part_DFP",
+        "pack_version": "1.0.0",
+        "installed": False,
+        "source": "index",
+        "family": "Control Family",
+        "series": "Value Series",
+    }]
+
+
+def test_target_search_route_keeps_limit_validation(app):
+    response = request(app, "GET", "/api/online-flash/targets?limit=1001")
+
+    assert response.status_code == 422
+
+
 def test_target_memory_map_route_returns_flash_sector_geometry(app):
     response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/memory-map")
 
@@ -448,6 +491,7 @@ def test_hpm_image_rejects_hex_without_pack_lookup(app, services):
 
 def test_hpm_algorithm_api_never_accepts_flm(app, services):
     listed = request(app, "GET", "/api/online-flash/algorithms?part_number=HPM5300")
+    available = request(app, "GET", "/api/online-flash/targets/HPM5300/algorithms")
     added = request(
         app,
         "POST",
@@ -457,9 +501,87 @@ def test_hpm_algorithm_api_never_accepts_flm(app, services):
     )
 
     assert listed.json() == []
+    assert available.json() == [{
+        "algorithm_id": "hpm-rom-api",
+        "target_part": "HPM5300",
+        "file_name": "HPM ROM API",
+        "flash_start": 0x80000000,
+        "flash_size": 0x10000000,
+        "default": True,
+        "source_kind": "hpm-rom-api",
+        "source_name": "HPM ROM API",
+    }]
     assert added.status_code == 422
     assert added.json()["detail"]["code"] == "TARGET_NOT_SUPPORTED"
     assert services.custom_flms.records == []
+
+
+def test_target_algorithm_route_lists_pack_source_without_paths(app, services, monkeypatch):
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda part_number, paths: [FlashAlgorithm(
+            algorithm_id="pack-algorithm",
+            target_part=part_number,
+            file_name="Internal.FLM",
+            flash_start=0x08000000,
+            flash_size=0x80000,
+            ram_start=0x20000000,
+            ram_size=0x4000,
+            default=True,
+            source_kind="installed-pack",
+            source_name="Vendor.Pack@1.0",
+            source_token="secret-token",
+            pack_path="C:/secret/Vendor.Pack.1.0.pack",
+        )],
+    )
+
+    response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/algorithms")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "algorithm_id": "pack-algorithm",
+        "target_part": "DEVICE_A",
+        "file_name": "Internal.FLM",
+        "flash_start": 0x08000000,
+        "flash_size": 0x80000,
+        "default": True,
+        "source_kind": "installed-pack",
+        "source_name": "Vendor.Pack@1.0",
+    }]
+    assert "secret" not in response.text.casefold()
+
+
+def test_target_algorithm_route_describes_pyocd_builtin_regions(app, services, monkeypatch):
+    builtin = TargetRecord(
+        "DEVICE_A", "Vendor", installed=True, source="builtin",
+    )
+    monkeypatch.setattr(
+        services.catalog,
+        "search",
+        lambda query, **_kwargs: [builtin]
+        if query.casefold() in builtin.part_number.casefold() else [],
+    )
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda *_args, **_kwargs: [],
+    )
+    services.target_memory_provider = lambda _part: (
+        MemoryRegion("flash", 0x08000000, 0x80000, True, True, 0x800),
+    )
+
+    response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/algorithms")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "algorithm_id": "pyocd-builtin:device_a:08000000",
+        "target_part": "DEVICE_A",
+        "file_name": "DEVICE_A · flash",
+        "flash_start": 0x08000000,
+        "flash_size": 0x80000,
+        "default": True,
+        "source_kind": "pyocd-builtin",
+        "source_name": "pyOCD",
+    }]
 
 
 def test_custom_flm_routes_store_list_and_remove_without_exposing_paths(app, services):
@@ -939,8 +1061,10 @@ def test_probe_enumeration_failure_is_actionable_and_does_not_expose_raw_details
 
 
 def test_pack_operations_collect_events_cancel_remove_and_map_errors(app, services):
+    refresh_count = services.catalog.refresh_count
     installed = request(app, "POST", "/api/online-flash/packs/install", json={"part_number": "Other"})
     assert installed.json()["events"][0]["progress"] == 0.5
+    assert services.catalog.refresh_count == refresh_count + 1
     missing = request(app, "POST", "/api/online-flash/packs/install", json={"part_number": "missing"})
     assert missing.status_code == 404
     updated = request(app, "POST", "/api/online-flash/packs/index/update")
@@ -971,7 +1095,8 @@ def test_hpm_pack_install_is_satisfied_without_network_download(app, services):
     }
 
 
-def test_pack_install_can_stream_progress_and_terminal_result(app):
+def test_pack_install_can_stream_progress_and_terminal_result(app, services):
+    refresh_count = services.catalog.refresh_count
     response = request(
         app,
         "POST",
@@ -997,6 +1122,28 @@ def test_pack_install_can_stream_progress_and_terminal_result(app):
         "type": "result",
         "result": {"status": "installed", "part_number": "Other"},
     }
+    assert services.catalog.refresh_count == refresh_count + 1
+
+
+def test_pack_import_can_stream_result_after_catalog_refresh(app, services):
+    refresh_count = services.catalog.refresh_count
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/packs/import",
+        files={"file": ("a.pack", b"pack")},
+        headers={"Accept": "application/x-ndjson"},
+    )
+
+    messages = [json.loads(line) for line in response.text.splitlines() if line]
+    assert response.status_code == 200
+    assert any(message.get("event", {}).get("phase") == "refreshing" for message in messages)
+    assert messages[-1] == {
+        "type": "result",
+        "result": {"status": "installed", "pack_id": "V.P", "version": "1"},
+    }
+    assert services.catalog.refresh_count == refresh_count + 1
+    assert not services.pack_manager.imported_path.exists()
 
 
 def test_pack_stream_bounds_bursty_progress_without_losing_result(app, services):
@@ -1216,10 +1363,12 @@ def test_successful_index_update_immediately_refreshes_pack_status(app, services
 
 
 def test_import_and_inspect_stream_uploads_then_delete_temporary_files(app, services):
+    refresh_count = services.catalog.refresh_count
     imported = request(
         app, "POST", "/api/online-flash/packs/import", files={"file": ("a.pack", b"pack")}
     )
     assert imported.status_code == 200
+    assert services.catalog.refresh_count == refresh_count + 1
     assert not services.pack_manager.imported_path.exists()
     inspected = request(
         app,

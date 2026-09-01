@@ -166,7 +166,7 @@ def test_v015_metadata_preserves_core_remote_and_separate_optional_surfaces():
     scripts = project["scripts"]
     extras = project["optional-dependencies"]
 
-    assert project["version"] == "0.1.8"
+    assert project["version"] == "0.1.9"
     assert {
         "pyelftools==0.32",
         "pycparser>=2.22,<4",

@@ -4,67 +4,59 @@
 
 ## 当前断点
 
-- 更新时间：`2026-08-26T20:08:43+08:00`
-- 分支：`feature/eternal-chip-gui`
-- HEAD：`v0.1.8 -> eeeb557b714f6ddc2278efce70bd1f1a9e0b3af6（origin/master PR #14 合并进立芯分支）`
-- 远端 HEAD：`GitHub master 已含 PR #14（eeeb557）；feature/eternal-chip-gui 同步合并提交推送 origin，gitee master 按镜像约定快进`
-- 工作树：合并解决后仅剩未跟踪的本地构建/测试目录（build、egg-info、mklink 缓存、pytest 临时目录），无跟踪文件改动
-- 当前任务：上游 PR #14（v0.1.8：安装版串口/时钟修复、严格 Windows USB 识别与端口命名、HPM readme 标识与 ROM API、Skill 运行时白名单）已合并进 su5176/master（eeeb557）；随后把 origin/master 整体合并进 feature/eternal-chip-gui：保留立芯品牌 GUI 样式体系，接入 master 的连接详情行、USB 端口名称修改/恢复（桌面版）与免连接固件升级，gui/dist 删除后由 vue-tsc + Vite 生产构建重建。
-- 状态：`master_synced_into_eternal_chip_v0.1.8`
+- 更新时间：`2026-09-01T14:07:55+08:00`
+- 分支：`master`
+- HEAD：`PR #15 is merged; master contains the validated build-gate fixes, synchronized Web assets, and privacy-safe memory observability.`
+- 远端 HEAD：`origin/master contains PR #15 merge commit 9485089b56075310d8f9b7c6ef0577dbb4bd5c2d; later documentation-only handoff updates may advance master.`
+- 工作树：Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory.
+- 当前任务：PR #15 修补、两个本地备份中的内存可观测性语义迁移、全量软件门禁、HIL-Infra 只读门禁和远端合并均已完成。
+- 状态：`v0.1.9-pr15-merged`
 
 ## 里程碑
 
-- **v0.1.8 当前开发基线** — `complete`。固件升级不依赖先连接调试会话，可读取 MICROKEEN U 盘并进入 Bootloader；连接先返回串口成功，目标 MCU IDCODE 后台同步读取；配置页显示已连接 COM 号；移除重复的串口自动搜索按钮，保留刷新串口和端口名称手动修改/恢复。安装版 sidecar 默认工程根目录改为用户可写的 %LOCALAPPDATA%\com.microkeen.mklink-ai-probe\workspace。
-- **USB 端口命名** — `complete`。使用管理员权限按 USB 设备实例写入 FriendlyName。MI_02 为 MKLink USB to UART，MI_04 为 MKLink Python Console，V4 的 MI_06 为 MKLink USB to RS485；V2/V3 不添加 MI_06。安装器会无条件执行一次初始化，但未连接设备时不会伪造不存在的 PnP 实例。
-- **HPM 固件升级策略** — `complete`。HPM 系列改由 readme.txt 的 HPM Firmware Build Date 标识识别，STARTUP_ANIMATION.zhrgb 不再参与判断；本地 HPMLink_V4.3.8 候选可覆盖线上 V4.3.7。
-- **HPM 真机闭环** — `complete`。HPM ROM API 烧录跳过 FLM；修复烧录后通用 reset 会停住 RISC-V 的问题。SDK FreeRTOS 工程完成 RAM/符号/RTT/故障注入与 ROM 重烧恢复验证。
-- **普通用户发布内容隔离** — `complete`。公开 Skill 由明确运行时白名单构建，不包含 _maintainer、docs/ai、测试、桌面源码、固件或维护 Skill；更新器还会删除旧安装遗留的维护目录和构建垃圾。
+- **0.1.9 桌面端与 WebGUI** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
+- **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
+- **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
 
 ## 验证证据
 
-- **master v0.1.8 同步进立芯分支门禁**：合并 feature/eternal-chip-gui + origin/master(eeeb557)：源代码冲突仅 ConfigView.vue（立芯 config-panel-header 样式体系保留，固件描述文案保留在面板头，接入 master 免连接升级按钮）；.gitignore、记忆/交接以 master v0.1.8 新状态为基重写；gui/dist 删除后由 vue-tsc + Vite 生产构建重建（17s 通过）。GUI 全量 59 文件/587 项通过（与后台 Python 全量并发时两轮出现不同位置的时序抖动，无竞争复跑 81s 全绿）；Python 全量 1403 passed、1 skipped、2 failed：test_public_skill_archive_excludes_repository_maintenance 为已知"归档取自 HEAD 提交树、合并尚未提交"模式，合并提交后定向复跑；test_firmware_check_filters_v4_candidates_by_probe_family 为 master 新增测试对线上固件索引的时序依赖（firmware_check.py 与测试文件同 master 逐字节一致，线上 hpmlink V4.3.8 已发布使 V4.3.7 fixture 正确判为 upgrade_required），非本次合并回归。git diff --check 干净、无残留冲突标记。真机证据沿用 master v0.1.8 已准入记录，本次未执行新的真机动作。
-- **GUI 与 Tauri**：GUI 全量 57 个测试文件、583 项通过；Tauri Rust 16 项通过；Python 等效全量 1393 passed、1 skipped，剩余 12 项为当前 Windows 账户无目录 symlink 特权；Skill 更新聚焦测试 14 项及先前偶发快照测试单独通过。
-- **安装包**：开发分支标准 NSIS 已在最终清理改动后重建，包含独立 Python sidecar、STCP 资源并生成 updater signature；此前覆盖安装已验证 /api/health=ok、配置持久化、无 Python 子进程且关闭后 8765 释放。正式资产将在 master 上重新生成。
-- **真机证据**：指定 STM32F103RC 工程实际解析为 STM32F103RE/Keil AC5；探针 V4.3.7、IDCODE 0x1BA01477、Keil 编译/下载、Flash 回读、AXF 符号、RAM/SCB 读取、RTT、VOFA、SuperWatch、SystemView 和安全值 RAM 写回均通过。串口 TX/RX、RS485、Modbus 物理回环及 VCC 激励未在无明确回环/电压确认时执行。
-- **HPM 固件升级**：本地 HPMLink_V4.3.8.uf2（SHA-256 D295858F...A7E3FA8）从探针 V4.3.7 自动升级成功；升级后 readme.txt 含 HPM Firmware Build Date 与 V4.3.8，REST 结果为 updated/verified_version V4.3.8。
-- **HPM SDK 真机**：hpm5301evklite IDCODE 0x1000563D；demo.bin 以 hpm.program 在 0x80000400 烧录成功，运行计数持续增长，RTT 5 秒输出和 1600/800 rpm 动态响应正常，alarm_code=0。故意非法指令得到 trap_state=2、mcause=2、mtval=0xFFFFFFFF，随后 ROM API 重烧恢复。
-- **SystemView 限制**：systemview-analyze 已使用 output/demo.elf 符号源，但 HPM 示例 2 秒产生 24296 事件并 target buffer overflow，任务区间为 0，未形成可信 CPU 统计；记录为示例固件/SDK trace 限制，不宣称完整通过。
+- **Python**：最终全量 1790 passed, 1 skipped，耗时 556.10 秒；观测与原 0.1.9 边界联合定向回归 59 passed。
+- **GUI 与 Web**：Vitest 59 files / 626 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 验证配置、仪表盘、脱机烧录、在线烧录路由与版本弹层；无静态资源或 Vue 运行时错误。
+- **Go/STCP**：官方 Go 1.25.12 工具链下 go test ./... 通过；当前源码 DLL SHA-256=C49908A030D16629253683C7B3B4837673863081E4602D8A1F25B54AA0B79087。
+- **Tauri Release 可执行文件**：Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=138647E4DE52BF8E85A4AAC43CBE39A44AF172250ACA47E3F7258B2CC47E661D。
+- **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性零错误零豁免；bench-01、bench-gec1900、运行计划和资源映射通过。
+- **HIL 运行时与插件准入**：MKLink、Toomoss、PSU、Camera 的负向运行时拒绝探针通过；MKLink 自动化插件评审 11/11 OK，Camera 11/11 OK；结束后无活动锁。本轮未烧录、复位、供电或发送 CAN。
+- **PR #15 固件资产**：按用户决策采用 PR 文件：HPMLink V4.3.8 SHA-256=D295858F3914998ABB7A19F6064157F6695C5B43E362CB00553D7A295A7E3FA8；MicroLink V3.3.8 SHA-256=E213B248A137C6519A9E926EAAC78718CE844C2A20555F3A3D2A48581B099BE8；MicroLink V4.3.9 SHA-256=F29821A6A34B75F3DAE96416595CA572A2DACAAF54C9DCC17521845F212DCEF6。
 
 ## 架构决策
 
-- 用户已授权将 v0.1.8-development squash 合并到 master，并正式发布应用 0.1.8 与 HPMLink V4.3.8。
-- USB 端口名称保持按设备实例写入 FriendlyName；不使用常驻 SYSTEM 轮询，不引入未签名 Extension INF。配置页保留手动修改和恢复按钮。
-- Windows 端口命名必须严格识别 VID_0D28/PID_0202、复合设备父子关系、ContainerId 和 MI；V4 才识别 MI_06。
-- HPM 目标使用设备端 ROM API，不加载 FLM；VCC 输出仍需每次获得明确电压确认。
-- HPM ROM API 已负责 RISC-V reset/resume，Device.flash 的 HPM 分支不得再调用通用 SWD reset。
-- 普通用户 Skill 只发布运行时白名单；维护者项目记忆、测试、维护 Skill、固件和构建产物不进入归档，更新时删除旧版遗留内容。
-- 不提交固件、Pack、FLM、日志、截图、硬件标识或构建缓存。
+- UF2 固件文件和 AGENTS.md 采用 PR #15 版本。
+- 两个本地备份包含同一份核心内存可观测性实现；只迁移一次代码，旧交接文档不覆盖当前 0.1.9 记忆，Eternal Chip GUI 分支历史不混入 PR。
+- 观测数据的公开事件仅包含安全事实，原始内存、RTT 和 SystemView 内容走有界私有流；发布失败降级但不改变成功读取结果。
+- 构建、测试、日志和缓存统一位于 MKLINK_BUILD_ROOT 或主工作区忽略的 .build，并经 scripts/build_workspace.ps1 运行。
+- 实际烧录、复位、供电、CAN 发送等不可逆或有外部影响的动作必须获得针对本次操作的明确确认。
+- 应用 Release、标签、更新签名和探针固件发布彼此独立，不随 PR 合并自动执行。
 
 ## 真机环境
 
-- **probe**：维护机可使用 V2/V3/V4；交接不记录端口号或完整探针标识。
-- **target**：实际 STM32F103RE 可用于固件编译、下载和调试闭环；工程目录中的 STM32F103RC 为历史命名。
-- **permission**：维护者已明确授权合并 master、签名、创建 v0.1.8 标签与双平台 Release、更新发布指针并独立发布 HPMLink V4.3.8。
+- **probe**：HIL-Infra bench-01 将 MKLink V4 命令口映射为 COM5；交接不依赖端口号，使用台架 selector 与互操作锁。
+- **target**：已有 v0.1.9 STM32F103RE 真机报告来自较早源码基线；本轮变更集中在构建门禁、Web 产物与主机侧可观测性，没有重烧目标。
+- **permission**：本轮只做 identify/capabilities/health/safe_state 与负向拒绝探针。若要重跑物理烧录闭环，需要用户明确授权目标、固件和写入动作。
 
 ## 下一动作
 
-1. master 后续功能或修复从新的 feature/fix 分支开始；立芯分支后续同步沿用本流程。
-2. test_firmware_check_filters_v4_candidates_by_probe_family 的线上索引时序依赖需上游修复（mock _remote_firmwares）。
-3. 用户端使用正式 0.1.8 安装包和 Skill；固件更新通过 firmware/latest.json 自动发现。
+1. 若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。
+2. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。
 
 ## 已知限制
 
-- 端口名称修改依赖管理员权限和 Windows 设备节点；更换另一只下载器后会产生新的设备实例，需要再次执行手动修改。
-- 安装时未连接下载器只能完成命名初始化，不能提前修改未来尚不存在的设备实例。
-- 当前 Windows 账户没有目录 symlink 权限，少量 Python 安全测试在该环境会失败；这不是本版本功能回归。
-- HPM SDK 示例的 SystemView 高频 ECall 事件会导致目标缓冲溢出，当前不能提供可信任务 CPU 占用。
-- 串口 TX/RX、RS485 和部分 VCC 场景没有稳定的自动化真机回环条件，不能用单元测试替代硬件验证。
-- 正式安装包尚未完成 Windows Authenticode/驱动签名发布流程；当前签名仅为 Tauri updater 签名。
-- 正式发布仍需在 master 生成完整七项资产，并由发布器验证 GitHub/Gitee 资产、更新清单和哈希。
-- test_firmware_check_filters_v4_candidates_by_probe_family 未 mock 在线固件索引：HPMLink V4.3.8 发布后，该测试在任何有网环境都会因线上最新版超过 fixture 盘符 V4.3.7 而失败；属 master 测试时序缺陷，待上游 fix 分支补 _remote_firmwares mock，不在立芯分支单独修改。
+- 本轮没有重新执行物理烧录 HIL；docs/verification/v0.1.9-stm32f103re-release-hil.md 的原始日志未在当前工作区找到，因此只能作为既有叙述证据，不能冒充本轮新证据。
+- Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。
+- Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
+- HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。
 
 ## 延续协议
 
-- 开始前校正 Git、进程和硬件状态。
-- 不把未验证的硬件现象写成 PASS；记录真实环境限制。
-- 结束前更新本文件并重新生成 CURRENT_HANDOFF.md。
+- 开始前校正 Git、台架 selector、目标固件和运行进程；硬件操作保持串行并遵守 HIL 锁。
+- 不把环境失败、旧叙述证据或未覆盖场景写成 PASS；关键证据写验证报告，交接只保留结论。
+- 结束前更新 project-memory.json、渲染 CURRENT_HANDOFF.md，并保持工作树与目标远端分支同步。

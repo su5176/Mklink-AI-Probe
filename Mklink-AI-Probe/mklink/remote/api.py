@@ -33,7 +33,7 @@ import secrets
 import sys
 import threading
 import time
-from typing import Any
+from typing import Annotated, Any
 import weakref
 
 from mklink.symbol_catalog import SymbolCatalogError
@@ -42,6 +42,8 @@ logger = logging.getLogger(__name__)
 
 _FILE_SOURCE_UPLOAD_LIMIT = 256 * 1024 * 1024
 _FILE_SOURCE_UPLOAD_CHUNK = 1024 * 1024
+_YMODEM_UPLOAD_LIMIT = 32 * 1024 * 1024
+_YMODEM_FILENAME_LIMIT = 31
 
 
 class BrowserSessionLease:
@@ -305,7 +307,7 @@ def _stop_dashboard_for_owner(owner: str) -> list[str]:
     managers = get_managers()
     manager = managers.get(manager_name)
     should_stop = (
-        getattr(manager, "running", False)
+        (manager is not None and _dashboard_worker_alive(manager))
         or owner in _OWNER_REQUIRES_STOP_EVEN_IF_NOT_RUNNING
     )
     if manager and should_stop:
@@ -660,6 +662,16 @@ def stop_dashboard_manager(state: dict[str, Any], dashboard: str, manager) -> No
     if error is not None:
         raise error
 
+
+async def stop_dashboard_manager_transaction(
+    state: dict[str, Any], dashboard: str, manager,
+) -> None:
+    """Serialize stop with start and keep blocking joins off the event loop."""
+    async with _dashboard_start_lock(state):
+        await asyncio.to_thread(
+            stop_dashboard_manager, state, dashboard, manager,
+        )
+
 # Eager-import FastAPI types so that typing.get_type_hints() can resolve
 # annotations in closures (e.g. the /ws handler).  The module can still be
 # imported without FastAPI — _check_fastapi() gates actual usage.
@@ -669,7 +681,7 @@ try:
         HTTPException, Query, Body, Request, File, UploadFile,
     )
     from fastapi.middleware.cors import CORSMiddleware  # noqa: F401
-    from pydantic import BaseModel                    # noqa: F401
+    from pydantic import BaseModel, StrictInt         # noqa: F401
 except ImportError:
     pass
 
@@ -713,7 +725,7 @@ def create_app(
         Request, File, UploadFile,
     )
     from fastapi.middleware.cors import CORSMiddleware
-    from pydantic import BaseModel
+    from pydantic import BaseModel, StrictInt
 
     from mklink.remote.server import DeviceDispatcher, make_response, make_error
     from mklink.project_config import (
@@ -878,6 +890,8 @@ def create_app(
     app.include_router(stream_api.create_stream_router(
         stream_registry, stream_types, auth_token,
     ))
+    from mklink.observe_bridge import install_stream_observation
+    install_stream_observation(app, stream_registry)
 
     from starlette.concurrency import run_in_threadpool
     from mklink.remote import online_flash_api
@@ -1200,9 +1214,9 @@ def create_app(
     async def rtt_find(
         source_path: str | None = Body(default=None, embed=True),
     ):
-        """Auto-detect RTT control block address from MAP/ELF file.
+        """Auto-detect RTT control block address from ELF/MAP file.
 
-        Scans the project for MAP files and resolves _SEGGER_RTT address.
+        Scans the project for ELF/MAP files and resolves _SEGGER_RTT address.
         If found, updates rtt_config automatically.
         """
         from mklink.project_config import (
@@ -1222,47 +1236,81 @@ def create_app(
             }
 
         project_root = _state["project_root"]
+        root = Path(project_root)
         project_info = load_keil_project(project_root) or {}
-        map_path = project_info.get("map_path")
-        if not map_path:
-            # Try common locations
-            from pathlib import Path
-            root = Path(project_root)
-            candidates = list(root.glob("**/*.map")) + list(root.glob("**/*.MAP"))
-            if candidates:
-                map_path = str(candidates[0])
 
-        if map_path:
-            result = await asyncio.to_thread(diagnose_rtt_addr, map_path)
-            if result.addr:
-                # Update rtt_config with found address
-                cfg = load_rtt_config(project_root) or {}
-                cfg["rtt_addr"] = result.addr
-                save_rtt_config(project_root, cfg)
-                return {
-                    "found": True,
+        configured_binary = []
+        configured_maps = []
+        for key in ("axf_path", "out_path", "map_path"):
+            value = project_info.get(key)
+            if not value:
+                continue
+            candidate = Path(value).expanduser()
+            if not candidate.is_absolute():
+                candidate = root / candidate
+            if not candidate.is_file():
+                continue
+            target = configured_maps if key == "map_path" else configured_binary
+            if candidate not in target:
+                target.append(candidate)
+
+        last_response = None
+
+        async def diagnose_sources(source_files):
+            nonlocal last_response
+            for source_file in source_files:
+                source_path = str(source_file)
+                result = await asyncio.to_thread(diagnose_rtt_addr, source_path)
+                response = {
+                    "found": bool(result.addr),
                     "addr": result.addr,
                     "source": result.source,
-                    "source_path": map_path,
+                    "source_path": source_path,
                     "details": result.details,
                     "warnings": result.warnings,
-                    "map_path": map_path,
                 }
-            return {
-                "found": False,
-                "addr": None,
-                "source": result.source,
-                "source_path": map_path,
-                "details": result.details,
-                "warnings": result.warnings,
-                "map_path": map_path,
-            }
+                if source_file.suffix.lower() == ".map":
+                    response["map_path"] = source_path
+                last_response = response
+                if result.addr:
+                    cfg = load_rtt_config(project_root) or {}
+                    cfg["rtt_addr"] = result.addr
+                    save_rtt_config(project_root, cfg)
+                    return response
+            return None
+
+        response = await diagnose_sources(configured_binary)
+        if response is not None:
+            return response
+
+        discovered_binary = []
+        discovered_maps = []
+        known_files = set(configured_binary + configured_maps)
+        for candidate in root.rglob("*"):
+            if not candidate.is_file() or candidate in known_files:
+                continue
+            suffix = candidate.suffix.lower()
+            if suffix in {".axf", ".elf", ".out"}:
+                discovered_binary.append(candidate)
+            elif suffix == ".map":
+                discovered_maps.append(candidate)
+
+        for source_files in (
+            sorted(discovered_binary),
+            configured_maps,
+            sorted(discovered_maps),
+        ):
+            response = await diagnose_sources(source_files)
+            if response is not None:
+                return response
+        if last_response is not None:
+            return last_response
         return {
             "found": False,
             "addr": None,
             "source": "",
             "source_path": None,
-            "details": ["未找到 MAP 文件"],
+            "details": ["未找到 AXF/ELF/OUT/MAP 文件"],
             "warnings": [],
         }
 
@@ -1530,26 +1578,27 @@ def create_app(
 
     async def _disconnect_shared_device() -> dict[str, object]:
         """Stop bridge dashboards and release the GUI-owned Device."""
-        async with device_disconnect_lock:
-            from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
+        async with _dashboard_start_lock(_state):
+            async with device_disconnect_lock:
+                from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
 
-            stopped = []
-            for name in BRIDGE_DASHBOARD_TYPES:
-                manager = dashboard_managers.get(name)
-                if manager is not None and _dashboard_worker_alive(manager):
-                    await run_in_threadpool(manager.stop)
-                    if _dashboard_worker_alive(manager):
-                        raise DashboardStopPending(name)
-                    stopped.append(name)
-                _state["resource_manager"].release(f"user:dashboard:{name}")
+                stopped = []
+                for name in BRIDGE_DASHBOARD_TYPES:
+                    manager = dashboard_managers.get(name)
+                    if manager is not None and _dashboard_worker_alive(manager):
+                        await run_in_threadpool(manager.stop)
+                        if _dashboard_worker_alive(manager):
+                            raise DashboardStopPending(name)
+                        stopped.append(name)
+                    _state["resource_manager"].release(f"user:dashboard:{name}")
 
-            device = _state["device"]
-            if device:
-                remember_device_connection(_state, device)
-                await run_in_threadpool(device.close)
-                _state["device"] = None
-                _state["dispatcher"] = None
-            return {"status": "disconnected", "stopped": stopped}
+                device = _state["device"]
+                if device:
+                    remember_device_connection(_state, device)
+                    await run_in_threadpool(device.close)
+                    _state["device"] = None
+                    _state["dispatcher"] = None
+                return {"status": "disconnected", "stopped": stopped}
 
     @app.post("/api/device/disconnect")
     async def disconnect_device():
@@ -1949,9 +1998,9 @@ def create_app(
     @app.post("/api/dash/rtt/start")
     async def rtt_start(
         addr: str | None = Body(default=None),
-        channel: int = Body(default=0),
-        mode: int = Body(default=0),
-        search_size: int = Body(default=1024),
+        channel: Annotated[StrictInt, Body()] = 0,
+        mode: Annotated[StrictInt, Body()] = 0,
+        search_size: Annotated[StrictInt, Body()] = 1024,
         encoding: str = Body(default="utf-8"),
     ):
         from mklink.remote.dashboards import normalize_rtt_encoding
@@ -1970,6 +2019,23 @@ def create_app(
                 status_code=400,
                 detail="Device not connected",
             )
+        try:
+            from mklink.device import DeviceError, _resolve_rtt_stream_parameters
+
+            addr, channel, search_size, mode = _resolve_rtt_stream_parameters(
+                addr,
+                channel,
+                search_size,
+                mode,
+                _state["project_root"],
+            )
+            validate_request = getattr(
+                _state["device"], "validate_rtt_stream_request", None,
+            )
+            if callable(validate_request):
+                validate_request(addr, search_size=search_size, mode=mode)
+        except (ValueError, DeviceError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         managers = get_managers()
         rtt = managers["rtt"]
         status, stopped = await start_dashboard_manager(
@@ -1999,7 +2065,9 @@ def create_app(
     @app.post("/api/dash/rtt/stop")
     async def rtt_stop():
         managers = get_managers()
-        stop_dashboard_manager(_state, "rtt", managers["rtt"])
+        await stop_dashboard_manager_transaction(
+            _state, "rtt", managers["rtt"],
+        )
         return {"status": "stopped"}
 
     @app.post("/api/dash/rtt/write")
@@ -2071,9 +2139,9 @@ def create_app(
     @app.post("/api/dash/systemview/start")
     async def systemview_start(
         addr: str | None = Body(default=None),
-        channel: int = Body(default=1),
-        mode: int = Body(default=0),
-        search_size: int = Body(default=1024),
+        channel: Annotated[StrictInt, Body()] = 1,
+        mode: Annotated[StrictInt, Body()] = 0,
+        search_size: Annotated[StrictInt, Body()] = 1024,
     ):
         if mode not in (0, 1):
             raise HTTPException(
@@ -2082,6 +2150,23 @@ def create_app(
             )
         if not _state["device"] or not _state["device"].connected:
             raise HTTPException(status_code=400, detail="Device not connected")
+        try:
+            from mklink.device import DeviceError, _resolve_rtt_stream_parameters
+
+            addr, channel, search_size, mode = _resolve_rtt_stream_parameters(
+                addr,
+                channel,
+                search_size,
+                mode,
+                _state["project_root"],
+            )
+            validate_request = getattr(
+                _state["device"], "validate_rtt_stream_request", None,
+            )
+            if callable(validate_request):
+                validate_request(addr, search_size=search_size, mode=mode)
+        except (ValueError, DeviceError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         managers = get_managers()
         sv = managers["systemview"]
         status, stopped = await start_dashboard_manager(
@@ -2101,7 +2186,9 @@ def create_app(
     @app.post("/api/dash/systemview/stop")
     async def systemview_stop():
         managers = get_managers()
-        stop_dashboard_manager(_state, "systemview", managers["systemview"])
+        await stop_dashboard_manager_transaction(
+            _state, "systemview", managers["systemview"],
+        )
         return {"status": "stopped"}
 
     @app.post("/api/dash/systemview/pause")
@@ -2207,11 +2294,8 @@ def create_app(
     @app.post("/api/dash/superwatch/stop")
     async def superwatch_stop():
         managers = get_managers()
-        await run_in_threadpool(
-            stop_dashboard_manager,
-            _state,
-            "superwatch",
-            managers["superwatch"],
+        await stop_dashboard_manager_transaction(
+            _state, "superwatch", managers["superwatch"],
         )
         return {"status": "stopped"}
 
@@ -2443,6 +2527,11 @@ def create_app(
         sm = managers["serial"]
         if not sm.running:
             raise HTTPException(status_code=400, detail="Serial monitor not running")
+        if sm.get_ymodem_status()["active"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Serial input is locked by an active YMODEM transfer",
+            )
         if hex:
             try:
                 data_bytes = bytes.fromhex(data.replace(" ", ""))
@@ -2453,7 +2542,77 @@ def create_app(
         success = sm.send(port, data_bytes)
         if success:
             return {"ok": True}
+        if sm.get_ymodem_status()["active"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Serial input is locked by an active YMODEM transfer",
+            )
         raise HTTPException(status_code=500, detail=f"Failed to send to {port}")
+
+    @app.post("/api/dash/serial/ymodem/start")
+    async def serial_ymodem_start(
+        port: str = Query(...),
+        file: UploadFile = File(...),
+    ):
+        """Upload one bounded file and transfer it over the already-open port."""
+        managers = get_managers()
+        sm = managers["serial"]
+        try:
+            if not sm.running:
+                raise HTTPException(status_code=400, detail="Serial monitor not running")
+            if sm.get_ymodem_status()["active"]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="a YMODEM transfer is already active",
+                )
+            filename = str(file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+            if not filename:
+                raise HTTPException(status_code=400, detail="YMODEM filename is required")
+            if any(ord(character) < 0x20 or ord(character) == 0x7F for character in filename):
+                raise HTTPException(
+                    status_code=400,
+                    detail="YMODEM filename contains control characters",
+                )
+            content = await file.read(_YMODEM_UPLOAD_LIMIT + 1)
+        finally:
+            await file.close()
+        if not content:
+            raise HTTPException(status_code=400, detail="YMODEM file is empty")
+        if len(content) > _YMODEM_UPLOAD_LIMIT:
+            raise HTTPException(
+                status_code=413,
+                detail="YMODEM file exceeds the 32 MiB upload limit",
+            )
+        filename_size = len(filename.encode("utf-8"))
+        if filename_size > _YMODEM_FILENAME_LIMIT:
+            raise HTTPException(
+                status_code=400,
+                detail="YMODEM filename exceeds the safe 31-byte limit",
+            )
+        header_size = filename_size + 1 + len(str(len(content))) + 1
+        if header_size > 128:
+            raise HTTPException(
+                status_code=400,
+                detail="YMODEM filename is too long for the protocol header",
+            )
+        try:
+            return sm.start_ymodem(port, content, filename)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+
+    @app.get("/api/dash/serial/ymodem/status")
+    async def serial_ymodem_status():
+        return get_managers()["serial"].get_ymodem_status()
+
+    @app.get("/api/dash/serial/ymodem/trace")
+    async def serial_ymodem_trace(after: int = 0, limit: int = 128):
+        return get_managers()["serial"].get_ymodem_trace(after, limit)
+
+    @app.post("/api/dash/serial/ymodem/cancel")
+    async def serial_ymodem_cancel():
+        return get_managers()["serial"].cancel_ymodem()
 
     @app.get("/api/dash/serial/status")
     async def serial_status():
@@ -2482,8 +2641,12 @@ def create_app(
         port: str = Body(...),
         slave: int = Body(default=1),
         baudrate: int = Body(default=9600),
+        bytesize: int = Body(default=8),
         parity: str = Body(default="N"),
         stopbits: int = Body(default=1),
+        timeout: float = Body(default=1.0),
+        retries: int = Body(default=0),
+        local_echo: bool = Body(default=False),
         registers: list[dict] | None = Body(default=None),
         interval: float = Body(default=1.0),
     ):
@@ -2510,9 +2673,38 @@ def create_app(
             )
 
         try:
+            port = str(port).strip()
+            parity = str(parity).strip().upper()
+            if not port:
+                raise ValueError("Serial port is required")
+            if isinstance(slave, bool) or not 1 <= int(slave) <= 247:
+                raise ValueError("Slave address must be in the range 1..247")
+            if isinstance(baudrate, bool) or not 300 <= int(baudrate) <= 4000000:
+                raise ValueError("Baud rate must be in the range 300..4000000")
+            if bytesize not in (7, 8):
+                raise ValueError("Data bits must be 7 or 8")
+            if parity not in ("N", "E", "O"):
+                raise ValueError("Parity must be N, E or O")
+            if stopbits not in (1, 2):
+                raise ValueError("Stop bits must be 1 or 2")
+            if not 0.05 <= float(timeout) <= 10.0:
+                raise ValueError("Timeout must be in the range 0.05..10 seconds")
+            if isinstance(retries, bool) or not 0 <= int(retries) <= 5:
+                raise ValueError("Retries must be in the range 0..5")
+            if not 0.02 <= float(interval) <= 3600.0:
+                raise ValueError("Polling interval must be in the range 0.02..3600 seconds")
             from mklink.modbus._client import ModbusClient
-            client = ModbusClient(port=port, baudrate=baudrate,
-                                  parity=parity, stopbits=stopbits)
+            client = ModbusClient(
+                port=port,
+                baudrate=int(baudrate),
+                bytesize=int(bytesize),
+                parity=parity,
+                stopbits=int(stopbits),
+                timeout=float(timeout),
+                retries=int(retries),
+                handle_local_echo=bool(local_echo),
+                trace_packet=mm.trace_packet,
+            )
             if not client.open():
                 raise HTTPException(
                     status_code=409,
@@ -2524,6 +2716,9 @@ def create_app(
         except HTTPException:
             release_resource_owner(_state, owner, stop_active=False)
             raise
+        except ValueError as e:
+            release_resource_owner(_state, owner, stop_active=False)
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             release_resource_owner(_state, owner, stop_active=False)
             raise HTTPException(status_code=500, detail=f"Modbus connect failed: {e}")
@@ -2531,7 +2726,23 @@ def create_app(
         loop = asyncio.get_event_loop()
         try:
             await loop.run_in_executor(
-                None, lambda: mm.start(client, slave, registers, interval)
+                None,
+                lambda: mm.start(
+                    client,
+                    int(slave),
+                    registers,
+                    float(interval),
+                    {
+                        "port": port,
+                        "baudrate": int(baudrate),
+                        "bytesize": int(bytesize),
+                        "parity": parity,
+                        "stopbits": int(stopbits),
+                        "timeout": float(timeout),
+                        "retries": int(retries),
+                        "local_echo": bool(local_echo),
+                    },
+                ),
             )
         except Exception:
             release_resource_owner(_state, owner, stop_active=True)
@@ -2579,6 +2790,65 @@ def create_app(
             return {"ok": True, "fc": fc, "start": start, "values": values}
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+    @app.post("/api/dash/modbus/transaction")
+    async def modbus_transaction(
+        fc: int = Body(...),
+        start: int = Body(...),
+        quantity: int | None = Body(default=None),
+        values: list[int | bool] | None = Body(default=None),
+    ):
+        mm = get_managers()["modbus"]
+        if not mm.running:
+            raise HTTPException(status_code=400, detail="Modbus not connected")
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                None,
+                lambda: mm.transaction(
+                    fc, start, quantity=quantity, values=values
+                ),
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except Exception as error:
+            raise HTTPException(status_code=502, detail=str(error))
+
+    @app.post("/api/dash/modbus/loop/start")
+    async def modbus_loop_start(
+        fc: int = Body(...),
+        start: int = Body(...),
+        quantity: int | None = Body(default=None),
+        values: list[int | bool] | None = Body(default=None),
+        interval: float = Body(default=1.0),
+        count: int = Body(default=0),
+    ):
+        mm = get_managers()["modbus"]
+        if not mm.running:
+            raise HTTPException(status_code=400, detail="Modbus not connected")
+        try:
+            # Validate before starting the background loop so callers get an
+            # immediate 400 response instead of a delayed SSE error.
+            from mklink.modbus._session import validate_transaction
+            validate_transaction(
+                fc, start, quantity=quantity, values=values
+            )
+            return mm.start_loop(
+                fc,
+                start,
+                quantity=quantity,
+                values=values,
+                interval=interval,
+                count=count,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except RuntimeError as error:
+            raise HTTPException(status_code=409, detail=str(error))
+
+    @app.post("/api/dash/modbus/loop/stop")
+    async def modbus_loop_stop():
+        return get_managers()["modbus"].stop_loop()
 
     @app.get("/api/dash/modbus/status")
     async def modbus_status():
@@ -2644,7 +2914,9 @@ def create_app(
     @app.post("/api/dash/vofa/stop")
     async def vofa_stop():
         managers = get_managers()
-        stop_dashboard_manager(_state, "vofa", managers["vofa"])
+        await stop_dashboard_manager_transaction(
+            _state, "vofa", managers["vofa"],
+        )
         return {"status": "stopped"}
 
     @app.post("/api/dash/vofa/pause")
@@ -3158,6 +3430,20 @@ def create_app(
     if _gui_dist.is_dir():
         import mimetypes
 
+        # Windows registry MIME overrides must not stop ES modules or CSS loading.
+        _gui_mime_types = {
+            ".js": "application/javascript",
+            ".mjs": "application/javascript",
+            ".css": "text/css",
+        }
+
+        def _gui_media_type(path: _Path) -> str:
+            return (
+                _gui_mime_types.get(path.suffix.lower())
+                or mimetypes.guess_type(str(path))[0]
+                or "application/octet-stream"
+            )
+
         _app_shell_headers = {
             "Cache-Control": "no-store, max-age=0",
             "Pragma": "no-cache",
@@ -3181,10 +3467,9 @@ def create_app(
         async def serve_assets(file_path: str):
             f = _gui_dist / "assets" / file_path
             if f.is_file():
-                ct, _ = mimetypes.guess_type(str(f))
                 return FileResponse(
                     f,
-                    media_type=ct or "application/octet-stream",
+                    media_type=_gui_media_type(f),
                     headers=_asset_headers,
                 )
             from fastapi.responses import JSONResponse
@@ -3194,10 +3479,9 @@ def create_app(
         async def serve_spa(full_path: str):
             candidate = _gui_dist / full_path
             if full_path and candidate.is_file():
-                ct, _ = mimetypes.guess_type(str(candidate))
                 return FileResponse(
                     candidate,
-                    media_type=ct or "application/octet-stream",
+                    media_type=_gui_media_type(candidate),
                     headers=_static_headers,
                 )
             return FileResponse(
@@ -3240,7 +3524,11 @@ def run_server(
     import uvicorn
 
     if app is None:
-        app = create_app(auth_token=auth_token, project_root=project_root)
+        app = create_app(
+            auth_token=auth_token,
+            project_root=project_root,
+            desktop_instance_id=desktop_instance_id,
+        )
 
     if auto_connect:
         import mklink
@@ -3277,7 +3565,27 @@ def run_server(
         except Exception as e:
             logger.warning("Auto-connect failed: %s", e)
 
+    from mklink.observe_bridge import configure_stream_observation
+
+    mklink_state = getattr(app.state, "mklink_state", {})
+    observation_token = (
+        auth_token
+        if auth_token is not None
+        else mklink_state.get("auth_token")
+    )
+    observation_correlation = (
+        desktop_instance_id
+        or mklink_state.get("desktop_instance_id")
+    )
+
     if desktop_port_end is None:
+        configure_stream_observation(
+            app,
+            host=host,
+            port=port,
+            auth_token=observation_token,
+            private_correlation=observation_correlation,
+        )
         browser_sessions = getattr(app.state, "browser_sessions", None)
         if browser_sessions is None:
             uvicorn.run(app, host=host, port=port, log_level="info")
@@ -3296,6 +3604,13 @@ def run_server(
         host, port, desktop_port_end,
     )
     try:
+        configure_stream_observation(
+            app,
+            host=host,
+            port=selected_port,
+            auth_token=observation_token,
+            private_correlation=observation_correlation,
+        )
         _write_desktop_runtime_info(
             desktop_runtime_info,
             port=selected_port,

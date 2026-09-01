@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref, onMounted } from 'vue'
+import { computed, reactive, ref, onMounted, onUnmounted } from 'vue'
 import { Download, RefreshCw, RotateCcw, Tag, Unplug, Usb } from '@lucide/vue'
 import { invoke } from '@tauri-apps/api/core'
 import { useMklinkApi } from '../composables/useMklinkApi'
@@ -14,8 +14,9 @@ import {
   saveDesktopSettings,
   type DesktopSettings,
 } from '../lib/desktopSettings'
-import { pickMapFile, pickSymbolFile, type PickedFile } from '../lib/filePicker'
+import { pickSymbolFile, type PickedFile } from '../lib/filePicker'
 import { saveBlobFile } from '../lib/downloadTextFile'
+import { refreshRttAddressForSymbol } from '../lib/rttSymbolAddress'
 import { IS_TAURI } from '../lib/runtimeEndpoint'
 import type { AxlStatus, FileSourceKind, PortInfo, ProbeFirmwareCheck, ProbeFirmwareUpgrade, ProjectConfig } from '../types/mklink'
 import ConfigSectionNav, { type ConfigSection } from '../components/config/ConfigSectionNav.vue'
@@ -30,6 +31,7 @@ const {
   connectDevice,
   disconnectDevice,
   parseAxf,
+  findRtt,
   probeFirmwareCheck,
   upgradeProbeFirmware,
   downloadProbeFirmware,
@@ -51,6 +53,8 @@ const connecting = ref(false)
 const disconnecting = ref(false)
 const browsingFiles = ref(false)
 const parsingSymbols = ref(false)
+let symbolParseGeneration = 0
+let disposed = false
 const localSaveState = ref<'idle' | 'saving' | 'saved'>('idle')
 
 const remoteUrl = ref('ws://127.0.0.1:8765')
@@ -161,6 +165,14 @@ async function connectLocal() {
       localPortExplicit.value = false
       config.value = { ...config.value, com_port: connectedPort }
     }
+    const symbolPath = settings.value.symbolPath.trim()
+    if (
+      isSymbolFilePath(symbolPath)
+      && deviceStatus.value.axf?.loaded
+      && isSameFileSourcePath(symbolPath, deviceStatus.value.axf.axf_path)
+    ) {
+      await refreshRttForSymbols(symbolPath)
+    }
   } catch (error: any) {
     localPort.value = ''
     localPortExplicit.value = false
@@ -224,10 +236,11 @@ async function selectedFilePath(
 }
 
 async function browseSymbolFile() {
+  if (browsingFiles.value || parsingSymbols.value) return
   browsingFiles.value = true
   try {
     const source = await selectedFilePath('symbol', await pickSymbolFile())
-    if (source) updateFilePath('symbol', source.path, source.displayPath)
+    if (source) updateFilePath(source.path, source.displayPath)
   } catch (error: any) {
     toast.error(tr('加载 AXF / ELF 文件失败: ', 'Failed to load AXF / ELF file: ') + error.message)
   } finally {
@@ -235,63 +248,78 @@ async function browseSymbolFile() {
   }
 }
 
-async function browseMapFile() {
-  browsingFiles.value = true
+function updateFilePath(value: string, displayPath = value) {
+  symbolParseGeneration++
+  parsingSymbols.value = false
   try {
-    const source = await selectedFilePath('map', await pickMapFile())
-    if (source) updateFilePath('map', source.path, source.displayPath)
-  } catch (error: any) {
-    toast.error(tr('加载 MAP 文件失败: ', 'Failed to load MAP file: ') + error.message)
-  } finally {
-    browsingFiles.value = false
-  }
-}
-
-function persistFilePaths() {
-  try {
-    saveDesktopSettings(window.localStorage, settings.value)
+    const latest = loadDesktopSettings(window.localStorage)
+    const sourceChanged = !isSameFileSourcePath(latest.symbolPath, value)
+    settings.value = saveDesktopSettings(window.localStorage, {
+      ...latest,
+      symbolPath: value,
+      symbolDisplayPath: displayPath === value ? '' : displayPath,
+      rttAddress: sourceChanged ? '' : latest.rttAddress,
+    })
   } catch (error: any) {
     toast.error(tr('保存文件路径失败: ', 'Failed to save file paths: ') + error.message)
   }
 }
 
-function updateFilePath(kind: 'symbol' | 'map', value: string, displayPath = value) {
-  if (kind === 'symbol') {
-    settings.value.symbolPath = value
-    settings.value.symbolDisplayPath = displayPath === value ? '' : displayPath
-  } else {
-    settings.value.mapPath = value
-    settings.value.mapDisplayPath = displayPath === value ? '' : displayPath
+async function refreshRttForSymbols(sourcePath: string) {
+  const refreshed = await refreshRttAddressForSymbol(
+    window.localStorage,
+    sourcePath,
+    findRtt,
+  )
+  settings.value = refreshed.settings
+  if (refreshed.error) {
+    toast.warn(
+      tr('AXF 已加载，但 RTT 地址自动刷新失败: ', 'AXF loaded, but automatic RTT address refresh failed: ')
+      + (refreshed.error instanceof Error ? refreshed.error.message : String(refreshed.error)),
+    )
   }
-  persistFilePaths()
 }
 
 async function parseSymbols() {
   if (!deviceStatus.value.connected || !isSymbolFilePath(settings.value.symbolPath)) return
+  const requestedPath = settings.value.symbolPath.trim()
+  const generation = ++symbolParseGeneration
   parsingSymbols.value = true
   try {
-    const requestedPath = settings.value.symbolPath.trim()
     const result = await parseAxf(requestedPath) as AxlStatus
+    if (!isActiveSymbolParse(generation, requestedPath)) return
     if (result.loaded) {
       if (!isSameFileSourcePath(requestedPath, result.axf_path)) {
         toast.error(tr(`AXF 解析失败: 后端仍在使用 ${result.axf_path || '未知文件'}`, `AXF parsing failed: backend is still using ${result.axf_path || 'an unknown file'}`))
         return
       }
+      await refreshRttForSymbols(requestedPath)
+      if (!isActiveSymbolParse(generation, requestedPath)) return
       try {
         await symbolCatalog.ensureLoaded(true)
       } catch (error: any) {
+        if (!isActiveSymbolParse(generation, requestedPath)) return
         toast.error(tr('符号目录刷新失败: ', 'Failed to refresh symbol catalog: ') + error.message)
         return
       }
+      if (!isActiveSymbolParse(generation, requestedPath)) return
       toast.success(tr(`AXF 解析成功: ${result.variable_count || 0} 个固定可读变量`, `AXF parsed: ${result.variable_count || 0} fixed readable variables`))
     } else {
       toast.error(tr('AXF 解析失败', 'AXF parsing failed'))
     }
   } catch (error: any) {
-    toast.error(tr('AXF 解析失败: ', 'AXF parsing failed: ') + error.message)
+    if (isActiveSymbolParse(generation, requestedPath)) {
+      toast.error(tr('AXF 解析失败: ', 'AXF parsing failed: ') + error.message)
+    }
   } finally {
-    parsingSymbols.value = false
+    if (generation === symbolParseGeneration) parsingSymbols.value = false
   }
+}
+
+function isActiveSymbolParse(generation: number, requestedPath: string): boolean {
+  return !disposed
+    && generation === symbolParseGeneration
+    && isSameFileSourcePath(requestedPath, settings.value.symbolPath)
 }
 
 function connectRemote() {
@@ -398,6 +426,11 @@ onMounted(async () => {
   if (restoredPort && !portOptions.value.some(option => option.value === restoredPort)) {
     localPort.value = ''
   }
+})
+
+onUnmounted(() => {
+  disposed = true
+  symbolParseGeneration++
 })
 </script>
 
@@ -518,16 +551,12 @@ onMounted(async () => {
         v-else-if="activeSection === 'files'"
         :symbol-path="settings.symbolPath"
         :symbol-display-path="settings.symbolDisplayPath"
-        :map-path="settings.mapPath"
-        :map-display-path="settings.mapDisplayPath"
         :connected="deviceStatus.connected"
         :symbol-status="deviceStatus.axf"
         :browsing="browsingFiles"
         :parsing="parsingSymbols"
-        @update:symbol-path="updateFilePath('symbol', $event)"
-        @update:map-path="updateFilePath('map', $event)"
+        @update:symbol-path="updateFilePath($event)"
         @browse-symbol="browseSymbolFile"
-        @browse-map="browseMapFile"
         @parse="parseSymbols"
       />
 

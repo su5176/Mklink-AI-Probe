@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
+
+
+if TYPE_CHECKING:
+    from mklink.bridge import MKLinkSerialBridge
 
 
 _HEX_DUMP_HEADER_RE = re.compile(

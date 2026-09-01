@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from mklink import bridge as bridge_module
 from mklink.bridge import MKLinkSerialBridge
+from mklink._types import DeviceState
 
 
 def test_mklink_bridges_lock_each_cmd_port_independently(tmp_path, monkeypatch):
@@ -22,6 +23,33 @@ def test_mklink_bridges_lock_each_cmd_port_independently(tmp_path, monkeypatch):
         first._port_lock.release()
 
 
+def test_reader_uses_available_bytes_without_waiting_for_a_fixed_4096_chunk():
+    bridge = MKLinkSerialBridge("TEST_STREAM")
+
+    class SerialPort:
+        def __init__(self):
+            self.waiting = iter((0, 100, 70000))
+            self.read_sizes = []
+
+        @property
+        def in_waiting(self):
+            return next(self.waiting)
+
+        def read(self, size):
+            self.read_sizes.append(size)
+            if len(self.read_sizes) == 3:
+                bridge._running = False
+            return b"x"
+
+    serial_port = SerialPort()
+    bridge._serial = serial_port
+    bridge._ctx.state = DeviceState.DUMP_STREAM
+    bridge._running = True
+
+    bridge._reader_loop()
+
+    assert serial_port.read_sizes == [1, 100, 65536]
+    assert bridge.drain_stream_bytes() == b"xxx"
 def test_connect_uses_staged_fast_timeouts_before_stream_recovery(monkeypatch):
     class PortLock:
         def acquire(self):

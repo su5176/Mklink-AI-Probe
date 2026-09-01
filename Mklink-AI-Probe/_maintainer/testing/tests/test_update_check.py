@@ -1,6 +1,28 @@
 from mklink import mcp_server, update_check
 
 
+def test_runtime_update_cache_uses_explicit_task_cache(monkeypatch, tmp_path):
+    cache_root = tmp_path / "task-cache"
+    monkeypatch.setenv("MKLINK_CACHE_DIR", str(cache_root))
+
+    assert update_check.default_cache_file() == (
+        cache_root / "mklink-ai-probe" / "skill-update-check.json"
+    )
+
+
+def test_runtime_update_cache_uses_build_workspace(monkeypatch, tmp_path):
+    monkeypatch.delenv("MKLINK_CACHE_DIR", raising=False)
+    monkeypatch.setenv("MKLINK_BUILD_ROOT", str(tmp_path / "build"))
+
+    assert update_check.default_cache_file() == (
+        tmp_path
+        / "build"
+        / "cache"
+        / "mklink-ai-probe"
+        / "skill-update-check.json"
+    )
+
+
 def test_runtime_manifest_sources_prefer_github_and_fall_back_to_gitee(monkeypatch):
     github, gitee = update_check.DEFAULT_MANIFEST_URLS
     assert github == (

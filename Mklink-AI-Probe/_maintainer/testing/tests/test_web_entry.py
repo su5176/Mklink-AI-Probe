@@ -602,10 +602,16 @@ def test_windows_install_writes_only_the_user_protocol_keys(tmp_path, monkeypatc
     )
 
     assert result["status"] == "installed"
-    assert (r"Software\Classes\mklink-ai-probe", "URL Protocol") in values
-    assert values[(r"Software\Classes\mklink-ai-probe", "Mklink Web Entry Owner")]
-    command_key = (r"Software\Classes\mklink-ai-probe\shell\open\command", "")
-    assert '"%1"' in values[command_key]
+    base = r"Software\Classes\mklink-ai-probe"
+    assert values[(base, "URL Protocol")] == ""
+    assert values[(base, "FriendlyTypeName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base, "ApplicationName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base + r"\Application", "ApplicationName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base + r"\Application", "ApplicationDescription")] == web_entry.WINDOWS_DESCRIPTION
+    command = values[(base + r"\shell\open\command", "")]
+    assert "pythonw.exe" in command
+    assert str(tmp_path / "data" / "handler.py") in command
+    assert '"%1"' in command
 
 
 def test_windows_uninstall_preserves_a_foreign_protocol_registration(tmp_path, monkeypatch):

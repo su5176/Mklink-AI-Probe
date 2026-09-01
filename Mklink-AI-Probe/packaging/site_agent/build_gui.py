@@ -1,19 +1,20 @@
-"""Build the v0.1.8 portable Site Agent GUI bundle."""
+"""Build the v0.1.9 portable Site Agent GUI bundle."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import struct
 import zipfile
 from pathlib import Path, PurePosixPath
 
 
-BUNDLE_VERSION = "0.1.8"
-CORE_VERSION = "0.1.8"
-ROOT_NAME = "MKLink-Site-Agent-v0.1.8-windows-x86_64-portable"
+BUNDLE_VERSION = "0.1.9"
+CORE_VERSION = "0.1.9"
+ROOT_NAME = "MKLink-Site-Agent-v0.1.9-windows-x86_64-portable"
 ZIP_NAME = f"{ROOT_NAME}.zip"
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 FIXED_FILE_MODE = 0o100644
@@ -291,6 +292,15 @@ def main() -> int:
         default=Path(__file__).resolve().parents[2] / "site-agent-gui",
     )
     args = parser.parse_args()
+    if os.name == "nt":
+        storage = os.environ.get("MKLINK_BUILD_ROOT")
+        if not storage:
+            parser.error("run via scripts/build_workspace.ps1 -Action run")
+        storage_root = Path(storage).resolve()
+        if storage_root.drive.casefold() in {"c:", os.environ.get("SystemDrive", "C:").casefold()}:
+            parser.error("build storage must not be on C: or the Windows system drive")
+        if not args.output.resolve().is_relative_to(storage_root):
+            parser.error("--output must be inside MKLINK_BUILD_ROOT")
     candidate, manifest = build_portable(
         output=args.output,
         core_zip=args.core_zip,

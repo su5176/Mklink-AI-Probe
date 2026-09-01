@@ -46,6 +46,11 @@ python -m mklink web-entry install --quick-launch
 - macOS：`~/Applications/Mklink AI Probe Web Launcher.app`
 - Linux：`~/.local/share/applications/mklink-ai-probe-web.desktop`
 
+Windows 协议处理器仍由完整 Skill/runtime 的 Python Web handler 执行；注册时同时
+写入 `MKLink Web GUI` 友好名称，浏览器授权框不应显示成“打开 Python”。不要把
+协议改绑到 Windows 桌面上位机：U 盘入口必须继续支持未安装桌面程序的 Windows、
+macOS 和 Linux 用户。
+
 skill/runtime 更新或安装目录变化后重新执行 `web-entry install`，使协议处理器指向新的绝对路径。
 
 同一份 HTML 在三个系统上的本机准备如下：
@@ -107,7 +112,8 @@ python -m mklink web-entry uninstall
 
 - Windows 10/11。
 - Edge、Chrome 或其他支持自定义协议的浏览器。
-- 首次点击时确认“打开 Mklink AI Probe Web Launcher”。
+- 首次点击时确认“打开 MKLink Web GUI”；若仍显示“打开 Python”，重新执行
+  `python -m mklink web-entry install` 刷新当前用户的协议元数据。
 
 ### macOS
 

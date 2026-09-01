@@ -15,6 +15,8 @@ export interface TargetRecord {
   pack_version: string | null
   installed: boolean
   source: string
+  family: string
+  series: string
 }
 
 export interface TargetMemoryRegion {
@@ -38,6 +40,17 @@ export interface CustomFlmRecord {
   flash_size: number
   page_size: number
   sector_sizes: Array<[number, number]>
+}
+
+export interface FlashAlgorithmRecord {
+  algorithm_id: string
+  target_part: string
+  file_name: string
+  flash_start: number
+  flash_size: number
+  default: boolean
+  source_kind: 'installed-pack' | 'builtin-pack' | 'daplink-builtin' | 'pyocd-builtin' | 'custom-flm' | 'hpm-rom-api' | string
+  source_name: string
 }
 
 export interface ImageSegment {
