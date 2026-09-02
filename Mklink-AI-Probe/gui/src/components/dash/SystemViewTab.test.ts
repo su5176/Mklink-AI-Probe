@@ -409,6 +409,43 @@ describe('SystemViewTab asynchronous lifecycle', () => {
     wrapper.unmount()
   })
 
+  it('shows one visible recovery notice and resets the failed first-start burst', async () => {
+    mocks.dash.getStatus.mockResolvedValue({ running: false })
+    const wrapper = mount(SystemViewTab, { props: { deviceConnected: true } })
+    await flushPromises()
+    const resetsBeforeRetry = mocks.binary.reset.mock.calls.length
+
+    mocks.status.data.value = [{
+      _streamSeq: 1,
+      event: 'status',
+      connection_generation: 3,
+      session_generation: 7,
+      auto_retry_count: 1,
+      auto_retry_reason: 'first_start_data_then_idle',
+      stats: { events: 0 },
+    }] as never[]
+    await nextTick()
+
+    const recovery = wrapper.get('[data-testid="systemview-auto-retry"]')
+    expect(recovery.text()).toContain('首次启动已自动重试')
+    expect(recovery.get('b').attributes('title')).toBe('first_start_data_then_idle')
+    expect(mocks.binary.reset).toHaveBeenCalledTimes(resetsBeforeRetry + 1)
+
+    mocks.status.data.value = [{
+      _streamSeq: 2,
+      event: 'status',
+      connection_generation: 3,
+      session_generation: 7,
+      auto_retry_count: 1,
+      auto_retry_reason: 'first_start_data_then_idle',
+      stats: { events: 10 },
+    }] as never[]
+    await nextTick()
+    expect(mocks.binary.reset).toHaveBeenCalledTimes(resetsBeforeRetry + 1)
+
+    wrapper.unmount()
+  })
+
   it('does not connect when a running-trace start resolves after unmount', async () => {
     const started = deferred<void>()
     mocks.dash.getStatus.mockResolvedValue({ running: true })

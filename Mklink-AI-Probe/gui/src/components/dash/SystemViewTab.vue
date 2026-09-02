@@ -134,6 +134,10 @@
           <span>Sync</span>
           <b>{{ meta.synced || dash.state.value !== 'running' ? 'Ready' : 'Unsynced' }}</b>
         </div>
+        <div v-if="meta.autoRetryCount > 0" data-testid="systemview-auto-retry" class="sv-health-card warn">
+          <span>Recovery</span>
+          <b :title="meta.autoRetryStopError || meta.autoRetryReason">{{ tr('首次启动已自动重试', 'First start retried') }}</b>
+        </div>
         <div v-if="analysisBufferCount" class="sv-health-card">
           <span>Analysis Buffer</span>
           <b>{{ analysisBufferCount.toLocaleString() }}</b>
@@ -392,7 +396,13 @@ const meta = reactive({
   recordingPath: '',
   recordingSummaryPath: '',
   recordingError: '',
+  connectionGeneration: 0,
+  sessionGeneration: 0,
+  autoRetryCount: 0,
+  autoRetryReason: '',
+  autoRetryStopError: '',
 })
+let lastAutoRetryKey = ''
 let lastStreamSeq = 0
 const totalEventCount = ref(0)
 const windowUs = ref(10_000_000)
@@ -890,6 +900,7 @@ async function reconnectRunningTrace(generation: number) {
     const status = await dash.getStatus()
     if (!operationIsActive(generation)) return
     if (status?.running) {
+      applySessionStatus(status)
       applyTargetOverflowStatus(status)
       if (status.synced !== undefined) meta.synced = !!status.synced
       if (status.cpu_freq !== undefined) meta.cpuFreq = Number(status.cpu_freq) || 0
@@ -918,6 +929,7 @@ watch(statusData, (nw) => {
   const fresh = takeNewStreamPoints(nw as any[], lastStreamSeq)
   for (const dp of fresh.points as any[]) {
     const evt = dp.event || dp._event
+    applySessionStatus(dp)
     applyTargetOverflowStatus(dp)
     if (dp.synced !== undefined) meta.synced = !!dp.synced
     if (dp.dropped_bytes !== undefined) meta.sessionDropped = dp.dropped_bytes + (dp.dropped_packets || 0)
@@ -1080,6 +1092,33 @@ function applyTargetOverflowStatus(status: Record<string, unknown>): void {
   }
 }
 
+function applySessionStatus(status: Record<string, unknown>): void {
+  const connectionGeneration = Number(status.connection_generation)
+  const sessionGeneration = Number(status.session_generation)
+  const autoRetryCount = Number(status.auto_retry_count)
+  const retryCount = Number.isFinite(autoRetryCount)
+    ? Math.max(0, Math.trunc(autoRetryCount))
+    : 0
+  const retryKey = retryCount > 0 && Number.isFinite(sessionGeneration)
+    ? `${Math.trunc(sessionGeneration)}:${retryCount}`
+    : ''
+  if (retryKey && retryKey !== lastAutoRetryKey) {
+    lastAutoRetryKey = retryKey
+    // Discard the failed reset burst so the replacement session owns one
+    // coherent timeline and event count.
+    clearAll()
+  }
+  if (Number.isFinite(connectionGeneration)) {
+    meta.connectionGeneration = Math.trunc(connectionGeneration)
+  }
+  if (Number.isFinite(sessionGeneration)) {
+    meta.sessionGeneration = Math.trunc(sessionGeneration)
+  }
+  meta.autoRetryCount = retryCount
+  meta.autoRetryReason = String(status.auto_retry_reason || '')
+  meta.autoRetryStopError = String(status.auto_retry_stop_error || '')
+}
+
 function hexId(id: number) { return '0x' + (id >>> 0).toString(16).toUpperCase() }
 function fmtCpuFreq(freq: number) {
   return freq >= 1_000_000 ? (freq / 1_000_000).toFixed(0) + 'MHz' : freq.toLocaleString() + 'Hz'
@@ -1138,6 +1177,11 @@ function clearAll() {
   meta.recordingPath = ''
   meta.recordingSummaryPath = ''
   meta.recordingError = ''
+  meta.connectionGeneration = 0
+  meta.sessionGeneration = 0
+  meta.autoRetryCount = 0
+  meta.autoRetryReason = ''
+  meta.autoRetryStopError = ''
 }
 
 async function refreshLogList() {
@@ -1373,6 +1417,7 @@ async function waitForSystemViewReady(generation: number, timeoutMs = 8_000): Pr
     try {
       const status = await dash.getStatus()
       if (!operationIsActive(generation)) return false
+      applySessionStatus(status)
       if (status?.progress_state === 'error') {
         runtimeError.value = status.progress_error || tr('SystemView 启动失败', 'SystemView startup failed')
         return false

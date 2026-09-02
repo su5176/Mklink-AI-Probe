@@ -59,6 +59,7 @@ def _sum_counter_snapshots(base: dict[str, int], current: dict[str, int]) -> dic
 logger = logging.getLogger(__name__)
 _RTT_DELIVERY_INTERVAL = 1.0 / 50.0
 _SYSTEMVIEW_DELIVERY_INTERVAL = 1.0 / 30.0
+_SYSTEMVIEW_FIRST_START_MAX_RETRIES = 1
 _YMODEM_STOP_TIMEOUT = 3.0
 _RUNTIME_CPU_FREQ_SOURCES = {"SystemCoreClock", "hpm_core_clock"}
 SUPPORTED_RTT_ENCODINGS = ("utf-8", "gb2312", "gbk", "gb18030", "big5")
@@ -706,6 +707,17 @@ class SystemViewStreamManager:
         self._progress_state = "idle"
         self._progress_error = ""
         self._raw_bytes_without_events = 0
+        # A Device instance represents one physical/logical probe connection.
+        # Keep the first-start workaround scoped to that connection instead of
+        # restarting every later stream that happens to go idle.
+        self._connection_device = None
+        self._connection_generation = 0
+        self._connection_start_seen = False
+        self._session_generation = 0
+        self._first_start_on_connection = False
+        self._auto_retry_count = 0
+        self._auto_retry_reason = ""
+        self._auto_retry_stop_error = ""
 
     @property
     def running(self) -> bool:
@@ -730,6 +742,19 @@ class SystemViewStreamManager:
                 return
             raise RuntimeError("SystemView worker thread is still active")
 
+        if self._connection_device is not device:
+            self._connection_device = device
+            self._connection_generation += 1
+            self._connection_start_seen = False
+        first_start_on_connection = not self._connection_start_seen
+        self._connection_start_seen = True
+        self._session_generation += 1
+        session_generation = self._session_generation
+        self._first_start_on_connection = first_start_on_connection
+        self._auto_retry_count = 0
+        self._auto_retry_reason = ""
+        self._auto_retry_stop_error = ""
+
         stop_event = threading.Event()
         generation = object()
         self._stop_event = stop_event
@@ -740,6 +765,7 @@ class SystemViewStreamManager:
         self._stats = {"events": 0, "bytes": 0}
         self._resolved_task_names.clear()
         self._name_resolution_attempted.clear()
+        self._name_resolution_disabled = False
         self._last_name_resolution = 0.0
         self._cpu_freq_source = ""
         with self._recording_lock:
@@ -769,12 +795,19 @@ class SystemViewStreamManager:
                 )
                 initialized = True
                 self._apply_cpu_freq_hint(device, start_result)
-                start_time = time.time()
-                empty_cycles = 0
+                # 会话总时长与空闲看门狗分离:deadline 只管理 duration,任何
+                # 恢复动作都不延长它;看门狗以"最后一次收到数据"为基准,统一
+                # 裁决空读与读异常——START 突发排空后的亚秒级静默(探针按批
+                # 转发的正常间隙)和单次瞬时读异常都不会误杀健康流,而持续
+                # 无数据会按"从未收到过 / 流中断"如实终止。
+                deadline_mono = time.monotonic() + max(0.0, duration)
+                last_data_mono = time.monotonic()
+                had_data = False
+                attempt_had_data = False
+                retry_count = 0
                 no_event_started = None
-                last_read_error = None
                 while not stop_event.is_set():
-                    if time.time() - start_time > duration:
+                    if time.monotonic() >= deadline_mono:
                         break
                     if not self._paused.is_set():
                         time.sleep(0.05)
@@ -785,37 +818,120 @@ class SystemViewStreamManager:
                             max_bytes=64 * 1024,
                         )
                     except Exception as exc:
-                        last_read_error = exc
-                        if time.time() - start_time >= self._startup_no_data_timeout_s:
+                        if time.monotonic() - last_data_mono >= self._startup_no_data_timeout_s:
                             raise RuntimeError(
                                 f"SystemView 读取失败: {exc}"
                             ) from exc
                         time.sleep(0.1)
                         continue
                     if not raw:
-                        empty_cycles += 1
-                        if empty_cycles == 4:
-                            try:
-                                device.systemview_stop()
-                                time.sleep(0.5)
-                                start_result = device.systemview_start(
-                                    addr, channel=channel, mode=mode,
-                                    search_size=search_size,
+                        idle = time.monotonic() - last_data_mono
+                        if idle >= self._startup_no_data_timeout_s:
+                            # 探针固件的首次附着可能复位目标(表现为 START
+                            # 突发排干后流静默,第二次启动即正常)。范围严格限定
+                            # 为每个 Device 连接首会话的一次可见自动重试；达到
+                            # 上限后如实终止并注明。
+                            if (
+                                had_data
+                                and first_start_on_connection
+                                and retry_count < _SYSTEMVIEW_FIRST_START_MAX_RETRIES
+                            ):
+                                retry_count += 1
+                                self._auto_retry_count = retry_count
+                                self._auto_retry_reason = (
+                                    "first_start_data_then_idle"
                                 )
-                                self._apply_cpu_freq_hint(device, start_result)
-                            except Exception as exc:
-                                last_read_error = exc
-                        if time.time() - start_time >= self._startup_no_data_timeout_s:
-                            detail = (
-                                f"：{last_read_error}" if last_read_error is not None else ""
-                            )
+                                logger.warning(
+                                    "SystemView 连接代次 %d 的首次启动疑似触发"
+                                    "探针附着复位,自动重启会话重试 %d/%d",
+                                    self._connection_generation,
+                                    retry_count,
+                                    _SYSTEMVIEW_FIRST_START_MAX_RETRIES,
+                                )
+                                stop_error = None
+                                try:
+                                    device.systemview_stop()
+                                except Exception as exc:
+                                    stop_error = exc
+                                    stop_text = str(exc)
+                                    if self._auto_retry_stop_error:
+                                        self._auto_retry_stop_error += "; " + stop_text
+                                    else:
+                                        self._auto_retry_stop_error = stop_text
+                                    logger.warning(
+                                        "SystemView 首次启动自动重试前停止失败: %s",
+                                        exc,
+                                    )
+                                # The failed burst belongs to the reset trace,
+                                # not the replacement session. Reset all parser-
+                                # generation state so the GUI receives one clean
+                                # timeline after the bounded retry.
+                                self._parser = self._create_parser(device)
+                                self._history.clear()
+                                self._stats = {"events": 0, "bytes": 0}
+                                self._resolved_task_names.clear()
+                                self._name_resolution_attempted.clear()
+                                self._name_resolution_disabled = False
+                                self._last_name_resolution = 0.0
+                                self._target_overflow_events = 0
+                                self._target_drop_count_baseline = None
+                                self._target_drop_count = None
+                                self._raw_bytes_without_events = 0
+                                no_event_started = None
+                                attempt_had_data = False
+                                self._progress_state = "starting"
+                                self._bridge.put({
+                                    "event": "status",
+                                    "stats": dict(self._stats),
+                                    "history_size": 0,
+                                    **self._status_meta(),
+                                })
+                                try:
+                                    retry_result = device.systemview_start(
+                                        addr, channel=channel, mode=mode,
+                                        search_size=search_size,
+                                    )
+                                    self._apply_cpu_freq_hint(
+                                        device, retry_result,
+                                    )
+                                except Exception as exc:
+                                    stop_detail = (
+                                        "; retry stop also failed: %s" % stop_error
+                                        if stop_error is not None else ""
+                                    )
+                                    raise RuntimeError(
+                                        "SystemView 首次启动自动重试失败: %s%s"
+                                        % (exc, stop_detail)
+                                    ) from exc
+                                last_data_mono = time.monotonic()
+                                continue
+                            if had_data:
+                                if retry_count and not attempt_had_data:
+                                    raise RuntimeError(
+                                        "SystemView 首次启动自动重试 "
+                                        f"{retry_count} 次后仍未收到数据"
+                                        + (
+                                            "(重试前 stop 失败: %s)"
+                                            % self._auto_retry_stop_error
+                                            if self._auto_retry_stop_error else ""
+                                        )
+                                    )
+                                raise RuntimeError(
+                                    "SystemView 数据流已中断(距最后数据 "
+                                    f"{idle:.1f}s 无新事件)"
+                                    + (
+                                        f"(已自动重试首次启动 {retry_count} 次)"
+                                        if retry_count else ""
+                                    )
+                                )
                             raise RuntimeError(
                                 "SystemView 启动后未收到数据，请检查 RTT 地址、"
-                                f"通道和下位机 SystemView 配置{detail}"
+                                "通道和下位机 SystemView 配置"
                             )
                         continue
-                    empty_cycles = 0
-                    last_read_error = None
+                    last_data_mono = time.monotonic()
+                    had_data = True
+                    attempt_had_data = True
                     self._stats["bytes"] += len(raw)
                     now = time.time()
                     evs = self._parser.feed(raw)
@@ -840,17 +956,25 @@ class SystemViewStreamManager:
                             )
                     self._note_init_cpu_freq(evs)
                     self._ensure_event_time_fields(evs)
-                    self._maybe_resolve_task_names(
+                    if self._maybe_resolve_task_names(
                         device, evs, addr=addr, channel=channel,
                         mode=mode, search_size=search_size,
-                    )
+                    ):
+                        # 解析内部 stop/start 耗时 ~5-12s 且期间无数据可读,
+                        # 必须重置空闲看门狗基准,否则解析后的首个空读会被
+                        # 误判为流中断。
+                        last_data_mono = time.monotonic()
                     self._apply_task_names(evs)
                     self._process_events(evs, now=now)
             except Exception as e:
                 logger.error("SystemView stream error: %s", e)
                 self._progress_state = "error"
                 self._progress_error = str(e)
-                self._bridge.put({"event": "error", "message": str(e)})
+                self._bridge.put({
+                    "event": "error",
+                    "message": str(e),
+                    "session_generation": session_generation,
+                })
                 start_failure = e
             finally:
                 try:
@@ -868,7 +992,10 @@ class SystemViewStreamManager:
                         if self._progress_state != "error":
                             self._progress_state = "stopped"
                         try:
-                            self._bridge.put({"event": "stopped"})
+                            self._bridge.put({
+                                "event": "stopped",
+                                "session_generation": session_generation,
+                            })
                         finally:
                             self._bridge.stop()
                 finally:
@@ -1157,6 +1284,14 @@ class SystemViewStreamManager:
 
     def _status_meta(self) -> dict:
         p = self._parser
+        session_status = {
+            "connection_generation": self._connection_generation,
+            "session_generation": self._session_generation,
+            "first_start_on_connection": self._first_start_on_connection,
+            "auto_retry_count": self._auto_retry_count,
+            "auto_retry_reason": self._auto_retry_reason,
+            "auto_retry_stop_error": self._auto_retry_stop_error,
+        }
         if not p:
             return {
                 "synced": False,
@@ -1170,6 +1305,7 @@ class SystemViewStreamManager:
                 "progress_state": self._progress_state,
                 "progress_error": self._progress_error,
                 "raw_bytes_without_events": self._raw_bytes_without_events,
+                **session_status,
                 **self._target_overflow_status(),
                 "task_names": {},
                 "isr_names": {},
@@ -1190,6 +1326,7 @@ class SystemViewStreamManager:
             "progress_state": self._progress_state,
             "progress_error": self._progress_error,
             "raw_bytes_without_events": self._raw_bytes_without_events,
+            **session_status,
             **self._target_overflow_status(),
             "task_names": dict(p._task_names),
             "isr_names": dict(p._isr_names),
@@ -1260,27 +1397,61 @@ class SystemViewStreamManager:
         channel: int,
         mode: int,
         search_size: int,
-    ) -> None:
+    ) -> bool:
+        # 任务名在线解析需要 stop/start 整个 SystemView 流,代价高昂且有两
+        # 个陷阱:(1) 非 RT-Thread 目标(FreeRTOS 等)解析注定空手而归,若不
+        # 禁用会每 3 秒拆一次流;(2) 拆流后 stop/start 失败必须如实上抛,
+        # 否则会话被留在死态,外层看门狗随后误报"启动后未收到数据"。因此:
+        # 解析一次空结果即永久禁用;失败上抛真实根因。返回 True 表示内部
+        # 执行过 stop/start(调用方需重置空闲看门狗基准)。
+        if getattr(self, "_name_resolution_disabled", False):
+            return False
         ids = self._unknown_task_ids(events)
         if not ids:
-            return
+            return False
         now = time.time()
         if now - self._last_name_resolution < 3.0:
-            return
+            return False
         self._last_name_resolution = now
         self._name_resolution_attempted.update(ids)
 
         try:
             device.systemview_stop()
-            try:
-                self._resolve_task_names(device, ids)
-            finally:
-                start_result = device.systemview_start(
-                    addr, channel=channel, mode=mode, search_size=search_size,
-                )
-                self._apply_cpu_freq_hint(device, start_result)
         except Exception as e:
-            logger.debug("SystemView task-name resolution failed: %s", e)
+            # stop 失败时设备侧会话已被拆除(device.systemview_stop 的 finally
+            # 总会清引用),继续轮询只会得到派生错误——如实上抛真实根因。
+            self._name_resolution_disabled = True
+            raise RuntimeError(
+                "SystemView 流在任务名解析时停止失败: %s" % e
+            ) from e
+        resolved: dict | None
+        try:
+            resolved = self._resolve_task_names(device, ids)
+        except Exception as e:
+            resolved = None
+            logger.warning("SystemView task-name resolution failed: %s", e)
+        try:
+            start_result = device.systemview_start(
+                addr, channel=channel, mode=mode, search_size=search_size,
+            )
+            self._apply_cpu_freq_hint(device, start_result)
+        except Exception as e:
+            # 会话已被 stop 拆除且重启失败——如实终止并保留真实根因,
+            # 不让轮询空转到看门狗误报。
+            self._name_resolution_disabled = True
+            raise RuntimeError(
+                "SystemView 流在任务名解析后重启失败: %s" % e
+            ) from e
+        if not resolved:
+            # RT-Thread 之外的解析路径拿不到线程对象名;这类目标的任务名
+            # 由 START 突发中的 TASK_INFO 事件携带。一次空结果后不再为
+            # 解析牺牲数据流。
+            self._name_resolution_disabled = True
+            logger.info(
+                "SystemView 任务名在线解析无结果,已禁用(任务名改由 "
+                "TASK_INFO 事件提供)"
+            )
+        return True
 
     def stop(self, timeout: float = 5.0) -> bool:
         thread = self._thread
