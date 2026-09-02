@@ -4,7 +4,7 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-02T13:25:00+08:00`
+- 更新时间：`2026-09-02T14:36:11+08:00`
 - 分支：`feature/eternal-chip-gui`
 - HEAD：`立芯分支已合入 master 的 SystemView 会话生命周期修复，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
 - 远端 HEAD：`origin/master 与 origin/feature/eternal-chip-gui 均包含经验证的 SystemView 会话修复；立芯分支生产资源由其品牌源码独立重建。`
@@ -22,10 +22,10 @@
 
 ## 验证证据
 
-- **Python**：最终全量 1805 passed, 1 skipped，耗时 657.28 秒；SystemView 状态机定向回归 15 passed。Windows 默认 GBK 会使发布清单夹具解码 Git UTF-8 内容失败，使用明确的 PYTHONUTF8=1 后定向与全量均通过。
-- **GUI 与 Web**：Vitest 59 files / 627 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 连接 STM32F411CE 目标验证 SystemView 持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning，停止、断连和进程退出正常。
+- **Python**：立芯合并提交全量运行 1804 passed, 1 skipped；唯一失败为隔离环境 pip install .[mcp] 达到固定 600 秒超时，定向复跑 1 passed / 198.90 秒。缺失 STCP 构建联接导致的 3 个 setup error 在挂接同源已验证 DLL 后定向 3/3 通过，并在后续全量中通过。SystemView 状态机 15 项均通过。
+- **GUI 与 Web**：立芯 Vitest 61 files / 631 tests 全部通过；生产构建转换 1952 modules，品牌资源仍引用 eternal-chip logo。SystemView 后端与 master 逐字一致；master 的真实 Chromium 会话持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning。
 - **Go/STCP**：master 集成证据中官方 Go 1.25.12 的 go test ./... 已通过；立芯分支复用与当前 go.mod/go.sum/main.go/main_test.go 逐文件同哈希的 x64 DLL，SHA-256=758E428FE9ED6BCBD9489D6DB1990FCE5A18680887137EA3CA6D348C27A77C07。
-- **Tauri Release 可执行文件**：Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=86D3F036D828699737610C0AB7A1129D04431F47234236C804A6A2401355D072。
+- **Tauri Release 可执行文件**：立芯分支 Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，19,225,600-byte EXE SHA-256=891CE8ADB5A88406E597C161C3B4F8963EC34B7C49FC9E43356612A931DDB4CE。
 - **HIL-Infra 硬门禁**：contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性零错误零豁免；bench-01、bench-gec1900、运行计划和资源映射通过。
 - **HIL 运行时与插件准入**：MKLink runtime 拒绝探针与自动化插件评审 11/11 OK；run-verify RV-01..RV-10 全部 OK，run-doctor 零孤儿、结束后无活动锁。本轮未烧录目标、未执行 OTA、未改变供电或发送 CAN。
 - **SystemView 真机链路**：原生 CLI 在 COM5、channel 1、RTT 控制块 0x20010d40 上运行 10 秒并持续输出有效事件；最终生产 WebGUI 会话约 70 秒达到 260744 events。既有故障故事中的首会话自动恢复实测曾持续 80 秒达到 165967 events 且零错误。
@@ -57,7 +57,7 @@
 
 - 本轮没有重新执行物理烧录 HIL；docs/verification/v0.1.9-stm32f103re-release-hil.md 的原始日志未在当前工作区找到，因此只能作为既有叙述证据，不能冒充本轮新证据。
 - Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。
-- Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
+- 立芯 Web 生产构建仍提示 DashboardView 压缩后约 552.15 KiB，超过 500 KiB 建议阈值，但不影响构建成功。
 - 探针冷启动后曾出现每次 SystemView start 都复位或停流的独立固件状态，增加到多次主机重试仍不能恢复；本次主机修复保持一次有界恢复，不掩盖该固件问题。经原生 CLI 正向控制后，同一目标的最终生产 WebGUI 长流验证通过。
 - 当前机器没有可调用的 Go 工具链；STCP 源码未改且复用 DLL 与其输入源码哈希一致，若需要新的 Go 证据应安装工具链后重跑 go test ./... 并重建 DLL。
 - 当前 GitHub 身份 su5176 对 MicroKeen/Mklink-AI-Probe 没有写权限；本轮按用户指定只同步 origin，不尝试覆盖或新建 MicroKeen 分支。
