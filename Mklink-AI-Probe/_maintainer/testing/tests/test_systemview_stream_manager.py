@@ -238,6 +238,51 @@ def test_first_start_reset_auto_retry_recovers_stream():
     assert status["session_generation"] == 1
 
 
+def test_recovered_session_does_not_restart_for_task_name_fallback():
+    """Recovery relies on fresh TASK_INFO instead of a third disruptive start."""
+    manager = _make_manager()
+    task_id = 0x20001000
+    parser_generation = 0
+
+    class TaskParser(NoEventParser):
+        def __init__(self, names):
+            super().__init__()
+            self._task_names.update(names)
+
+        @staticmethod
+        def feed(_raw):
+            return [{
+                "kind": "task_start_exec",
+                "task_id": task_id,
+                "t_ticks": 1,
+            }]
+
+    def create_parser(_device=None):
+        nonlocal parser_generation
+        parser_generation += 1
+        # The failed burst has a name so it reaches the idle watchdog without
+        # entering the fallback.  The recovered generation deliberately lacks
+        # one: before the fix this caused stop/read-RAM/start call number three.
+        names = {task_id: "worker"} if parser_generation == 1 else {}
+        return TaskParser(names)
+
+    manager._create_parser = create_parser
+    device = FakeDevice()
+
+    def after_retry_streams():
+        return b"\x05" * 32 if device.start_calls >= 2 else b""
+
+    device._script = [b"\x06" * 32, after_retry_streams]
+    manager.start(device, addr="0x20000000", channel=1, duration=1.0)
+    assert _wait_terminal(manager, deadline=5.0)
+    manager.stop()
+
+    assert manager._progress_error == ""
+    assert manager.get_status()["auto_retry_count"] == 1
+    assert device.start_calls == 2
+    assert device.resolve_calls == 0
+
+
 def test_later_session_on_same_connection_does_not_auto_retry():
     """同一 Device 的后续会话永久静默时如实失败,不再伪装成首次附着。"""
     manager = _make_manager()

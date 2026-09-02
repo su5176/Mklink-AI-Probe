@@ -863,7 +863,13 @@ class SystemViewStreamManager:
                                 self._stats = {"events": 0, "bytes": 0}
                                 self._resolved_task_names.clear()
                                 self._name_resolution_attempted.clear()
-                                self._name_resolution_disabled = False
+                                # A recovered target emits a fresh TASK_INFO
+                                # burst.  Rely on that non-disruptive source for
+                                # names: the RAM fallback tears down and starts
+                                # SystemView again, which can retrigger the same
+                                # attach reset that this bounded retry just
+                                # recovered from.
+                                self._name_resolution_disabled = True
                                 self._last_name_resolution = 0.0
                                 self._target_overflow_events = 0
                                 self._target_drop_count_baseline = None
