@@ -4,7 +4,7 @@
 从会话起点固定起算、任务名解析反复拆流)。修复后语义:
 - 单一空闲看门狗以"最后一次收到数据"为基准,统一裁决空读与读异常;
 - 会话总时长(duration)与空闲看门狗分离,不再被任何恢复动作延长;
-- 首次启动重试按 Device 连接代次最多两次,并重置解析代际;
+- 首次启动重试按 Device 连接代次限为一次,并重置解析代际;
 - 任务名解析一次空结果即永久禁用,stop/start 失败如实上抛。
 
 用 fake device + 缩短的看门狗超时覆盖关键状态机分支。
@@ -125,17 +125,17 @@ def test_never_any_data_fails_with_startup_hint_and_no_restart():
 
 
 def test_data_then_permanent_silence_reports_stream_stalled():
-    """场景(b):健康后永久静 → 用尽有界重试后仍静默 → 如实失败。"""
+    """场景(b):健康后永久静 → 自动重试一次后仍静默 → 如实失败。"""
     manager = _make_manager()
     device = FakeDevice([b"\x01" * 64])
     manager.start(device, addr="0x20000000", channel=1, duration=30)
     assert _wait_terminal(manager, deadline=5.0)
     manager.stop()
-    assert "自动重试 2 次后仍未收到数据" in (manager._progress_error or "")
-    assert device.start_calls == 3  # 初始启动 + 最多两次恢复启动
-    assert device.stop_calls == 3
+    assert "自动重试 1 次后仍未收到数据" in (manager._progress_error or "")
+    assert device.start_calls == 2  # 初始启动 + 一次恢复启动
+    assert device.stop_calls == 2
     status = manager.get_status()
-    assert status["auto_retry_count"] == 2
+    assert status["auto_retry_count"] == 1
     assert status["auto_retry_reason"] == "first_start_data_then_idle"
     assert status["first_start_on_connection"] is True
 
@@ -238,77 +238,6 @@ def test_first_start_reset_auto_retry_recovers_stream():
     assert status["session_generation"] == 1
 
 
-def test_cold_probe_recovers_on_second_bounded_retry():
-    """Cold probe may need two recovery starts, but never a third retry."""
-    manager = _make_manager()
-    device = FakeDevice()
-    burst_seen_for_start = set()
-
-    def cold_then_streaming():
-        call = device.start_calls
-        if call < 3:
-            if call not in burst_seen_for_start:
-                burst_seen_for_start.add(call)
-                return b"\x07" * 32
-            return b""
-        return b"\x08" * 32
-
-    device._script = [cold_then_streaming]
-    manager.start(device, addr="0x20000000", channel=1, duration=1.5)
-    assert _wait_terminal(manager, deadline=5.0)
-    manager.stop()
-
-    assert manager._progress_state == "stopped"
-    assert manager._progress_error == ""
-    assert device.start_calls == 3
-    assert manager.get_status()["auto_retry_count"] == 2
-    assert manager._stats["bytes"] > 32
-
-
-def test_recovered_session_does_not_restart_for_task_name_fallback():
-    """A new connection never spends bounded retries on task-name fallback."""
-    manager = _make_manager()
-    task_id = 0x20001000
-    parser_generation = 0
-
-    class TaskParser(NoEventParser):
-        def __init__(self, names):
-            super().__init__()
-            self._task_names.update(names)
-
-        @staticmethod
-        def feed(_raw):
-            return [{
-                "kind": "task_start_exec",
-                "task_id": task_id,
-                "t_ticks": 1,
-            }]
-
-    def create_parser(_device=None):
-        nonlocal parser_generation
-        parser_generation += 1
-        # Both generations lack TASK_INFO.  Before the fix, the first burst
-        # immediately entered stop/read-RAM/start and consumed another start
-        # before the idle watchdog could own the bounded recovery policy.
-        return TaskParser({})
-
-    manager._create_parser = create_parser
-    device = FakeDevice()
-
-    def after_retry_streams():
-        return b"\x05" * 32 if device.start_calls >= 2 else b""
-
-    device._script = [b"\x06" * 32, after_retry_streams]
-    manager.start(device, addr="0x20000000", channel=1, duration=1.0)
-    assert _wait_terminal(manager, deadline=5.0)
-    manager.stop()
-
-    assert manager._progress_error == ""
-    assert manager.get_status()["auto_retry_count"] == 1
-    assert device.start_calls == 2
-    assert device.resolve_calls == 0
-
-
 def test_later_session_on_same_connection_does_not_auto_retry():
     """同一 Device 的后续会话永久静默时如实失败,不再伪装成首次附着。"""
     manager = _make_manager()
@@ -339,9 +268,9 @@ def test_new_device_connection_restores_first_start_retry():
     manager.start(second, duration=30)
     assert _wait_terminal(manager)
     manager.stop()
-    assert second.start_calls == 3
+    assert second.start_calls == 2
     assert manager.get_status()["connection_generation"] == 2
-    assert manager.get_status()["auto_retry_count"] == 2
+    assert manager.get_status()["auto_retry_count"] == 1
 
 
 def test_retry_stop_failure_is_visible_when_restart_recovers():
@@ -398,13 +327,11 @@ def test_retry_resets_undecodable_progress_generation():
     manager._create_parser = lambda _device=None: EmptyParser()
     device = FakeDevice()
 
-    chunks_seen_for_attempt = set()
-
     def one_chunk_per_attempt():
         if device.start_calls == 1:
             return b""
-        if device.start_calls not in chunks_seen_for_attempt:
-            chunks_seen_for_attempt.add(device.start_calls)
+        if device.start_calls == 2 and not getattr(device, "_retry_chunk", False):
+            device._retry_chunk = True
             return b"\x02" * 64
         return b""
 

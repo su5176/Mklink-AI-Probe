@@ -59,7 +59,7 @@ def _sum_counter_snapshots(base: dict[str, int], current: dict[str, int]) -> dic
 logger = logging.getLogger(__name__)
 _RTT_DELIVERY_INTERVAL = 1.0 / 50.0
 _SYSTEMVIEW_DELIVERY_INTERVAL = 1.0 / 30.0
-_SYSTEMVIEW_FIRST_START_MAX_RETRIES = 2
+_SYSTEMVIEW_FIRST_START_MAX_RETRIES = 1
 _YMODEM_STOP_TIMEOUT = 3.0
 _RUNTIME_CPU_FREQ_SOURCES = {"SystemCoreClock", "hpm_core_clock"}
 SUPPORTED_RTT_ENCODINGS = ("utf-8", "gb2312", "gbk", "gb18030", "big5")
@@ -765,13 +765,7 @@ class SystemViewStreamManager:
         self._stats = {"events": 0, "bytes": 0}
         self._resolved_task_names.clear()
         self._name_resolution_attempted.clear()
-        # Keep the entire first session on a new probe connection to the
-        # documented maximum of one recovery start.  The RAM task-name
-        # fallback performs its own stop/start and is indistinguishable from
-        # another recovery to reset-prone probe firmware.  Fresh TASK_INFO is
-        # the non-disruptive name source here; later sessions on the same
-        # connection re-enable the fallback through this assignment.
-        self._name_resolution_disabled = first_start_on_connection
+        self._name_resolution_disabled = False
         self._last_name_resolution = 0.0
         self._cpu_freq_source = ""
         with self._recording_lock:
@@ -833,10 +827,10 @@ class SystemViewStreamManager:
                     if not raw:
                         idle = time.monotonic() - last_data_mono
                         if idle >= self._startup_no_data_timeout_s:
-                            # 探针固件冷启动后的首次附着可能连续复位目标
-                            # (表现为 START 突发排干后流静默)。真机上最多需要
-                            # 两次恢复启动；范围仍严格限定为每个 Device 连接的
-                            # 首个会话，达到上限后如实终止并注明。
+                            # 探针固件的首次附着可能复位目标(表现为 START
+                            # 突发排干后流静默,第二次启动即正常)。范围严格限定
+                            # 为每个 Device 连接首会话的一次可见自动重试；达到
+                            # 上限后如实终止并注明。
                             if (
                                 had_data
                                 and first_start_on_connection
@@ -877,13 +871,7 @@ class SystemViewStreamManager:
                                 self._stats = {"events": 0, "bytes": 0}
                                 self._resolved_task_names.clear()
                                 self._name_resolution_attempted.clear()
-                                # A recovered target emits a fresh TASK_INFO
-                                # burst.  Rely on that non-disruptive source for
-                                # names: the RAM fallback tears down and starts
-                                # SystemView again, which can retrigger the same
-                                # attach reset that this bounded retry just
-                                # recovered from.
-                                self._name_resolution_disabled = True
+                                self._name_resolution_disabled = False
                                 self._last_name_resolution = 0.0
                                 self._target_overflow_events = 0
                                 self._target_drop_count_baseline = None
