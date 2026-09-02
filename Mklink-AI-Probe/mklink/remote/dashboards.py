@@ -764,7 +764,13 @@ class SystemViewStreamManager:
         self._stats = {"events": 0, "bytes": 0}
         self._resolved_task_names.clear()
         self._name_resolution_attempted.clear()
-        self._name_resolution_disabled = False
+        # Keep the entire first session on a new probe connection to the
+        # documented maximum of one recovery start.  The RAM task-name
+        # fallback performs its own stop/start and is indistinguishable from
+        # another recovery to reset-prone probe firmware.  Fresh TASK_INFO is
+        # the non-disruptive name source here; later sessions on the same
+        # connection re-enable the fallback through this assignment.
+        self._name_resolution_disabled = first_start_on_connection
         self._last_name_resolution = 0.0
         self._cpu_freq_source = ""
         with self._recording_lock:

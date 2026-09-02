@@ -239,7 +239,7 @@ def test_first_start_reset_auto_retry_recovers_stream():
 
 
 def test_recovered_session_does_not_restart_for_task_name_fallback():
-    """Recovery relies on fresh TASK_INFO instead of a third disruptive start."""
+    """A new connection never spends its one retry on task-name fallback."""
     manager = _make_manager()
     task_id = 0x20001000
     parser_generation = 0
@@ -260,11 +260,10 @@ def test_recovered_session_does_not_restart_for_task_name_fallback():
     def create_parser(_device=None):
         nonlocal parser_generation
         parser_generation += 1
-        # The failed burst has a name so it reaches the idle watchdog without
-        # entering the fallback.  The recovered generation deliberately lacks
-        # one: before the fix this caused stop/read-RAM/start call number three.
-        names = {task_id: "worker"} if parser_generation == 1 else {}
-        return TaskParser(names)
+        # Both generations lack TASK_INFO.  Before the fix, the first burst
+        # immediately entered stop/read-RAM/start and consumed another start
+        # before the idle watchdog could own the bounded recovery policy.
+        return TaskParser({})
 
     manager._create_parser = create_parser
     device = FakeDevice()
