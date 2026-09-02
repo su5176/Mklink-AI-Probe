@@ -136,7 +136,7 @@
         </div>
         <div v-if="meta.autoRetryCount > 0" data-testid="systemview-auto-retry" class="sv-health-card warn">
           <span>Recovery</span>
-          <b :title="meta.autoRetryStopError || meta.autoRetryReason">{{ tr('首次启动已自动重试', 'First start retried') }}</b>
+          <b :title="meta.autoRetryStopError || meta.autoRetryReason">{{ tr(`首次启动已自动重试 ${meta.autoRetryCount} 次`, `First start retried ${meta.autoRetryCount} time(s)`) }}</b>
         </div>
         <div v-if="analysisBufferCount" class="sv-health-card">
           <span>Analysis Buffer</span>

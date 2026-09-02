@@ -442,6 +442,19 @@ describe('SystemViewTab asynchronous lifecycle', () => {
     }] as never[]
     await nextTick()
     expect(mocks.binary.reset).toHaveBeenCalledTimes(resetsBeforeRetry + 1)
+
+    mocks.status.data.value = [{
+      _streamSeq: 3,
+      event: 'status',
+      connection_generation: 3,
+      session_generation: 7,
+      auto_retry_count: 2,
+      auto_retry_reason: 'first_start_data_then_idle',
+      stats: { events: 0 },
+    }] as never[]
+    await nextTick()
+    expect(recovery.text()).toContain('首次启动已自动重试 2 次')
+    expect(mocks.binary.reset).toHaveBeenCalledTimes(resetsBeforeRetry + 2)
     wrapper.unmount()
   })
 

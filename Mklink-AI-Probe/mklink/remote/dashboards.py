@@ -59,6 +59,7 @@ def _sum_counter_snapshots(base: dict[str, int], current: dict[str, int]) -> dic
 logger = logging.getLogger(__name__)
 _RTT_DELIVERY_INTERVAL = 1.0 / 50.0
 _SYSTEMVIEW_DELIVERY_INTERVAL = 1.0 / 30.0
+_SYSTEMVIEW_FIRST_START_MAX_RETRIES = 2
 _YMODEM_STOP_TIMEOUT = 3.0
 _RUNTIME_CPU_FREQ_SOURCES = {"SystemCoreClock", "hpm_core_clock"}
 SUPPORTED_RTT_ENCODINGS = ("utf-8", "gb2312", "gbk", "gb18030", "big5")
@@ -809,7 +810,7 @@ class SystemViewStreamManager:
                 last_data_mono = time.monotonic()
                 had_data = False
                 attempt_had_data = False
-                retry_used = False
+                retry_count = 0
                 no_event_started = None
                 while not stop_event.is_set():
                     if time.monotonic() >= deadline_mono:
@@ -832,30 +833,37 @@ class SystemViewStreamManager:
                     if not raw:
                         idle = time.monotonic() - last_data_mono
                         if idle >= self._startup_no_data_timeout_s:
-                            # 探针固件的首次附着可能复位目标(表现为:START
-                            # 突发排干后流静默,第二次启动即正常)。此处做一次
-                            # 有界、可见的自动重试;重试仍失败才终止并注明。
+                            # 探针固件冷启动后的首次附着可能连续复位目标
+                            # (表现为 START 突发排干后流静默)。真机上最多需要
+                            # 两次恢复启动；范围仍严格限定为每个 Device 连接的
+                            # 首个会话，达到上限后如实终止并注明。
                             if (
                                 had_data
                                 and first_start_on_connection
-                                and not retry_used
+                                and retry_count < _SYSTEMVIEW_FIRST_START_MAX_RETRIES
                             ):
-                                retry_used = True
-                                self._auto_retry_count = 1
+                                retry_count += 1
+                                self._auto_retry_count = retry_count
                                 self._auto_retry_reason = (
                                     "first_start_data_then_idle"
                                 )
                                 logger.warning(
                                     "SystemView 连接代次 %d 的首次启动疑似触发"
-                                    "探针附着复位,自动重启会话重试一次",
+                                    "探针附着复位,自动重启会话重试 %d/%d",
                                     self._connection_generation,
+                                    retry_count,
+                                    _SYSTEMVIEW_FIRST_START_MAX_RETRIES,
                                 )
                                 stop_error = None
                                 try:
                                     device.systemview_stop()
                                 except Exception as exc:
                                     stop_error = exc
-                                    self._auto_retry_stop_error = str(exc)
+                                    stop_text = str(exc)
+                                    if self._auto_retry_stop_error:
+                                        self._auto_retry_stop_error += "; " + stop_text
+                                    else:
+                                        self._auto_retry_stop_error = stop_text
                                     logger.warning(
                                         "SystemView 首次启动自动重试前停止失败: %s",
                                         exc,
@@ -910,9 +918,10 @@ class SystemViewStreamManager:
                                 last_data_mono = time.monotonic()
                                 continue
                             if had_data:
-                                if retry_used and not attempt_had_data:
+                                if retry_count and not attempt_had_data:
                                     raise RuntimeError(
-                                        "SystemView 首次启动自动重试后仍未收到数据"
+                                        "SystemView 首次启动自动重试 "
+                                        f"{retry_count} 次后仍未收到数据"
                                         + (
                                             "(重试前 stop 失败: %s)"
                                             % self._auto_retry_stop_error
@@ -922,7 +931,10 @@ class SystemViewStreamManager:
                                 raise RuntimeError(
                                     "SystemView 数据流已中断(距最后数据 "
                                     f"{idle:.1f}s 无新事件)"
-                                    + ("(已自动重试首次启动)" if retry_used else "")
+                                    + (
+                                        f"(已自动重试首次启动 {retry_count} 次)"
+                                        if retry_count else ""
+                                    )
                                 )
                             raise RuntimeError(
                                 "SystemView 启动后未收到数据，请检查 RTT 地址、"
