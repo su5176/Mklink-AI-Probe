@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-09-01T14:07:55+08:00",
+  "updated_at": "2026-09-02T13:18:45+08:00",
   "repository": {
     "url": "https://github.com/su5176/Mklink-AI-Probe",
     "project_root": "Mklink-AI-Probe",
     "branch": "master",
-    "head": "PR #15 is merged; master contains the validated build-gate fixes, synchronized Web assets, and privacy-safe memory observability.",
-    "remote_head": "origin/master contains PR #15 merge commit 9485089b56075310d8f9b7c6ef0577dbb4bd5c2d; later documentation-only handoff updates may advance master.",
+    "head": "master contains the SystemView session lifecycle fix, bounded first-session recovery, synchronized Web assets, and regression coverage.",
+    "remote_head": "origin/master contains the validated SystemView session lifecycle fix; feature/eternal-chip-gui carries the corresponding source fix with its own branded Web assets.",
     "working_tree": "Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory."
   },
   "mission": {
@@ -14,9 +14,9 @@
     "maintenance": "交接只保留当前基线、关键验证、长期约束和未完成事项；历史过程从 Git 与验证报告查询。"
   },
   "current_session": {
-    "status": "v0.1.9-pr15-merged",
-    "current_task": "PR #15 修补、两个本地备份中的内存可观测性语义迁移、全量软件门禁、HIL-Infra 只读门禁和远端合并均已完成。",
-    "release": "本轮未创建标签、Release、签名安装器，也未执行任何探针或目标写入；这些动作仍需单独授权。"
+    "status": "v0.1.9-systemview-session-fixed",
+    "current_task": "SystemView WebGUI 会话生命周期、首会话单次有界恢复、状态可观测性、回归测试、真机 HIL 以及 master/立芯分支同步均已完成。",
+    "release": "本轮未创建标签、Release、安装器或签名，也未执行目标固件烧录或 OTA；这些动作仍需单独授权。"
   },
   "milestones": [
     {
@@ -33,16 +33,21 @@
       "name": "PR #15 本地集成门禁",
       "status": "complete",
       "notes": "Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。"
+    },
+    {
+      "name": "SystemView 会话生命周期修复",
+      "status": "complete",
+      "notes": "分离 duration 与单调时钟 idle watchdog，容忍瞬态读取，按设备连接代次仅为第一个会话提供一次自动恢复；重试时清理解析器、历史、统计、任务与 CPU hint，并在 WebGUI 显示恢复代次、原因和停止错误。"
     }
   ],
   "verification": [
     {
       "area": "Python",
-      "result": "最终全量 1790 passed, 1 skipped，耗时 556.10 秒；观测与原 0.1.9 边界联合定向回归 59 passed。"
+      "result": "最终全量 1805 passed, 1 skipped，耗时 657.28 秒；SystemView 状态机定向回归 15 passed。Windows 默认 GBK 会使发布清单夹具解码 Git UTF-8 内容失败，使用明确的 PYTHONUTF8=1 后定向与全量均通过。"
     },
     {
       "area": "GUI 与 Web",
-      "result": "Vitest 59 files / 626 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 验证配置、仪表盘、脱机烧录、在线烧录路由与版本弹层；无静态资源或 Vue 运行时错误。"
+      "result": "Vitest 59 files / 627 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 连接 STM32F411CE 目标验证 SystemView 持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning，停止、断连和进程退出正常。"
     },
     {
       "area": "Go/STCP",
@@ -50,7 +55,7 @@
     },
     {
       "area": "Tauri Release 可执行文件",
-      "result": "Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=138647E4DE52BF8E85A4AAC43CBE39A44AF172250ACA47E3F7258B2CC47E661D。"
+      "result": "Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=86D3F036D828699737610C0AB7A1129D04431F47234236C804A6A2401355D072。"
     },
     {
       "area": "HIL-Infra 硬门禁",
@@ -58,7 +63,11 @@
     },
     {
       "area": "HIL 运行时与插件准入",
-      "result": "MKLink、Toomoss、PSU、Camera 的负向运行时拒绝探针通过；MKLink 自动化插件评审 11/11 OK，Camera 11/11 OK；结束后无活动锁。本轮未烧录、复位、供电或发送 CAN。"
+      "result": "MKLink runtime 拒绝探针与自动化插件评审 11/11 OK；run-verify RV-01..RV-10 全部 OK，run-doctor 零孤儿、结束后无活动锁。本轮未烧录目标、未执行 OTA、未改变供电或发送 CAN。"
+    },
+    {
+      "area": "SystemView 真机链路",
+      "result": "原生 CLI 在 COM5、channel 1、RTT 控制块 0x20010d40 上运行 10 秒并持续输出有效事件；最终生产 WebGUI 会话约 70 秒达到 260744 events。既有故障故事中的首会话自动恢复实测曾持续 80 秒达到 165967 events 且零错误。"
     },
     {
       "area": "PR #15 固件资产",
@@ -69,23 +78,25 @@
     "UF2 固件文件和 AGENTS.md 采用 PR #15 版本。",
     "两个本地备份包含同一份核心内存可观测性实现；只迁移一次代码，旧交接文档不覆盖当前 0.1.9 记忆，Eternal Chip GUI 分支历史不混入 PR。",
     "观测数据的公开事件仅包含安全事实，原始内存、RTT 和 SystemView 内容走有界私有流；发布失败降级但不改变成功读取结果。",
+    "SystemView 自动恢复限定为每次 Device 连接的第一个会话最多一次；恢复状态显式暴露，后续会话和持续失败不会进入隐式重试循环。",
     "构建、测试、日志和缓存统一位于 MKLINK_BUILD_ROOT 或主工作区忽略的 .build，并经 scripts/build_workspace.ps1 运行。",
     "实际烧录、复位、供电、CAN 发送等不可逆或有外部影响的动作必须获得针对本次操作的明确确认。",
     "应用 Release、标签、更新签名和探针固件发布彼此独立，不随 PR 合并自动执行。"
   ],
   "hardware": {
     "probe": "HIL-Infra bench-01 将 MKLink V4 命令口映射为 COM5；交接不依赖端口号，使用台架 selector 与互操作锁。",
-    "target": "已有 v0.1.9 STM32F103RE 真机报告来自较早源码基线；本轮变更集中在构建门禁、Web 产物与主机侧可观测性，没有重烧目标。",
-    "permission": "本轮只做 identify/capabilities/health/safe_state 与负向拒绝探针。若要重跑物理烧录闭环，需要用户明确授权目标、固件和写入动作。"
+    "target": "本轮使用 ec_s100_watch_V2.6_tony 的 STM32F411CE + FreeRTOS + LVGL 既有固件，通过 RTT 控制块 0x20010d40 验证 SystemView；未重烧目标。",
+    "permission": "本轮执行 SystemView 启停、读取和一次探针重启以复现冷启动问题；未执行目标烧录、OTA、供电变更或 CAN 激励。后续写入动作仍需针对目标和固件单独确认。"
   },
   "known_limits": [
     "本轮没有重新执行物理烧录 HIL；docs/verification/v0.1.9-stm32f103re-release-hil.md 的原始日志未在当前工作区找到，因此只能作为既有叙述证据，不能冒充本轮新证据。",
     "Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。",
     "Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。",
+    "探针冷启动后曾出现每次 SystemView start 都复位或停流的独立固件状态，增加到多次主机重试仍不能恢复；本次主机修复保持一次有界恢复，不掩盖该固件问题。经原生 CLI 正向控制后，同一目标的最终生产 WebGUI 长流验证通过。",
     "HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。"
   ],
   "next_actions": [
-    "若需要重新证明目标侧行为，先获得明确烧录授权，再通过 hil-orchestrator 执行编译、烧录、激励、观测、判定和证据归档闭环。",
+    "另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。",
     "正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。"
   ],
   "continuation_protocol": [
