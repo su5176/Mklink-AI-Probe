@@ -194,6 +194,7 @@ window.__rttTestProbe = {
     count: rawLogStoredCount, total: rawLogLineCount, lines: rawLogSnapshot()
   }; },
   saveRawLog: saveRawLog,
+  exportCSV: exportCSV,
   syncStatus: syncDashboardStatus,
   collectionState: function() { return {
     state: collectionState, paused: paused, renderPaused: renderPaused
@@ -209,6 +210,7 @@ window.__rttTestProbe = {
   panelYRange: function(panel) { return getPanelYRange(panel); },
   setSplitChannel: setSplitChannel,
   clearSplitChannel: clearSplitChannel,
+  setArraySnapshot: setArraySnapshot,
   setBufferCapacity: setBufferCapacity,
   serializeState: serializeState,
   deserializeState: deserializeState,
@@ -330,6 +332,31 @@ describe('WaveformViewer VOFA binary transport', () => {
       'controller.target': 20,
     }])
     wrapper.unmount()
+  })
+
+  it('treats an array snapshot as a normal SuperWatch channel', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch')
+    try {
+      runtime.viewer.configureBinaryChannels([{ name: 'gain' }])
+      runtime.viewer.acceptBinaryBatch({
+        sequence: 1n, timestampNs: 1_000_000_000n, itemCount: 2, channelCount: 1,
+        layout: 'sample-major-float32', values: Float32Array.of(2, 3).buffer,
+        times: Float64Array.of(1, 2).buffer,
+      })
+      expect(runtime.probe.setArraySnapshot({
+        name: 'samples', type_name: 'uint16_t', element_size: 2,
+        start_index: 4, count: 3, sequence: 8, values: [1, 5, 2],
+      })).toBe(true)
+      expect(runtime.probe.fields().samples.isArraySnapshot).toBe(true)
+      expect(runtime.probe.fields().samples.arrayValues).toEqual([1, 5, 2])
+      expect(runtime.probe.setSplitChannel('samples')).toBe(true)
+      expect(runtime.probe.splitChannel()).toBe('samples')
+      runtime.probe.clearSplitChannel()
+      runtime.probe.setArraySnapshot(null)
+      expect(runtime.probe.fields().samples).toBeUndefined()
+    } finally {
+      runtime.cleanup()
+    }
   })
 
   it('stops SuperWatch transport without clearing the retained viewer state', async () => {
@@ -494,7 +521,7 @@ describe('WaveformViewer VOFA binary transport', () => {
     }
   })
 
-  it('estimates frontend history memory from the requested capacity and channel count', async () => {
+  it('estimates Worker history memory from the requested capacity and channel count', async () => {
     const runtime = await loadRttViewerRuntime('SuperWatch', 8)
     try {
       runtime.viewer.configureBinaryChannels([{ name: 'A' }, { name: 'B' }])
@@ -503,8 +530,8 @@ describe('WaveformViewer VOFA binary transport', () => {
       input.value = '1000000'
       input.dispatchEvent(new Event('input', { bubbles: true }))
 
-      expect(estimate.textContent).toBe('~92 MB')
-      expect(estimate.dataset.bytes).toBe(String(1_000_000 * 2 * 48))
+      expect(estimate.textContent).toBe('~15 MB')
+      expect(estimate.dataset.bytes).toBe(String(1_000_000 * (8 + 2 * 4)))
       expect(estimate.title).toContain('2 ch x 1000000 pts')
     } finally {
       runtime.cleanup()
@@ -773,7 +800,50 @@ describe('WaveformViewer VOFA binary transport', () => {
     if (!mocks.binary.envelope) throw new Error('missing envelope ref')
     mocks.binary.envelope.value = envelope
     await nextTick()
-    expect(renderBinaryEnvelope).toHaveBeenCalledWith(envelope)
+    expect(renderBinaryEnvelope).toHaveBeenCalledWith(envelope, false)
+    wrapper.unmount()
+  })
+
+  it('attaches the SuperWatch viewport requester after the viewer script loads', async () => {
+    let requestViewport: (() => void) | undefined
+    const setBinaryVisibleRangeRequester = vi.fn((requester: () => void) => {
+      requestViewport = requester
+    })
+    const getBinaryVisibleRange = vi.fn(() => ({ start: 100, end: 200, pixelWidth: 800 }))
+    const renderBinaryEnvelope = vi.fn()
+    const wrapper = mount(WaveformViewer, {
+      props: { mode: 'SuperWatch', deviceConnected: true },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    const i18nScript = wrapper.element.querySelector('script[src]') as HTMLScriptElement
+    i18nScript.onload?.(new Event('load'))
+    ;(window as any).__waveformViewers.SuperWatch = {
+      setBinaryVisibleRangeRequester, getBinaryVisibleRange, renderBinaryEnvelope,
+    }
+    const scripts = wrapper.element.querySelectorAll('script[src]')
+    const viewerScript = scripts[scripts.length - 1] as HTMLScriptElement
+    viewerScript.onload?.(new Event('load'))
+
+    expect(setBinaryVisibleRangeRequester).toHaveBeenCalledOnce()
+    requestViewport?.()
+    expect(mocks.binary.requestVisibleRange).toHaveBeenCalledWith(
+      expect.any(Number), 100, 200, 800,
+    )
+    const requestId = mocks.binary.requestVisibleRange.mock.calls.at(-1)?.[0]
+    const envelope = {
+      type: 'render-envelope', mode: 'min-max-v1', timestampKind: 'sample-milliseconds',
+      requestId, pixelWidth: 800, channelCount: 1, pointCount: 2,
+      candidateSampleCount: 2, channelOffsets: Uint32Array.of(0, 2).buffer,
+      times: Float64Array.of(100, 200).buffer,
+      timeIndices: Uint32Array.of(0, 1).buffer,
+      values: Float32Array.of(1, 2).buffer,
+    }
+    if (!mocks.binary.envelope) throw new Error('missing envelope ref')
+    mocks.binary.envelope.value = envelope
+    await nextTick()
+
+    expect(renderBinaryEnvelope).toHaveBeenCalledWith(envelope, true)
     wrapper.unmount()
   })
 
@@ -1038,6 +1108,12 @@ describe('VOFA viewer hot path source guard', () => {
     expect(viewerCss).not.toMatch(/(^|\n)\s*footer\s*\{/)
   })
 
+  it('keeps waveform header styles scoped to the viewer', () => {
+    expect(viewerCss).not.toMatch(/(^|\n)\s*header(?:\s+h1)?\s*\{/)
+    expect(viewerCss).toContain('.waveform-viewer header {')
+    expect(viewerCss).toContain('.waveform-viewer header h1 {')
+  })
+
   it('keeps desktop SuperWatch live status and controls in stable rows', () => {
     expect(componentSource).toContain('<div class="header-status">')
     expect(viewerCss).toContain('.waveform-viewer.superwatch-desktop header')
@@ -1050,6 +1126,14 @@ describe('VOFA viewer hot path source guard', () => {
       '    width: 104px;\n    overflow: hidden;',
     )
     expect(viewerCss).toContain('flex-wrap: nowrap')
+    expect(viewerCss).toContain(
+      '.waveform-viewer.superwatch-desktop #control-toolbar > *,\n' +
+      '  .waveform-viewer.superwatch-desktop #trigger-toolbar > * {\n' +
+      '    flex: 0 0 auto;\n' +
+      '    white-space: nowrap;',
+    )
+    expect(viewerCss).toContain('#interval-group > * { flex: 0 0 auto; }')
+    expect(viewerCss).toContain('#trigger-enable-btn,\n#trigger-force-btn {\n  flex: 0 0 auto;')
     expect(viewerCss).toContain('flex: 1 1 140px')
     expect(viewerCss).toContain('text-overflow: ellipsis')
   })
@@ -2103,6 +2187,93 @@ describe('VOFA viewer hot path source guard', () => {
     }
   })
 
+  it('reloads the requested SuperWatch envelope when the paused or stopped timeline moves', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch', 50_000)
+    try {
+      const requestVisibleRange = vi.fn()
+      runtime.viewer.setBinaryVisibleRangeRequester(requestVisibleRange)
+      runtime.viewer.configureBinaryChannels([{ name: 'A' }])
+      runtime.viewer.acceptBinarySummary({
+        sequence: 1n, timestampNs: 8_000_000_000n,
+        collectedItemCount: 8, bufferedItemCount: 8, channelCount: 1,
+        bufferStartMs: 0, bufferEndMs: 8_000, latestTimeMs: 8_000,
+        latestValues: Float32Array.of(8).buffer,
+      })
+      runtime.viewer.renderBinaryEnvelope({
+        type: 'render-envelope', mode: 'min-max-v1', timestampKind: 'sample-milliseconds',
+        requestId: 1, pixelWidth: 800, channelCount: 1, pointCount: 4,
+        candidateSampleCount: 4, times: Float64Array.of(4_000, 5_000, 6_000, 8_000).buffer,
+        timeIndices: Uint32Array.of(0, 1, 2, 3).buffer,
+        values: Float32Array.of(4, 5, 6, 8).buffer,
+        channelOffsets: Uint32Array.of(0, 4).buffer,
+      })
+      runtime.probe.syncStatus({ state: 'running', items: [{ name: 'A' }] })
+      document.getElementById('btn-pause')!.click()
+
+      const axis = document.getElementById('x-axis-hit')!
+      axis.dispatchEvent(wheelEvent({ deltaY: -100, clientX: 400, bubbles: true }))
+      expect(requestVisibleRange).toHaveBeenCalledOnce()
+
+      ;(window as any).__canvasPointVisits = 0
+      const historicalEnvelope = {
+        type: 'render-envelope', mode: 'min-max-v1', timestampKind: 'sample-milliseconds',
+        requestId: 2, pixelWidth: 800, channelCount: 1, pointCount: 4,
+        candidateSampleCount: 4, times: Float64Array.of(2_000, 2_500, 3_000, 3_500).buffer,
+        timeIndices: Uint32Array.of(0, 1, 2, 3).buffer,
+        values: Float32Array.of(20, 25, 30, 35).buffer,
+        channelOffsets: Uint32Array.of(0, 4).buffer,
+      }
+      expect(runtime.viewer.renderBinaryEnvelope(historicalEnvelope, true)).toBe(true)
+      expect(Array.from(runtime.probe.binaryEnvelope().values)).toEqual([20, 25, 30, 35])
+      expect((window as any).__canvasPointVisits).toBeGreaterThan(0)
+
+      runtime.probe.syncStatus({ state: 'stopped', items: [{ name: 'A' }] })
+      axis.dispatchEvent(wheelEvent({ deltaY: 100, clientX: 400, bubbles: true }))
+      expect(requestVisibleRange).toHaveBeenCalledTimes(2)
+      expect(Array.from(runtime.probe.binaryEnvelope().values)).toEqual([20, 25, 30, 35])
+    } finally {
+      runtime.cleanup()
+    }
+  })
+
+  it('continues drawing the accepted binary envelope while SuperWatch is paused', () => {
+    expect(viewerSource).not.toContain(
+      'binaryEnvelope &&\n    !(IS_SUPERWATCH_MODE && paused)',
+    )
+  })
+
+  it('retains only the latest SuperWatch row on the main thread while Worker bounds drive history', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch', 50_000)
+    try {
+      runtime.viewer.configureBinaryChannels([{ name: 'A' }, { name: 'B' }])
+      expect(runtime.viewer.acceptBinarySummary({
+        sequence: 1n, timestampNs: 1_000_000_000n, collectedItemCount: 512, bufferedItemCount: 512,
+        channelCount: 2, bufferStartMs: 0, bufferEndMs: 1_000,
+        latestTimeMs: 1_000, latestValues: Float32Array.of(1, 10).buffer,
+      })).toBe(true)
+      expect(runtime.viewer.acceptBinarySummary({
+        sequence: 2n, timestampNs: 2_000_000_000n, collectedItemCount: 512, bufferedItemCount: 1_024,
+        channelCount: 2, bufferStartMs: 0, bufferEndMs: 2_000,
+        latestTimeMs: 2_000, latestValues: Float32Array.of(2, 20).buffer,
+      })).toBe(true)
+
+      const fields = runtime.probe.fields()
+      expect(fields.A.ringBuf.count).toBe(1)
+      expect(fields.B.ringBuf.count).toBe(1)
+      expect(fields.A.ringBuf.capacity).toBe(2)
+      expect(fields.B.ringBuf.capacity).toBe(2)
+      expect(fields.A.ringBuf.latest().y).toBe(2)
+      expect(fields.B.ringBuf.latest().y).toBe(20)
+      expect(runtime.probe.fullTimeRange()).toEqual({ tMin: 0, tMax: 2 })
+      expect(runtime.viewer.getStorageDiagnostics()).toMatchObject({
+        historyOwner: 'worker', workerCapacity: 50_000, workerBufferedSamples: 1_024,
+        mainRingCapacity: 2, mainRingMaxCount: 1, detailEnabled: false,
+      })
+    } finally {
+      runtime.cleanup()
+    }
+  })
+
   it('keeps the full SuperWatch history navigable while render pause is active', async () => {
     const runtime = await loadRttViewerRuntime('SuperWatch', 8)
     try {
@@ -2147,7 +2318,7 @@ describe('VOFA viewer hot path source guard', () => {
       }))
 
       expect(runtime.probe.timeline().offset).toBe(0)
-      expect((window as any).__ringPointVisits).toBeGreaterThan(0)
+      expect((window as any).__ringPointVisits).toBe(0)
 
       document.getElementById('btn-pause')!.click()
       expect(ring.count).toBe(0)
@@ -2218,6 +2389,34 @@ describe('VOFA viewer hot path source guard', () => {
     } finally {
       click.mockRestore()
       vi.unstubAllGlobals()
+      runtime.cleanup()
+    }
+  })
+
+  it('routes SuperWatch CSV and raw-log exports through the desktop save bridge', async () => {
+    const runtime = await loadRttViewerRuntime('SuperWatch')
+    const nativeSave = vi.fn().mockResolvedValue(true)
+    ;(window as any).__MKLINK_SAVE_FILE__ = nativeSave
+    try {
+      runtime.viewer.configureBinaryChannels([{ name: 'gain' }])
+      runtime.probe.setRawLogOpen(true)
+      runtime.viewer.acceptBinaryBatch({
+        sequence: 1n, timestampNs: 1_000_000_000n,
+        itemCount: 2, channelCount: 1, layout: 'sample-major-float32',
+        values: Float32Array.of(1, 1.25).buffer,
+        times: Float64Array.of(1_000, 2_000).buffer,
+      })
+
+      runtime.probe.saveRawLog()
+      runtime.probe.exportCSV()
+      await Promise.resolve()
+
+      expect(nativeSave).toHaveBeenCalledTimes(2)
+      expect(nativeSave.mock.calls[0][0]).toMatch(/^superwatch-raw-\d{8}-\d{6}\.txt$/)
+      expect(nativeSave.mock.calls[0][1]).toContain('gain=1.25')
+      expect(nativeSave.mock.calls[1][0]).toBe('jscope_export.csv')
+      expect(nativeSave.mock.calls[1][1]).toContain('timestamp,gain')
+    } finally {
       runtime.cleanup()
     }
   })

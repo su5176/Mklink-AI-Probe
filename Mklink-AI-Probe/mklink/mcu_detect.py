@@ -167,20 +167,20 @@ def _algorithm_record(attrs: dict[str, str], pdsc: Path) -> dict:
     }
 
 
-def _find_device_memory(subfamily: ET.Element, device_name: str) -> list[dict]:
-    target = None
+def _find_device_element(subfamily: ET.Element, device_name: str) -> ET.Element | None:
     normalized = _norm_device(device_name)
     for dev in subfamily.findall("device"):
+        if _norm_device(dev.attrib.get("Dname")) == normalized:
+            return dev
+    for dev in subfamily.findall("device"):
         dname = _norm_device(dev.attrib.get("Dname"))
-        if dname == normalized:
-            target = dev
-            break
-    if target is None:
-        for dev in subfamily.findall("device"):
-            dname = _norm_device(dev.attrib.get("Dname"))
-            if dname and normalized.startswith(dname.rstrip("X")):
-                target = dev
-                break
+        if dname and normalized.startswith(dname.rstrip("X")):
+            return dev
+    return None
+
+
+def _find_device_memory(subfamily: ET.Element, device_name: str) -> list[dict]:
+    target = _find_device_element(subfamily, device_name)
     if target is None:
         return []
     regions = []
@@ -222,11 +222,23 @@ def _discover_from_pdsc(device: str, pack_roots: list[Path]) -> dict | None:
                 if not any(normalized.startswith(_norm_device(d).rstrip("X")) for d in device_names):
                     continue
 
-            algorithms = [
-                _algorithm_record(alg.attrib, pdsc)
-                for alg in subfamily.findall("algorithm")
-                if _is_internal_algorithm(alg.attrib)
-            ]
+            # <algorithm> may sit directly under <subFamily> or under each
+            # <device> (e.g. Keil.STM32F4xx_DFP declares per-device). The
+            # device-level entry is the more specific match and wins; keep
+            # subFamily-level entries only as fallback.
+            device_el = _find_device_element(subfamily, device)
+            algorithm_parents = (
+                [device_el, subfamily] if device_el is not None else [subfamily]
+            )
+            algorithms: list[dict] = []
+            for parent in algorithm_parents:
+                algorithms = [
+                    _algorithm_record(alg.attrib, pdsc)
+                    for alg in parent.findall("algorithm")
+                    if _is_internal_algorithm(alg.attrib)
+                ]
+                if algorithms:
+                    break
             processor = subfamily.find("processor")
             dclock = None
             if processor is not None:
@@ -403,12 +415,16 @@ def detect_mcu_profile(
             "candidates": candidates,
         }
     if not selected:
+        if candidates:
+            message = "Multiple internal flash algorithms found; specify one with flm/--flm."
+        else:
+            message = "No internal flash algorithm found in the matched pack entry."
         return {
             "status": "needs_selection",
             "device": device_name,
             "profile_key": discovered["profile_key"],
             "candidates": candidates,
-            "message": "Multiple internal flash algorithms found; specify one with flm/--flm.",
+            "message": message,
         }
 
     basename = _flm_basename(selected["name"])

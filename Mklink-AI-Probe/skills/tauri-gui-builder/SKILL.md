@@ -1,6 +1,6 @@
 ---
 name: tauri-gui-builder
-description: Build and qualify the Mklink AI Probe Tauri v2 Windows desktop app, bundled Python sidecar, and standard NSIS installer.
+description: Maintainer-only workflow to build and qualify the Mklink AI Probe Tauri v2 Windows app, bundled Python sidecar, and standard NSIS installer. Invoke explicitly in a source checkout; never use for ordinary end-user GUI startup or hardware debugging.
 ---
 
 # Mklink AI Probe Tauri Builder
@@ -11,6 +11,10 @@ Use this skill for desktop GUI compilation, installer generation, bundled-sideca
 
 - Read `AGENTS.md` and `docs/ai/CURRENT_HANDOFF.md` before building.
 - Use the repository script at `skills/tauri-gui-builder/scripts/build.py`.
+- Invoke it through `scripts/build_workspace.ps1 -Action run -Executable python
+  -ArgumentList @('skills/tauri-gui-builder/scripts/build.py', ...)` so build
+  scratch and caches stay under the main checkout's ignored `.build/` on E:.
+  Follow `docs/ai/build-storage.md`; never build on C: or upload `.build/`.
 - Do not use completed files under `docs/superpowers/` as active instructions.
 - The packaged application must work without Python, Node, Rust, Keil, or a source checkout on the target computer.
 
@@ -31,17 +35,19 @@ Development builds may fall back to a Python backend. Release installers must co
 Run from the project root:
 
 ```powershell
-python skills/tauri-gui-builder/scripts/build.py --check
-python skills/tauri-gui-builder/scripts/build.py
-python skills/tauri-gui-builder/scripts/build.py --bundle
-python skills/tauri-gui-builder/scripts/build.py --clean
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('skills/tauri-gui-builder/scripts/build.py', '--check')
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('skills/tauri-gui-builder/scripts/build.py')
+./scripts/build_workspace.ps1 -Action run -Executable python -ArgumentList @('skills/tauri-gui-builder/scripts/build.py', '--bundle')
+./scripts/build_workspace.ps1 -Action clean
 ```
 
 Outputs:
 
-- executable: `gui/src-tauri/target/release/mklink-ai-probe.exe`
-- setup/updater executable: `gui/src-tauri/target/release/bundle/nsis/*.exe`
-- updater signature: `gui/src-tauri/target/release/bundle/nsis/*.exe.sig`
+- executable: `.build/cache/cargo/release/mklink-ai-probe.exe`
+- setup/updater executable: `.build/cache/cargo/release/bundle/nsis/*.exe`
+- updater signature: `.build/cache/cargo/release/bundle/nsis/*.exe.sig`
+
+These paths are relative to the main checkout, shared across worktrees.
 
 `--bundle` must force a fresh PyInstaller sidecar and collect:
 
@@ -58,7 +64,7 @@ password by default.
 
 ## Release Candidates
 
-Copy candidate installers to the main repository `release` directory. Include the source commit in every filename and generate a SHA-256 list. Keep installers, sidecars, checksums, logs, and extracted MSI contents out of Git.
+Copy candidate installers to the main checkout's `.build/artifacts` directory. Include the source commit in every filename and generate a SHA-256 list. Keep installers, sidecars, checksums, logs, and extracted MSI contents out of Git. Preserve existing official `release/` assets.
 
 Generate only the standard NSIS by default. MSI and WebView2-offline variants require explicit user authorization.
 
@@ -76,13 +82,11 @@ Do not use the removed `/api/dashboard/status` endpoint. Use the current `/api/d
 
 ## Cleanup
 
-After copying external release artifacts, restore tracked `gui/dist` files and remove only generated paths from the current build:
-
-- `build/`
-- `dist/`
-- `gui/src-tauri/binaries/`
-- `gui/src-tauri/target/`
-- `mklink-sidecar.spec`
-- generated `__pycache__/` directories
+The workspace launcher cleans only the current `.build/runs/<run>/` temporary
+directory, including PyInstaller work/dist/spec data. Preserve shared Cargo and
+dependency caches. The bundler removes its staged sidecar and STCP resource.
+Do not discard intentional tracked `gui/dist` updates or remove runtime assets.
+If cleanup encounters links or denied access, report the exact paths instead
+of forcing deletion; the maintainer will handle them manually.
 
 The final worktree must be clean. Windows installers are currently unsigned, so qualification reports must retain the unknown-publisher limitation.

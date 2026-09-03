@@ -7,6 +7,7 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, watch } from 'vue'
+import { invoke, isTauri } from '@tauri-apps/api/core'
 import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import '@xterm/xterm/css/xterm.css'
@@ -20,6 +21,7 @@ const normalizer = new SeggerAnsiNormalizer()
 let terminal: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let resizeObserver: ResizeObserver | null = null
+let pasteHost: HTMLElement | null = null
 
 function write(text: string): void {
   const normalized = normalizer.push(text)
@@ -47,6 +49,94 @@ function activate(): void {
     fit()
     focus()
   })
+}
+
+function legacyCopy(text: string): boolean {
+  const input = document.createElement('textarea')
+  input.value = text
+  input.setAttribute('readonly', '')
+  input.style.position = 'fixed'
+  input.style.opacity = '0'
+  document.body.appendChild(input)
+  input.select()
+  try {
+    return document.execCommand('copy')
+  } finally {
+    input.remove()
+    terminal?.focus()
+  }
+}
+
+async function writeClipboard(text: string): Promise<void> {
+  if (isTauri()) {
+    try {
+      await invoke('clipboard_write_text', { text })
+      return
+    } catch { /* WebView clipboard is the fallback for a transient native failure */ }
+  }
+  if (navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text)
+      return
+    } catch { /* fall through for insecure contexts or denied permission */ }
+  }
+  if (!legacyCopy(text)) throw new Error('Clipboard write is unavailable')
+}
+
+async function readTauriClipboard(): Promise<string> {
+  try {
+    return await invoke<string>('clipboard_read_text')
+  } catch {
+    if (!navigator.clipboard?.readText) throw new Error('Clipboard read is unavailable')
+    return await navigator.clipboard.readText()
+  }
+}
+
+function handleBrowserPaste(event: ClipboardEvent): void {
+  event.preventDefault()
+  event.stopPropagation()
+  if (!props.inputEnabled) return
+  const text = event.clipboardData?.getData('text/plain') ?? ''
+  if (text) terminal?.paste(text)
+}
+
+function handleShortcut(event: KeyboardEvent): boolean {
+  if (event.type !== 'keydown' || (!event.ctrlKey && !event.metaKey) || event.altKey) return true
+  const key = event.key.toLowerCase()
+  if (key === 'a') {
+    event.preventDefault()
+    terminal?.selectAll()
+    return false
+  }
+  if (key === 'c') {
+    const selection = terminal?.getSelection() ?? ''
+    if (!selection) return true
+    event.preventDefault()
+    void writeClipboard(selection).catch(() => undefined)
+    return false
+  }
+  if (key === 'v') {
+    if (!props.inputEnabled) {
+      event.preventDefault()
+      return false
+    }
+    // Browser paste events provide clipboardData without the permission prompt
+    // required by navigator.clipboard.readText(). The capture listener below
+    // feeds that trusted event into xterm exactly once.
+    // Returning true lets xterm translate Ctrl+V into the terminal control
+    // byte SYN (0x16) and cancel the DOM key event. Leave the event itself
+    // untouched, but stop xterm's key handling so Chromium can dispatch its
+    // trusted paste event to the capture listener below.
+    if (!isTauri()) return false
+    event.preventDefault()
+    void readTauriClipboard()
+      .then(text => {
+        if (text && props.inputEnabled) terminal?.paste(text)
+      })
+      .catch(() => undefined)
+    return false
+  }
+  return true
 }
 
 watch(() => props.inputEnabled, enabled => {
@@ -78,6 +168,9 @@ onMounted(() => {
   fitAddon = new FitAddon()
   terminal.loadAddon(fitAddon)
   terminal.open(element)
+  pasteHost = element
+  element.addEventListener('paste', handleBrowserPaste, true)
+  terminal.attachCustomKeyEventHandler(handleShortcut)
   terminal.onData(data => {
     if (props.inputEnabled) emit('input', data)
   })
@@ -89,6 +182,8 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  pasteHost?.removeEventListener('paste', handleBrowserPaste, true)
+  pasteHost = null
   resizeObserver?.disconnect()
   terminal?.dispose()
   terminal = null

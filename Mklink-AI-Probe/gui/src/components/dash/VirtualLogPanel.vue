@@ -11,7 +11,7 @@
         >
           <span class="virtual-log-number">{{ entry.number }}</span>
           <span class="virtual-log-time">{{ formatTime(entry.time) }}</span>
-          <span class="virtual-log-level">{{ entry.level }}</span>
+          <span class="virtual-log-level">{{ entry.label || entry.level }}</span>
           <span class="virtual-log-text">{{ entry.text }}</span>
         </div>
       </div>
@@ -26,6 +26,7 @@ export interface VirtualLogInput {
   readonly time: number | bigint
   readonly level: 'raw' | 'data' | 'warning' | 'error'
   readonly text: string
+  readonly label?: string
 }
 
 interface VirtualLogEntry extends VirtualLogInput { readonly number: number }
@@ -80,6 +81,13 @@ function clear(): void {
   }
 }
 
+function exportText(): string {
+  flush()
+  return entries.value.map(entry => (
+    `${formatTime(entry.time)}\t${entry.label || entry.level}\t${entry.text}`
+  )).join('\n')
+}
+
 function scrollToBottom(): void {
   const element = viewport.value
   if (!element || !following.value) return
@@ -123,7 +131,7 @@ onUnmounted(() => {
   window.removeEventListener('resize', measure)
 })
 
-defineExpose({ append, clear, retainedCount, firstLineNumber, following })
+defineExpose({ append, clear, exportText, retainedCount, firstLineNumber, following })
 </script>
 
 <style scoped>

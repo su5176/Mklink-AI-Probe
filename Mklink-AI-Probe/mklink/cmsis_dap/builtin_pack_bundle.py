@@ -27,6 +27,13 @@ def _text(value: object, description: str) -> str:
     return value.strip()
 
 
+def _optional_text(*values: object) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _pack_path(root: Path, value: object) -> Path:
     relative_text = _text(value, "builtin pack file")
     relative = Path(relative_text)
@@ -94,5 +101,11 @@ def load_builtin_pack_records(root: Optional[Path] = None) -> List[TargetRecord]
                 pack_path=str(pack_path),
                 installed=True,
                 source="bundle",
+                family=_optional_text(raw_target.get("family")),
+                series=_optional_text(
+                    raw_target.get("series"),
+                    raw_target.get("sub_family"),
+                    raw_target.get("subfamily"),
+                ),
             ))
     return records

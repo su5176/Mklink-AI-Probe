@@ -1,216 +1,107 @@
 {
   "schema_version": 1,
-  "updated_at": "2026-08-03T20:54:44+08:00",
+  "updated_at": "2026-09-02T13:18:45+08:00",
   "repository": {
     "url": "https://github.com/su5176/Mklink-AI-Probe",
     "project_root": "Mklink-AI-Probe",
     "branch": "master",
-    "head": "Qualified feature commit ca031f6 is merged into master by f985dba. v0.1.6 adds the native-only main-GUI Site Agent page, one shared sidecar/device/resource manager, DPAPI credential storage, tray lifecycle, and a seven-file Release contract including the standalone portable ZIP and manifest.",
-    "remote_head": "origin/master contains merge commit f985dba and qualified feature commit ca031f6. GitHub authentication is active for su5176/Mklink-AI-Probe and v0.1.6 does not yet exist as a tag or Release.",
-    "working_tree": "The v0.1.6 code merge is pushed to origin/master. Full automated, production-build, and fresh GEC1900 Windows hardware gates are green. The qualified main GUI remains running on the field machine with its unified local backend, LAN Site Agent, and recognized STM32F40x target."
+    "head": "master contains the SystemView session lifecycle fix, bounded first-session recovery, synchronized Web assets, and regression coverage.",
+    "remote_head": "origin/master contains the validated SystemView session lifecycle fix; feature/eternal-chip-gui carries the corresponding source fix with its own branded Web assets.",
+    "working_tree": "Keep the checkout clean; build output belongs in MKLINK_BUILD_ROOT or the ignored .build directory."
   },
   "mission": {
-    "product": "MKLink/MicroLink tooling for local and authenticated VPN/LAN remote firmware flash, embedded debug, symbols, memory, RTT/SystemView/VOFA/SuperWatch streaming, Serial, Modbus, MCP, Web, Tauri desktop, and standalone Site Agent workflows.",
-    "maintenance": "Keep this file limited to the current baseline, durable decisions, latest qualification evidence, unresolved limits, and next actions. Git history is the record for completed chronology."
+    "product": "维护 MKLink/MicroLink 的烧录、调试、Web/Tauri GUI、AI Skill、串口、Modbus 和远程 Site Agent。",
+    "maintenance": "交接只保留当前基线、关键验证、长期约束和未完成事项；历史过程从 Git 与验证报告查询。"
   },
   "current_session": {
-    "status": "v016_merged_pending_release_key",
-    "current_task": "Integrate Site Agent into the main Tauri GUI and unified Python sidecar while retaining the standalone portable Windows client, then merge and publish v0.1.6 to the su5176 GitHub Releases page.",
-    "release": "All active product, plugin, main-Tauri, standalone-Tauri, core-package, portable-package, and release-history surfaces use 0.1.6. GitHub merge and publication are authorized by the maintainer request, and the fresh GEC1900 hardware gate is complete. A signed NSIS build still awaits the established Tauri updater private key or an explicit narrower portable-only publication decision. Gitee/latest.json synchronization is not authorized by the current GitHub-only request."
+    "status": "v0.1.9-systemview-session-fixed",
+    "current_task": "SystemView WebGUI 会话生命周期、首会话单次有界恢复、状态可观测性、回归测试、真机 HIL 以及 master/立芯分支同步均已完成。",
+    "release": "本轮未创建标签、Release、安装器或签名，也未执行目标固件烧录或 OTA；这些动作仍需单独授权。"
   },
   "milestones": [
     {
-      "name": "Product and distribution baseline",
+      "name": "0.1.9 桌面端与 WebGUI",
       "status": "complete",
-      "notes": "Online/offline flash, debug control, symbols and types, bounded binary streaming, Serial, Modbus, MCP, Web, Tauri v2, bundled Python sidecar, USB Web entry, browser file uploads, updater flow, and resource arbitration are implemented."
+      "notes": "采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。"
     },
     {
-      "name": "Flash, symbols, and RTT correctness",
+      "name": "隐私安全的内存可观测性",
       "status": "complete",
-      "notes": "Builtin pyelftools is authoritative by default; aggregate symbols and bounded pasted C layouts work; symbol reload is a shared device transaction; HPM low-address writable ELF sections can supply _SEGGER_RTT; successful automatic connections backfill the actual serial port; online/offline flash workflows retain files and rebuilt-image changes correctly."
+      "notes": "从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。"
     },
     {
-      "name": "HPM5301 ROM API and SuperWatch",
+      "name": "PR #15 本地集成门禁",
       "status": "complete",
-      "notes": "HPM targets use the device ROM API without FLM. SuperWatch uses a fixed-duration oscilloscope timeline that follows live data with an adjustable fixed lag, freezes on pause, and supports retained-history navigation. HPM online flash synchronously stops SuperWatch, closes the shared Device, and releases the probe before programming."
+      "notes": "Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。"
     },
     {
-      "name": "Global GUI localization and navigation",
+      "name": "SystemView 会话生命周期修复",
       "status": "complete",
-      "notes": "One persistent Chinese/English switch controls the Web/Tauri shell and embedded waveform workspace. The shell brand is MKLink. Technical English names remain unchanged. Dashboard order is RTT View, SuperWatch, HardFault, Memory, Debug Control, Serial Assistant, Modbus, RTOS Trace, and Symbols last. The content card starts directly with a compact tab row; the redundant Dashboard heading is removed and the resource-owner status shares that row. A persistent header action provides quick Device connect/disconnect, and each Dashboard surface now explains only its current missing prerequisite with an inline action. RTT View keeps address/source on one row and grouped acquisition, encoding, metrics, and secondary actions on the next; data-format examples open on demand instead of consuming a permanent third row."
-    },
-    {
-      "name": "Lazy large-array symbol browsing",
-      "status": "complete",
-      "notes": "Arrays are grouped into 256-direct-element range nodes and expanded on demand. Structure arrays and nested arrays retain their hierarchy; exact backend search resolves unloaded paths; later elements support type lookup and the normal SuperWatch/read/write descriptor path. The old first-256-leaves warning is removed."
-    },
-    {
-      "name": "HPM5301 SystemView recorder and analysis",
-      "status": "complete",
-      "notes": "RTOS Trace shares RTT address state with RTT View and uses the probe SystemView bridge plus SEGGER UART Recorder handshake. Delayed TaskList recovery, parser framing recovery, valid HPM ram_base=0/id_shift=0, exact Runtime/Context analysis, inactive task retention, and running-session metadata hydration restore task1/task2/task3/Tmr Svc correctly. Timeline uses a microsecond ruler, 10-second default, 10/30/60-second choices, 300,000-event browser ring, wheel zoom, drag pan, and Fit All. Explicit JSONL recording is independent of display and acquisition; offline replay is bounded and supports pause, speed, progress, and restart."
-    },
-    {
-      "name": "RTT terminal mode",
-      "status": "complete",
-      "notes": "RTT remains channel 0 only. Binary terminal chunks decode incrementally without waiting for LF, while existing line and waveform parsing remain parallel. The Web view switches between 日志 and 终端 without restarting RTT; xterm.js handles common ANSI colors, cursor movement, erase, and clear controls, with SEGGER 2;3Xm and 4;4Xm compatibility normalization. xterm convertEol is enabled so RT-Thread bare LF and conventional CRLF both begin the next display row at column zero without rewriting backend data. Keyboard input is batched and serialized through the existing RTT Down Buffer write API; termios, PTY/ConPTY, multi-channel UI, and SEGGER virtual terminals are intentionally out of scope."
-    },
-    {
-      "name": "Serial Assistant terminal and explicit Device lifecycle",
-      "status": "complete",
-      "notes": "Serial Assistant provides 日志 and xterm terminal modes without requiring an MKLink target connection. The backend publishes immediate exact RX/TX chunks alongside existing structured events; the terminal consumes RX only, uses shared ANSI/SEGGER normalization and convertEol, and forwards serialized keyboard bytes only while the selected UART is open. Explicit Open/Close controls own the serial lifecycle; mode, dashboard-tab, and route changes close only the browser subscription. Serial and RTT keep separate resources, settings, histories, status, and transports. Stopping the last MKLink Dashboard keeps the shared Device connected. Only the persistent Dashboard header Disconnect action releases the probe, stops MKLink-dependent Dashboards, and leaves Serial Assistant and Modbus untouched. Automated, Web, real-target, and paired-virtual-UART qualification passed."
-    },
-    {
-      "name": "Offline flash UX and conservative device labeling",
-      "status": "complete",
-      "notes": "Offline Flash requests include only algorithms referenced by firmware rows, so unused missing FLMs do not block deployment. Selected unavailable FLMs are highlighted and can be replaced with a local upload; common backend failures are translated into actionable guidance with expandable technical details. RTT View and Serial Assistant default to Terminal mode. Header links expose only 在线文档 and 淘宝店 labels. The STM32F10x profile no longer claims Medium Density from a family-level IDCODE match."
-    },
-    {
-      "name": "Remote Site Agent and in-process STCP integration",
-      "status": "complete",
-      "notes": "The standalone field client remains a portable Windows EXE/ZIP with direct WebSocket and in-process LAN STCP. The pending v0.1.6 main Tauri GUI adds a native-only Site Agent page and hosts the same listener inside the existing Python sidecar, borrowing the GUI Device and ResourceManager instead of opening a second backend or probe. DPAPI-protected credentials are passed only through the owned child environment; enabled service lifecycle is retained in the tray."
+      "notes": "分离 duration 与单调时钟 idle watchdog，容忍瞬态读取，按设备连接代次仅为第一个会话提供一次自动恢复；重试时清理解析器、历史、统计、任务与 CPU hint，并在 WebGUI 显示恢复代次、原因和停止错误。"
     }
   ],
   "verification": [
     {
-      "area": "v0.1.6 unified main-GUI Site Agent final gate",
-      "result": "On feature/gui-site-agent-integration from ba56901, full Python passed 1,253 with 1 skipped; full GUI passed 49 files and 494 tests; vue-tsc and Vite 8.1.5 production build passed. Main Tauri Rust passed 10 tests, rustfmt check, and optimized release build. The isolated PyInstaller sidecar build and local health smoke passed. Fresh GEC1900 Windows HIL opened the actual Site Agent page, generated and stored a DPAPI CurrentUser token, applied LAN configuration, and verified a 8766-to-8767-to-8766 restart sequence. The engineer CLI passed health, status, ports, capabilities, reconnect, and probe.info through the LAN Agent. GUI, Agent, and remote call agreed on the same STM32F40x target while sharing one sidecar worker and probe connection. Alt+F4 hid the GUI to tray without stopping either listener or the target connection. Two HIL defects were fixed and regressed: the Windows Job Object now terminates the complete PyInstaller child generation before restart, and restore_last no longer requests symbol parsing when a shared connection has no AXF. The final field runtime was restarted without the temporary WebView debug port, reconnected read-only, and left ready; temporary plaintext token files, CLI site registration, debug environment, and scheduled tasks were removed. No flash, reset, halt, RAM write, register write, or firmware change was performed. The updater private key remains unavailable, so signed NSIS publication is still blocked."
+      "area": "Python",
+      "result": "最终全量 1805 passed, 1 skipped，耗时 657.28 秒；SystemView 状态机定向回归 15 passed。Windows 默认 GBK 会使发布清单夹具解码 Git UTF-8 内容失败，使用明确的 PYTHONUTF8=1 后定向与全量均通过。"
     },
     {
-      "area": "PR #8 Site Agent v0.1.5 merge and final gate",
-      "result": "Tested runtime tip efbc44f aligns the Site Agent core, provenance, wheel/distribution audit, portable GUI manifest, GUI status, README, and third-party notice with product version 0.1.5. Independent A/B core ZIPs matched at SHA-256 BF67DDF54C68F8DD7D36EB74DCB549CD83A019C829020398C3D9E06211F432EA; independent portable GUI ZIPs matched at 031DD8C564619C1DE67FFF4CFA00753FBCB4CE4CCA28518C8DC51877E9972E8F. Clean package audit passed 4 tests, full Python passed 1,242 with 1 skipped, GUI passed 48 files and 491 tests plus type check and Vite 8.1.5 production build, Site Agent Rust passed 5 tests and release build, runtime npm audit was clean, and the full npm tree had one development-only high finding. The new packaged process passed ready, wrong-token rejection, health/status/capabilities, cooperative stop, and zero-residue cleanup. No MKLink CDC probe was connected for a fresh physical rerun; commit 2bbbcc0 with combined STM32 Site Agent HIL is an ancestor, and mklink/remote plus native/stcp_bridge have identical Git trees through efbc44f, so no new physical result is inferred and the code-identical hardware evidence remains applicable. GitHub merged qualified head 18af032 into su5176/master as merge commit 77a4433 after confirming the PR remained CLEAN and had no configured status checks; origin/master was then verified to contain the qualified head."
+      "area": "GUI 与 Web",
+      "result": "Vitest 59 files / 627 tests 全部通过；生产构建转换 1945 modules。真实 Chromium 连接 STM32F411CE 目标验证 SystemView 持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning，停止、断连和进程退出正常。"
     },
     {
-      "area": "Web entry dynamic-port and launch-feedback gate",
-      "result": "On fix/web-entry-launch-feedback, browser-hosted REST, SSE, JSON-RPC, and binary streams use the current page origin while Tauri retains its configured port 8765 sidecar endpoint. The Web entry page shows a 25-second countdown over the existing 20-second backend readiness timeout, gives actionable timeout guidance, and reminds users to re-register after Skill updates or moves. GUI passed 48 files and 491 tests; the Vite 8.1.5 production build passed with VITE_APP_BUILD_COMMIT=6899d10e008e; the raw Python suite reached 1,227 passed and 1 skipped with only the 12 known symlink-privilege failures and 3 missing-STCP-DLL package errors; the comparable reduced gate passed 1,227 tests with 1 skipped and 15 explicit deselections. A source Web service served health and the new runtime-marked bundle successfully on non-default port 8770. Commit 1fd998d was archived as an unchanged-version 0.1.5 Skill package with SHA-256 D511CA0804BE2B43673684F6E03C959F31EB2F499989376EAE3C2CF617777DDF and installed into the user Skill root. With a benign server occupying 8765, the installed Web entry selected 8766; health, root, and the new bundle returned HTTP 200. A real Edge network capture observed 475 references to the 8766 origin across health, Device, RTT, Serial, SystemView, and assets, and zero references to 8765. Web entry stop released owned port 8766, the test blocker released 8765, the current-user protocol handler was re-registered, and the generated current-user launcher contains the countdown, timeout guidance, update reminder, and protocol link."
+      "area": "Go/STCP",
+      "result": "官方 Go 1.25.12 工具链下 go test ./... 通过；当前源码 DLL SHA-256=C49908A030D16629253683C7B3B4837673863081E4602D8A1F25B54AA0B79087。"
     },
     {
-      "area": "Web entry master integration and branch cleanup",
-      "result": "The verified fix branch was pushed, merged into master without conflicts through merge commit 4b83331, and pushed to origin/master. The four product and plugin version declarations remain 0.1.5. origin/master was verified to contain fix tip 7a69fce before the local and origin fix/web-entry-launch-feedback and fix/v015-skill-web-dist branches were deleted. The remaining origin fix/hpm5301-online-symbols branch and its local tracking branch were also deleted after confirming that master already contains its work. GitHub closed su5176/Mklink-AI-Probe#7 when its deleted source branch disappeared; it was not merged. Replacement pull request su5176/Mklink-AI-Probe#8 was opened from Aladdin-Wang:master with the complete v0.1.5 synchronization and dynamic-port Web entry evidence; its later qualified merge is recorded in the current PR #8 gate entry. No tag, release asset, updater manifest, or Gitee state changed."
+      "area": "Tauri Release 可执行文件",
+      "result": "Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，16.3 MB EXE SHA-256=86D3F036D828699737610C0AB7A1129D04431F47234236C804A6A2401355D072。"
     },
     {
-      "area": "Vite WebSocket proxy and source Web regression",
-      "result": "The source Vite server had proxied only /api since its introduction, while RTT, SuperWatch, SystemView, and VOFA later moved to /ws/streams/*. REST calls therefore remained healthy at port 5173 while binary streams bypassed the backend. vite.config.ts now forwards /ws with WebSocket upgrade enabled to port 8765, and a Node-environment Vitest test pins both /api and /ws proxy contracts. On the real STM32F103RC through http://127.0.0.1:5173, RTT delivered MSH output, 16-channel SuperWatch accumulated 631,520 complete samples around 859 Hz with zero host/target errors or drops, RTOS Trace received about 154,089 events, and a direct VOFA WebSocket handshake reached Open through the Vite proxy."
+      "area": "HIL-Infra 硬门禁",
+      "result": "contract_check 61 symbols / SHA 0347576fb2dd8c02...；pytest 380 passed；6 个 capmap 静态一致性零错误零豁免；bench-01、bench-gec1900、运行计划和资源映射通过。"
     },
     {
-      "area": "Imported Site Agent baseline evidence",
-      "result": "The clean combined-branch Windows Site Agent package had SHA-256 713FD6C34A4232455E42747AB41B2492E5B2B3E3ABDD1D8ADE78D13982E7FAE3 and contained no frpc/frps. Loopback health/status/capabilities/ports, token isolation, reconnect, STM32F10x probe.info, halted registers, confirmed superwatch_ch00 write/read/restore, RTT channel 0 HIL_PING echo, SystemView channel 1 with 8,148 bytes and 1,991 parsed events/tasks, cleanup, site deletion, and port release passed. Direct use of the user project root was correctly rejected because its remote-upload ACL was not owner-only; an isolated Agent state root with the AXF specified separately passed. External managed-LAN STCP was not rerun because no independent LAN frps endpoint was available."
+      "area": "HIL 运行时与插件准入",
+      "result": "MKLink runtime 拒绝探针与自动化插件评审 11/11 OK；run-verify RV-01..RV-10 全部 OK，run-doctor 零孤儿、结束后无活动锁。本轮未烧录目标、未执行 OTA、未改变供电或发送 CAN。"
     },
     {
-      "area": "Large-array symbol browsing",
-      "result": "On the real STM32 AXF, _thread_stack exposed eight 256-element ranges through [1792..2047]. The tail request returned exactly _thread_stack[1792] through _thread_stack[2047], exact search found unloaded _thread_stack[2047], type lookup reported uint8_t at 0x20009A63, and target read returned 35. No write was performed because the available large arrays are active stack/buffer memory; the dynamic write path is covered automatically. SuperWatch and Symbols Web views both rendered only the selected tail page, omitted [0], removed the old warning, and produced no console warnings or errors."
+      "area": "SystemView 真机链路",
+      "result": "原生 CLI 在 COM5、channel 1、RTT 控制块 0x20010d40 上运行 10 秒并持续输出有效事件；最终生产 WebGUI 会话约 70 秒达到 260744 events。既有故障故事中的首会话自动恢复实测曾持续 80 秒达到 165967 events 且零错误。"
     },
     {
-      "area": "HPM5301 flash and dump-memory",
-      "result": "The hello_world sample rebuilt, programmed, and verified through the HPM ROM API at 0x80000400. One 4-byte region sustained 6,935.9 Hz and three regions totaling 9 bytes sustained 2,416.4 Hz in 30-second runs with no flags, parser warnings, or failures. SuperWatch also accumulated more than 100,000 complete samples without host drops and released the probe before online flash."
-    },
-    {
-      "area": "STM32F103RC dump-memory throughput",
-      "result": "Keil ARMClang rebuilt and downloaded the STM32F103RC target with no errors or warnings. Separate-region dump-memory sweeps reached about 30.22/16.53/8.87/4.50/2.29 kHz for 1/2/4/8/16 regions; the 16-region 30-second run sustained 2,262.44 Hz with zero flags or mismatches. SuperWatch coalesced 16 contiguous floats into one 64-byte block and rendered all channels at 6,636.66 Hz over 30 seconds with no acquisition, parser, backend, or transport drops; the Hz-only badge matched an independent counter measurement."
-    },
-    {
-      "area": "SuperWatch Web interaction baseline",
-      "result": "Real STM32 Web tests qualified the complete current interaction model: configurable history up to 1,000,000 points/channel without changing the live span, frozen pause history with pan/zoom/minimap browsing, live X zoom and navigation that preserve a fixed lag while advancing, double-click reset to the newest window, independent split-channel Y axes with shared X, persistent merge control, and an auto-hiding channel legend. The one-request-in-flight Worker envelope scheduler remains responsive near 9.26 kHz, and the tested surfaces produced no transport/backend drops or browser warnings/errors."
-    },
-    {
-      "area": "Symbols, RTT, and GUI hardware loop",
-      "result": "Builtin ELF resolved HPM low-address _SEGGER_RTT and portable writable variables. RTT auto-search and address sharing worked. The source Web GUI was exercised in Chinese and English at desktop and mobile sizes without relevant console errors or document overflow."
-    },
-    {
-      "area": "SystemView hardware loop",
-      "result": "The HPM target streamed at 360 MHz with four correctly named tasks, late-attach metadata recovery, 10/30/60-second views, a 300,000-event browser ring, and zero parser packet drops. Independent JSONL recording captured about 42,844 events over 21 seconds while Trace continued; bounded replay supports pause, speed, progress, and restart."
-    },
-    {
-      "area": "Current live surface",
-      "result": "During the final visual handoff, the installed Skill Web GUI ran as an owned Web entry service on loopback and returned HTTP 200 from /api/health. The Device was disconnected, no AXF was loaded, and the current-user MICROKEEN launcher had been regenerated. The browser and Windows-control plugins were unavailable during that handoff, so the system browser was opened through the Web entry itself; the preceding real Edge network capture provides the page-level dynamic-origin evidence."
-    },
-    {
-      "area": "Combined STM32F103RC Web and hardware regression",
-      "result": "On the real STM32F103RC, 16-channel SuperWatch ran in dump-memory mode around 844-858 Hz with zero read, parser, firmware, backend, or transport drops; all 16 curves filled the full canvas, the legend auto-hid, pause retained 200,000 transport samples, changing the history limit from 50,000 to 250,000 points/channel preserved the paused viewport, and stopping kept Device connected. RTT channel 0 accepted help and returned the MSH prompt with zero stream drops. HardFault reported no fault; Memory read 64 bytes at 0x20000000; halt/core-register/resume returned plausible ARM registers and restored execution. SystemView captured 14,320 events and 56,865 bytes in four seconds at 72 MHz, recovered six task names plus SysTick, had no event-packet or target-overflow drops, and stopped cleanly. _thread_stack returned exactly 256 tail elements from [1792] through [2047]. The paired virtual UART passed a synchronized bidirectional REST/OS loop with exact 9-byte TX and 11-byte RX, Modbus returned HTTP 409 while the serial port was occupied without closing Serial Assistant, and explicit Serial stop allowed immediate native reopen."
-    },
-    {
-      "area": "RTT terminal Web and STM32 hardware loop",
-      "result": "The STM32F103RC test firmware rebuilt with Keil ARMClang without errors or warnings and was downloaded with IDE verify OK. Triggering its controlled ANSI self-test rendered RT-Thread green/yellow/red/magenta log colors, SEGGER normal and bright foreground/background macros, ESC[2K line erase, cursor overwrite, ESC[2J clear/home, and a split CSI sequence in the xterm terminal. Terminal keyboard input reached RTT channel 0 and returned 0d (Enter), 7f (Backspace), and 1b 5b 41 (ArrowUp) through the diagnostic loopback. With the later Agile Console RTT firmware, the real MSH help command emitted bare-LF lines that all rendered from column zero; the prompt and consecutive rows had no staircase or extra blank lines, while Log mode retained all 37 raw rows. Log/terminal switching and view-local clear worked without stopping RTT; transport/backend drops stayed at 0. At a 768px viewport document width equaled the viewport and the terminal/control rows remained contained; browser warning/error logs were empty."
-    },
-    {
-      "area": "Serial Assistant Web and paired virtual UART loop",
-      "result": "A Windows ELTIMA paired virtual serial fixture exercised the real OS serial API with concrete port identifiers intentionally omitted. A partial prompt produced an immediate terminal event before its later LF; ANSI color data, bare LF, CRLF, and a CSI sequence split across writes arrived exactly while structured Log events remained line-based. Reverse TX matched all 18 expected bytes for ASCII plus CRLF, binary 00 AA 55 FF, Enter, Backspace, and ArrowUp; terminal events preserved TX for statistics while the UI remains RX-only. Explicit stop released the OS port, reconnect reset counters and restored traffic, ended SSE subscribers did not stop acquisition, a second native open was denied, and 500 fixed-size lines delivered 3,000 of 3,000 bytes with 500 of 500 rows. Repeated CLI sends passed after the byte-zero lock fix; released lock markers report no owner. Modbus access to the occupied serial port returned HTTP 409 and left Serial Assistant open. Automated coverage still verifies no MKLink gate, separate send history, no local TX echo, status recovery, mode-local clear, and no stop on unmount; disconnected desktop and 768px Web layouts have no overflow or page errors."
-    },
-    {
-      "area": "Dashboard Device ownership and independent serial lifecycle",
-      "result": "On the STM32 target, RTT and Serial Assistant ran concurrently. Stopping RTT while it was the last running MKLink-dependent Dashboard left Device connected and Serial Assistant running. The persistent header Disconnect action then stopped RTT and released Device while Serial Assistant stayed open and transmitted again through the real Windows serial API. Header quick connect restored the last successful probe and target settings without affecting Serial Assistant. Explicit Serial Assistant Close released its OS port for immediate native reopen while Device remained connected; final explicit header Disconnect left Device and all Dashboards stopped with an empty resource map."
-    },
-    {
-      "area": "Scheme 2 Web regression",
-      "result": "After restarting the local backend to load the new profile, the real Chrome Web GUI showed label-only 在线文档 and 淘宝店 links with exact target URLs, RTT View Terminal pressed by default, Serial Assistant Terminal pressed by default, and no raw link address in visible text. The Offline Flash page loaded against the detected probe drive and retained disabled build actions until a valid firmware/algorithm sequence was configured. The device status no longer reported Medium Density after the new profile was loaded; disconnected status correctly omitted the MCU badge."
-    },
-    {
-      "area": "v0.1.5 NSIS installer qualification",
-      "result": "The standard x64 NSIS installer Mklink-AI-Probe-v0.1.5-x64-Setup.exe installed over the registered v0.1.4 application with exit code 0; registry DisplayVersion is 0.1.5. The installed Tauri app started with bundled mklink-sidecar.exe, GET /api/health and /api/online-flash/probes returned HTTP 200, and no python.exe/pythonw.exe process was present. Closing the app normally released port 8765 and left no Mklink or Python processes. SHA-256: D8D07B655D908A0685A0C4F3B68CF831FEAF4A8E01019070B542DDC30294DF23 for the installer and 1CB683A7A38FBE6DC8E9F096F9B3A944B545778157B1DCBE90A85C649DAB07F4 for its signature."
-    },
-    {
-      "area": "Fork-only v0.1.5 publication",
-      "result": "This publication evidence belongs to the Aladdin-Wang fork and does not describe the su5176 target repository. In that fork, GitHub and Gitee master, annotated v0.1.5 tag, and updates branch were synchronized; both Releases contain the installer, updater signature, Skill archive, SHA256SUMS.txt, and release-manifest.json. The published installer is 65,895,556 bytes with SHA-256 8B85845A9858762808B4B5FEE0DC581D11D46AC92CC55C3F3C6DD45C41893321; the Skill archive is 3,035,282 bytes with SHA-256 8492E85059915690E63BADD5DF7D9B96BA02231070E71E4E6CDB17795DCF8A1F. Anonymous Gitee downloads matched both values, and the fork's GitHub/Gitee latest.json resolve version 0.1.5 and source commit 76a66b6bad79b289398f80edbbe604e5b2f2fce5."
+      "area": "PR #15 固件资产",
+      "result": "按用户决策采用 PR 文件：HPMLink V4.3.8 SHA-256=D295858F3914998ABB7A19F6064157F6695C5B43E362CB00553D7A295A7E3FA8；MicroLink V3.3.8 SHA-256=E213B248A137C6519A9E926EAAC78718CE844C2A20555F3A3D2A48581B099BE8；MicroLink V4.3.9 SHA-256=F29821A6A34B75F3DAE96416595CA572A2DACAAF54C9DCC17521845F212DCEF6。"
     }
   ],
   "decisions": [
-    "The main Windows Tauri GUI exposes Site Agent configuration only in the native runtime. Its remote listener runs inside the existing Python sidecar and shares the current GUI Device and ResourceManager; Web-only GUI builds do not expose native credential controls. The standalone portable Site Agent remains a separately runnable EXE/ZIP for field-only deployments.",
-    "The main Tauri process owns every bundled sidecar generation through a Windows Job Object. Restart and shutdown close that Job before launching a replacement, so PyInstaller one-file workers cannot outlive their tracked launcher or retain the API/Agent ports.",
-    "Restoring a shared Device connection without an AXF is valid. The backend reparses symbols only when an active or requested AXF path exists; restore_last must not turn an already-connected probe into a No AXF path set failure.",
-    "Main-GUI Site Agent configuration is stored in LocalAppData, while the access token and STCP credentials are DPAPI CurrentUser ciphertext. Plaintext is generated or entered only for provisioning, never returned by status APIs or placed on command lines, and inherited Site Agent/STCP environment variables are removed before controlled child injection.",
-    "Product version 0.1.6 is one coordinated release across Python, plugin, main Tauri, standalone Tauri, core and portable package metadata, and GUI history. A complete Release contains five payloads—NSIS, updater signature, Skill ZIP, portable ZIP, and portable manifest—plus SHA256SUMS.txt and release-manifest.json.",
-    "A field machine may run Site Agent from the integrated main Windows GUI when local GUI workflows are needed, or from the standalone portable EXE for field-only deployment. Engineer machines use the Skill, SDK, remote CLI, or optional remote MCP over authenticated direct ws/wss or managed LAN/VPN transport.",
-    "Non-loopback remote listeners require explicit --allow-lan and token configuration. Tokens come only from environment variables or owner-only files, and local operator confirmation remains mandatory for flash, erase, writes, activation, and Agent stop.",
-    "LAN STCP uses the pinned in-process library bridge. No frpc/frps executable is launched or packaged, and tunnel, Site Agent, and local confirmation credentials remain distinct.",
-    "Any combined-runtime change after the fork's ddf7ff27 qualification invalidates its deterministic package hashes and HIL verdict for release purposes; the integration branch must be rebuilt and requalified before merge or publication.",
-    "The source Vite development server must proxy both REST /api traffic and binary /ws WebSocket upgrades to the same local backend. Any new browser transport prefix requires an explicit development-proxy contract test so source-Web behavior cannot silently diverge from the bundled backend surface.",
-    "AGENTS.md and the repository maintenance Skill are authoritative. Before changing a product, interaction, architecture, workflow, or testing strategy, present the problem, options, tradeoffs, recommendation, and acceptance criteria, then wait for explicit maintainer confirmation. Confirmed-strategy root-cause fixes may proceed directly. Runtime changes require a fix/feature branch, full Python and GUI suites, production build, git diff check, project-memory update, and affected real-hardware loop. Never infer authority to commit, merge, push, sign, tag, publish, modify latest.json, or synchronize Gitee.",
-    "HPM targets always use the dedicated ROM API and never FLM. Agent-driven download routing is IDE-native build/download, then pyOCD online flash, then MKLink offline deployment; do not silently switch after a started operation fails.",
-    "Builtin pyelftools is the default ELF/DWARF backend. External GNU tools run only when explicitly selected. _SEGGER_RTT in ELF/AXF is accepted only when its complete storage lies in an allocated writable section.",
-    "Symbol reload is one shared backend transaction bound to the current Device. Requested and active paths must match, and SuperWatch must be stopped/rebound/restarted serially. Pasted C layouts remain bounded and fingerprint-scoped.",
-    "Large arrays page by 256 direct elements, represented as explicit [start..end] range nodes that load only when expanded. Paging is recursive for structure and nested arrays. Exact search resolves unloaded paths through the backend, and dynamically resolved descriptors remain valid for SuperWatch, type lookup, and read/write. Do not restore a first-256-readable-leaves limit or its UI warning.",
-    "Dashboard sessions and one-shot debug/flash operations use serialized resource leases. User operations may preempt Dashboard owners only after synchronous stop succeeds; one user operation never preempts another. HPM online flash also closes the shared CDC Device before opening its ROM-API backend.",
-    "Desktop and Web-entry clients stop only backend processes they created and still own. Web app shells use no-store, hashed assets may be immutable, and copied user-level Skill/runtime installations must not depend on the development checkout.",
-    "SuperWatch uses a fixed-duration timeline independent of history capacity, defaults to zoom 2 at the newest window, and supports up to 1,000,000 points/channel with a 48-byte-per-point memory estimate and a warning above 512 MiB. Live horizontal interactions preserve the chosen time lag and span while advancing; pause freezes the complete frontend history and viewport; resume clears the snapshot; double-click restores the newest default window. VOFA retains its adaptive timeline.",
-    "SuperWatch effective rate counts complete sample rows rather than variables and never uses the requested interval as the result. The backend uses a one-second perf_counter window as the authoritative status value; the binary viewer uses producer batch timestamps over at least 0.5 seconds for responsive updates between status polls and resets the statistic at stream/layout boundaries.",
-    "SuperWatch defaults to one shared plot. One visible channel may move to a lower plot with an independent persisted Y range while both plots share X navigation. The auto-hiding legend uses a compact reveal button, and a persistent split divider names the independent channel and provides Merge.",
-    "The global GUI language defaults to Chinese and persists under mklink_lang. English technical product names are not translated. Post-flash reconnection was explicitly canceled and must not be inferred.",
-    "RTT View is intentionally fixed to channel 0 with a compact 日志 | 终端 mode switch. Terminal mode uses xterm.js with convertEol enabled so bare LF and CRLF are both display newlines, common ANSI parsing plus SEGGER macro normalization, retained history while hidden, and keyboard forwarding through the existing Down Buffer API. Backend and Log-mode bytes remain unchanged. Do not add termios, PTY/ConPTY, multi-channel UI, or SEGGER virtual-terminal support without a new confirmed strategy.",
-    "Serial Assistant is independent of MKLink deviceConnected and uses the SERIAL_PORT resource while RTT uses MKLINK_BRIDGE/TARGET_DEBUG. Immediate raw serial chunks feed the terminal without waiting for LF; structured events remain parallel for Log mode. The terminal displays RX only and forwards raw keyboard bytes without local echo. Mode/tab/route changes preserve the backend session and close only the browser subscription; explicit Close Port is authoritative. Serial transmit settings/history remain separate from RTT. Physical UART and Modbus access to one COM port must still fail clearly rather than run concurrently.",
-    "Starting or stopping an MKLink-dependent Dashboard never owns the shared Device lifetime. The persistent Dashboard header Connect Device / Disconnect control is the authoritative normal Web owner: Connect restores the last successful actual probe port, AXF path, MCU hint, and ELF backend; Disconnect synchronously stops only MKLink-dependent Dashboards, releases their logical leases, and closes Device. Serial Assistant and Modbus remain independent and are never stopped by Device Disconnect. Dashboard tab, route, mode, and stream-subscriber changes remain non-owning.",
-    "Contextual setup guidance appears where work is blocked and offers the next useful action. Device-only tools prompt quick connect; RTT and RTOS Trace offer AXF/ELF loading for RTT address discovery; SuperWatch and Symbols distinguish missing, stale, empty, and failed symbol states; HardFault keeps symbols optional; RTOS Trace keeps offline JSONL replay available; Serial Assistant and Modbus guide missing serial-port setup without depending on Device.",
-    "Offline Flash serializes only algorithms referenced by firmware rows. Unused unavailable FLM candidates must not block deployment; a selected unavailable candidate must be visibly actionable through local replacement or another algorithm, and backend text remains available under technical details. RTT View and Serial Assistant default to Terminal mode. External documentation/store links display labels only and open with target=_blank plus noopener noreferrer. Family-level MCU IDCODE matches must not claim uncertain density/package qualifiers.",
-    "Windows serial advisory locks always lock byte zero and clear their PID marker before unlock, so repeated open/close cycles do not raise and released resources are not reported as live. Modbus Dashboard opens through ModbusClient.open and returns HTTP 409 when the requested serial port is busy or unavailable.",
-    "RTT View and RTOS Trace share one valid RTT address. SystemView uses SystemView.start plus the SEGGER recorder handshake and matching stop sequence on both ARM/SWD and HPM RISC-V/JTAG. START supplies INIT/SYSDESC/SYSTIME, delayed TaskList recovers startup metadata, ram_base=0 and id_shift=0 are valid, and late attach hydrates task, ISR, clock, drop, and recording metadata from backend status.",
-    "SystemView uses complete bounded intervals for exact Runtime/Context analysis, retains inactive contexts, keeps 60 seconds of exact history and a 300,000-event browser ring, and offers 10/30/60-second views. JSONL recording is independent of display/acquisition, and offline replay is incremental and bounded with pause, speed, progress, and restart.",
-    "MCP stdio reserves stdout for JSON-RPC. Ordinary Python output is redirected to stderr only for the MCP entry; CLI, Web, and desktop logging remain unchanged."
+    "UF2 固件文件和 AGENTS.md 采用 PR #15 版本。",
+    "两个本地备份包含同一份核心内存可观测性实现；只迁移一次代码，旧交接文档不覆盖当前 0.1.9 记忆，Eternal Chip GUI 分支历史不混入 PR。",
+    "观测数据的公开事件仅包含安全事实，原始内存、RTT 和 SystemView 内容走有界私有流；发布失败降级但不改变成功读取结果。",
+    "SystemView 自动恢复限定为每次 Device 连接的第一个会话最多一次；恢复状态显式暴露，后续会话和持续失败不会进入隐式重试循环。",
+    "构建、测试、日志和缓存统一位于 MKLINK_BUILD_ROOT 或主工作区忽略的 .build，并经 scripts/build_workspace.ps1 运行。",
+    "实际烧录、复位、供电、CAN 发送等不可逆或有外部影响的动作必须获得针对本次操作的明确确认。",
+    "应用 Release、标签、更新签名和探针固件发布彼此独立，不随 PR 合并自动执行。"
   ],
   "hardware": {
-    "probe": "Fresh v0.1.6 GEC1900 qualification used a real MKLink CDC probe and detected the MICROKEEN removable drive. Concrete port and device identifiers remain intentionally omitted.",
-    "target": "Fresh v0.1.6 GEC1900 qualification recognized an STM32F40x through the main GUI, unified Site Agent, and engineer CLI. Validation was read-only; no target state or firmware was changed. Existing STM32F103RC and HPM5301 EVK Lite evidence remains recorded.",
-    "serial_fixture": "A paired ELTIMA virtual serial-port fixture is available; concrete COM numbers are intentionally omitted.",
-    "permission": "Firmware build/flash and read-only target validation are permitted when required by the active task."
+    "probe": "HIL-Infra bench-01 将 MKLink V4 命令口映射为 COM5；交接不依赖端口号，使用台架 selector 与互操作锁。",
+    "target": "本轮使用 ec_s100_watch_V2.6_tony 的 STM32F411CE + FreeRTOS + LVGL 既有固件，通过 RTT 控制块 0x20010d40 验证 SystemView；未重烧目标。",
+    "permission": "本轮执行 SystemView 启停、读取和一次探针重启以复现冷启动问题；未执行目标烧录、OTA、供电变更或 CAN 激励。后续写入动作仍需针对目标和固件单独确认。"
   },
   "known_limits": [
-    "The maintainer host has GitHub release access but no existing Tauri updater private key in MKLINK_TAURI_UPDATER_KEY or ~/.config/mklink-ai-probe/updater.key. Do not generate or substitute a new trust key implicitly; either provide the established key or explicitly narrow publication to unsigned non-updater assets.",
-    "The v0.1.6 branch passed direct LAN Site Agent automation and fresh STM32 hardware qualification, but external managed-LAN STCP was not rerun because no independent LAN frps endpoint was available. The imported fork STCP/HIL evidence remains supplementary rather than fresh v0.1.6 proof.",
-    "High-event-rate SystemView can overflow the target RTT buffer. Host TaskList retry recovers metadata, but physically dropped event packets cannot be reconstructed; increase the target buffer for loss-sensitive timing analysis.",
-    "The first real V4 offline trigger once returned a transient empty failure and an immediate retry succeeded. Reproduce cold starts and add device-output diagnostics if it recurs.",
-    "Full npm audit reports one high-severity development-only transitive finding in brace-expansion; the runtime dependency audit is clean.",
-    "Serial Assistant's closed loop used a paired virtual serial driver and therefore does not qualify USB-UART electrical behavior, cable faults, or adapter-specific driver latency; the host software and Windows serial API path are qualified.",
-    "USB Web entry still needs macOS/Linux qualification. Standard NSIS and updater behavior still need a second clean Windows machine. Non-builtin flash algorithm paths have automated coverage but limited physical-target coverage."
+    "本轮没有重新执行物理烧录 HIL；docs/verification/v0.1.9-stm32f103re-release-hil.md 的原始日志未在当前工作区找到，因此只能作为既有叙述证据，不能冒充本轮新证据。",
+    "Tauri 本轮只完成 --no-bundle Release 可执行文件构建；未生成或安装 NSIS，未做仅系统 PATH 的安装后运行验证，也未使用更新签名密钥。",
+    "Web 生产构建仍提示 DashboardView 压缩后约 551.11 KiB，超过 500 KiB 建议阈值，但不影响构建成功。",
+    "探针冷启动后曾出现每次 SystemView start 都复位或停流的独立固件状态，增加到多次主机重试仍不能恢复；本次主机修复保持一次有界恢复，不掩盖该固件问题。经原生 CLI 正向控制后，同一目标的最终生产 WebGUI 长流验证通过。",
+    "HIL relay 插件仍有既有 runtime/拒绝探针证据缺口；不影响本次 MKLink 插件 11/11 自动化准入。"
   ],
   "next_actions": [
-    "Provide the established Tauri updater signing key for a full NSIS release, or explicitly authorize a GitHub Release limited to the portable/Skill integrity assets without the signed updater installer.",
-    "After the signing decision is satisfied, rebuild artifacts from clean master, create the annotated v0.1.6 tag, and publish/verify the su5176 GitHub Release without changing Gitee or updates/latest.json unless separately authorized.",
-    "Reproduce the first-trigger V4 offline empty failure across cold starts and add device-output diagnostics if it recurs.",
-    "Run loss-sensitive SystemView tests with a larger target RTT buffer and document the sustainable event rate.",
-    "Qualify USB Web entry on current macOS and Linux systems.",
-    "Qualify standard NSIS and older-client updater behavior on a clean Windows 10/11 machine."
+    "另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。",
+    "正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次 PR 合并自动推断。"
   ],
   "continuation_protocol": [
-    "Validate project memory and reconcile it with live Git and runtime state before acting.",
-    "Preserve the fork's published v0.1.5 tag and updates/latest.json, and do not infer publication state for the su5176 target repository. Pull request #8 is merged as 77a4433; reconcile later remote state with live GitHub before acting.",
-    "Follow the repository branch, automated gate, real-surface, and release-authority rules.",
-    "Keep future memory updates consolidated; use Git history for completed chronology instead of appending session logs."
+    "开始前校正 Git、台架 selector、目标固件和运行进程；硬件操作保持串行并遵守 HIL 锁。",
+    "不把环境失败、旧叙述证据或未覆盖场景写成 PASS；关键证据写验证报告，交接只保留结论。",
+    "结束前更新 project-memory.json、渲染 CURRENT_HANDOFF.md，并保持工作树与目标远端分支同步。"
   ]
 }

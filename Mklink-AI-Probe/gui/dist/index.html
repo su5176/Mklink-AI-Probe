@@ -1,15 +1,185 @@
 <!doctype html>
-<html lang="en">
+<html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
     <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>gui</title>
-    <script type="module" crossorigin src="/assets/index-PRD4we4F.js"></script>
-    <link rel="modulepreload" crossorigin href="/assets/_plugin-vue_export-helper-34rwp3O6.js">
-    <link rel="stylesheet" crossorigin href="/assets/index-BullP9uz.css">
+    <title>MKLink AI Probe</title>
+    <style>
+      html,
+      body,
+      #app {
+        width: 100%;
+        height: 100%;
+      }
+      body {
+        margin: 0;
+        overflow: hidden;
+        background: #020611;
+      }
+      #startup-splash {
+        position: fixed;
+        inset: 0;
+        z-index: 10000;
+        display: grid;
+        grid-template-rows: minmax(0, 1fr) auto;
+        justify-items: center;
+        gap: 18px;
+        padding: clamp(28px, 5vh, 64px) clamp(24px, 6vw, 96px);
+        box-sizing: border-box;
+        overflow: hidden;
+        background: #020611;
+        color: #f4f8ff;
+        font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+        opacity: 1;
+        transition: opacity 240ms ease;
+      }
+      #startup-splash.is-complete {
+        pointer-events: none;
+        opacity: 0;
+      }
+      .startup-visual {
+        align-self: center;
+        width: min(72vh, 760px, 82vw);
+        aspect-ratio: 1;
+        min-height: 0;
+      }
+      .startup-image {
+        display: block;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        animation: startup-image-enter 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+      }
+      .startup-footer {
+        width: min(560px, 78vw);
+        padding-bottom: clamp(8px, 2vh, 24px);
+      }
+      .startup-heading {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 10px;
+      }
+      .startup-brand {
+        font-size: 16px;
+        font-weight: 650;
+        letter-spacing: 0;
+      }
+      #startup-progress-value {
+        color: #8bbcf7;
+        font: 600 12px/1 Consolas, monospace;
+      }
+      .startup-progress {
+        width: 100%;
+        height: 5px;
+        overflow: hidden;
+        background: #1b2a3d;
+      }
+      #startup-progress-fill {
+        width: 8%;
+        height: 100%;
+        background: #2e9df4;
+        box-shadow: 0 0 14px rgba(46, 157, 244, 0.55);
+        transition: width 180ms ease-out;
+      }
+      #startup-status {
+        min-height: 20px;
+        margin: 9px 0 0;
+        color: #9ca9bb;
+        font-size: 12px;
+        text-align: center;
+      }
+      @keyframes startup-image-enter {
+        from { opacity: 0; transform: scale(0.975); }
+        to { opacity: 1; transform: scale(1); }
+      }
+      @media (max-width: 720px) {
+        #startup-splash {
+          gap: 12px;
+          padding: 24px 18px;
+        }
+        .startup-visual {
+          width: min(64vh, 88vw);
+        }
+        .startup-footer {
+          width: min(520px, 88vw);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        #startup-splash,
+        #startup-progress-fill,
+        .startup-image {
+          animation: none;
+          transition: none;
+        }
+      }
+    </style>
+    <script type="module" crossorigin src="/assets/mime-v1/index-B24BG7Dc.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/mime-v1/core-tyXAVNRQ.js">
   </head>
   <body>
     <div id="app"></div>
+    <div id="startup-splash" role="status" aria-live="polite">
+      <div class="startup-visual">
+        <img
+          class="startup-image"
+          src="/startup-probe.png"
+          alt="MKLink AI Probe 下载器"
+        />
+      </div>
+      <div class="startup-footer">
+        <div class="startup-heading">
+          <span class="startup-brand">MKLink AI Probe</span>
+          <span id="startup-progress-value">8%</span>
+        </div>
+        <div
+          id="startup-progress"
+          class="startup-progress"
+          role="progressbar"
+          aria-label="启动进度"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          aria-valuenow="8"
+        >
+          <div id="startup-progress-fill"></div>
+        </div>
+        <p id="startup-status">正在准备工作区…</p>
+      </div>
+    </div>
+    <script>
+      (() => {
+        const splash = document.getElementById('startup-splash')
+        const progress = document.getElementById('startup-progress')
+        const fill = document.getElementById('startup-progress-fill')
+        const valueLabel = document.getElementById('startup-progress-value')
+        const status = document.getElementById('startup-status')
+        let value = 8
+        let timer = 0
+
+        const update = (nextValue, nextStatus) => {
+          value = Math.max(value, Math.min(100, Math.round(nextValue)))
+          fill.style.width = `${value}%`
+          valueLabel.textContent = `${value}%`
+          progress.setAttribute('aria-valuenow', String(value))
+          if (nextStatus) status.textContent = nextStatus
+        }
+
+        timer = window.setInterval(() => {
+          if (value < 18) update(value + 1)
+        }, 320)
+
+        window.__MKLINK_STARTUP__ = {
+          update,
+          finish() {
+            window.clearInterval(timer)
+            update(100)
+            splash.classList.add('is-complete')
+            window.setTimeout(() => splash.remove(), 260)
+          },
+        }
+      })()
+    </script>
   </body>
 </html>

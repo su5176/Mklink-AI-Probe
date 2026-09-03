@@ -16,8 +16,8 @@ from typing import Iterable, Mapping, Sequence
 
 
 DEFAULT_MANIFEST_URLS = (
-    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
     "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/updates/latest.json",
+    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
 )
 USER_AGENT = "Mklink-AI-Probe-Runtime-Updater"
 _CHECK_LOCK = threading.Lock()
@@ -50,7 +50,11 @@ def current_version() -> str:
 
 
 def default_cache_file() -> Path:
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+    if os.environ.get("MKLINK_CACHE_DIR"):
+        base = Path(os.environ["MKLINK_CACHE_DIR"])
+    elif os.environ.get("MKLINK_BUILD_ROOT"):
+        base = Path(os.environ["MKLINK_BUILD_ROOT"]) / "cache"
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))

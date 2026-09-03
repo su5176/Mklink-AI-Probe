@@ -1,73 +1,59 @@
-# 安装与可选依赖
+# 安装与更新（使用者）
 
-> 触发词：pip、ensurepip、readelf、arm-none-eabi、winget
-> 返回索引：[SKILL.md](../SKILL.md)
+按用户选择安装桌面应用或 AI Skill，不需要维护仓库或编译 MKLink。
 
-## 安装步骤
+## 选择安装方式
 
-在使用本 Skill 之前，必须先安装 `mklink` Python 包：
+- **桌面应用**：使用[官方发布页](https://github.com/Aladdin-Wang/Mklink-AI-Probe/releases)
+  的安装包。Python 后端与 Web 资源已经打包，不要求另装 Python、Node、Rust 或 MSVC。
+- **AI Skill / Python CLI / Web GUI**：使用官方发布的完整 Skill ZIP 和对应摘要，
+  校验来源与 SHA-256，解压到当前 AI 客户端支持的用户 Skill 目录。不要仅复制
+  `SKILL.md`，也不要把整个开发仓库作为用户 Skill 安装；发布包只含运行所需文件。
+  选择满足包内 `pyproject.toml` 要求的 Python，后续命令从完整 Skill 根目录执行。
+- **远程现场机**：使用独立 Site Agent 包；部署按[直连远程说明](commands-remote.md)。
 
-```bash
-# 1. 如果 Python 没有 pip，先引导安装
-python -m ensurepip --upgrade
+## 完整 Skill 安装与自检
 
-# 2. 从本 Skill 目录安装 mklink 包（ editable 模式）
-python -m pip install -e .
-
-# 3. 如果使用 Modbus 功能，确保安装 pymodbus（已在依赖中自动安装）
-pip install pymodbus>=3.0
-```
-
-安装完成后，`python -m mklink` 命令即可正常使用。
-
-
-## 作为 Claude Code 插件使用（MCP 能力层）
-
-本 Skill 同时是一个 Claude Code **插件**：根目录 `.claude-plugin/plugin.json` + `.mcp.json` 暴露 **42 个 MCP tool**（`mcp__mklink__*`，覆盖连接/烧录/内存/变量/调试/符号/RTT/HardFault/Modbus/串口），由 `python -m mklink mcp` 以 stdio 方式启动。MCP server **依赖 `fastmcp`**，需安装 `mcp` extras：
+若 Python 缺少 pip，先执行 `python -m ensurepip --upgrade`。安装时始终使用同一
+Python 环境；完整安装包含 Web GUI 与 MCP：
 
 ```powershell
-pip install -e ".[mcp]"
+python -m pip install -e ".[gui,mcp]"
+python -c "import serial, pymodbus, elftools, pycparser, websockets, fastapi, starlette, uvicorn, pyocd, intelhex, multipart, fastmcp, pydantic; print('MKLink dependencies OK')"
+python -m mklink web-entry install --quick-launch
 ```
 
-验证 MCP server 可启动（应向 stderr 打印 FastMCP 横幅并等待 stdio JSON-RPC 输入，Ctrl+C 退出）：
+最后一条会检查依赖和已打包的 `gui/dist`，再注册用户级 URL 启动器和 HTML 入口。
+缺依赖则修复对应环境；缺 Web assets 则重新取得完整官方包，不引导用户构建前端。
+失败时不能仅复制网页就宣称安装成功。
 
-```powershell
-python -m mklink mcp
-```
+快速启动页优先写入卷标 `MICROKEEN` 的下载器 U 盘，未检测到时写入用户桌面。
+报告自检与文件位置，不必立即打开 GUI。双击入口会等待本地服务健康后打开页面，
+详细行为与排障见 [Web 入口](web-entry.md)。
 
-**普通用户安装本插件**（无需上架 marketplace，走 skills-directory 机制）：
+MCP 使用 `python -m mklink mcp`（stdio），客户端按其插件/MCP 配置加载包内
+`.mcp.json`。安装 Skill 文本本身不保证客户端已启用 MCP；以实际可调用工具为准。
+没有 MCP 时使用 CLI。工具参数以当前 schema 为准，不依赖固定工具数量。
 
-```powershell
-# 1. 把本目录放到 Claude Code 的 skills 目录下
-git clone <repo-url> "$env:USERPROFILE\.claude\skills\mklink-flash"
-#   （或手动复制整个目录到 ~/.claude/skills/mklink-flash/）
+## 更新
 
-# 2. 安装 Python 包 + MCP 依赖（使 .mcp.json 中的 python -m mklink mcp 可用）
-cd "$env:USERPROFILE\.claude\skills\mklink-flash"
-pip install -e ".[mcp]"
-
-# 3. 重启 Claude Code —— 自动加载为 mklink-flash@skills-dir，MCP 工具即可用
-```
-
-> 仅使用 CLI、不用 MCP 的用户：跳过 `.[mcp]`，`pip install -e .` 即可。
-> `pyelftools` 已作为正式依赖安装；标准桌面安装包也会把它打入 sidecar。
-
-## Skill 与桌面版自动更新
-
-从 v0.1.3 开始，AI 每个会话第一次使用 MKLink 能力时会执行一次带 24 小时
-缓存的版本检查。检查不会占用探针，离线失败不会阻塞调试。发现新版本后，AI
-会先说明版本和发布说明，只有得到用户明确同意才自动更新：
+首次实际使用时读 MCP `ping.update` 或运行检查脚本，二选一。检查缓存 24 小时，
+不占用探针，离线不阻塞调试：
 
 ```powershell
 python scripts/skill_update.py check --json
+```
+
+发现新版本先说明当前版本、最新版本与发布说明；只有用户明确同意后才执行：
+
+```powershell
 python scripts/skill_update.py install --yes --json
 ```
 
-更新器从公开 `updates/latest.json` 读取桌面安装包和 Skill ZIP，对下载结果校验
-大小与 SHA-256 后再安装。桌面程序和本地服务必须先关闭；Skill 更新后需要
-重启 AI 客户端或开启新会话。Git checkout 会被识别并拒绝覆盖，应继续通过 Git
-维护。早于 v0.1.3 的复制式 Skill 没有更新检查入口，需要先手动升级一次。
-
+更新器从公开 `updates/latest.json` 获取版本化桌面安装包和 Skill ZIP，校验大小与
+SHA-256。桌面应用与本地服务须先关闭，不打断正在进行的设备操作。可选
+`--skill-only` / `--app-only` 限定更新范围；更新 Skill 后重启 AI 客户端或开新会话。
+Git checkout 不会被覆盖。旧复制式安装没有更新脚本时，重新安装完整官方 Skill 包。
 
 ## ELF/AXF 解析后端
 
@@ -119,116 +105,3 @@ winget install --id Arm.GnuArmEmbeddedToolchain -e --accept-package-agreements -
 MCP `ping` 和 REST `/api/health` 会同时报告 `elf_backend`、
 `builtin_elf_available`、`external_elf_available`、`readelf_available` 和
 `addr2line_available`。后两个字段只描述可选 GNU 后端，不再决定 AXF 功能是否可用。
-
-
-## GUI 依赖（Web GUI 与 Tauri 桌面应用）
-
-当用户需要以下功能时，需要安装 GUI 依赖：
-
-- `mklink serve` — 远程调试服务器（REST API + WebSocket JSON-RPC）
-- `mklink gui` — 启动 Web GUI（FastAPI 后端 + Vue 3 前端）
-- Tauri 桌面应用 — 原生窗口体验
-
-### Python GUI 依赖
-
-先检查是否已安装：
-
-```powershell
-python -c "import fastapi, uvicorn; print('GUI deps OK')"
-```
-
-若导入失败：
-
-```powershell
-pip install -e ".[gui]"
-```
-
-### Node.js 依赖
-
-Tauri 桌面应用和 Vue 3 前端需要 Node.js。先检查：
-
-```powershell
-node --version
-```
-
-若未安装，使用 winget：
-
-```powershell
-winget install --id OpenJS.NodeJS.LTS -e --accept-package-agreements --accept-source-agreements
-```
-
-然后安装前端依赖：
-
-```powershell
-cd gui
-npm install
-```
-
-### Rust 工具链（Tauri 桌面应用）
-
-Tauri v2 桌面应用需要 Rust 编译器。先检查：
-
-```powershell
-rustc --version
-cargo --version
-```
-
-若未安装，分两步：
-
-**步骤 1 — 安装 MSVC Build Tools**（Rust Windows 编译必需）：
-
-```powershell
-# 检查是否已有 Visual Studio 或 Build Tools
-if (-not (Get-Command cl -ErrorAction SilentlyContinue)) {
-    winget install --id Microsoft.VisualStudio.2022.BuildTools -e --accept-package-agreements --accept-source-agreements --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --passive"
-}
-```
-
-**步骤 2 — 安装 Rust**：
-
-```powershell
-# 下载并静默安装 rustup
-$installer = "$env:TEMP\rustup-init.exe"
-Invoke-WebRequest -Uri https://win.rustup.rs/x86_64 -OutFile $installer
-& $installer -y --default-toolchain stable --default-host x86_64-pc-windows-msvc
-Remove-Item $installer -Force
-
-# 刷新当前会话 PATH
-$env:Path += ";$env:USERPROFILE\.cargo\bin"
-```
-
-验证 Rust 安装：
-
-```powershell
-rustc --version
-cargo --version
-```
-
-### Tauri 桌面应用启动
-
-```powershell
-# 开发模式（热重载，需同时手动启动 Python 后端）
-cd gui
-python -m mklink serve --port 8765 &   # 后端（另一终端）
-npx tauri dev                           # Tauri 窗口
-```
-
-### Sidecar 打包（发布构建）
-
-发布桌面安装包（MSI/NSIS）前，需将 Python 后端打包为独立可执行文件：
-
-```powershell
-pip install pyinstaller
-
-# 打包 Python 后端为 mklink-sidecar.exe
-pyinstaller --onefile --name mklink-sidecar --collect-all mklink -p .. mklink\__main__.py
-
-# 将产物放入 Tauri 预期位置
-New-Item -ItemType Directory -Force -Path "src-tauri\binaries" | Out-Null
-Copy-Item dist\mklink-sidecar.exe "src-tauri\binaries\mklink-sidecar-x86_64-pc-windows-msvc.exe" -Force
-
-# 构建桌面安装包
-npx tauri build
-```
-
-构建产物位于 `gui/src-tauri/target/release/bundle/`。

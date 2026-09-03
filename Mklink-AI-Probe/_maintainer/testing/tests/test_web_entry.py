@@ -9,6 +9,32 @@ import pytest
 from mklink import web_entry
 
 
+def test_protocol_python_executable_keeps_venv_interpreter(tmp_path, monkeypatch):
+    executable = tmp_path / ".venv" / "bin" / "python"
+    monkeypatch.setattr(web_entry.sys, "executable", str(executable))
+    monkeypatch.setattr(web_entry.sys, "prefix", str(executable.parent.parent))
+    monkeypatch.setattr(web_entry.sys, "base_prefix", str(tmp_path / "base"))
+
+    def reject_resolve(_path, *_args, **_kwargs):
+        raise AssertionError("venv interpreter must not be resolved")
+
+    monkeypatch.setattr(Path, "resolve", reject_resolve)
+
+    assert web_entry.protocol_python_executable() == executable.absolute()
+
+
+def test_protocol_python_executable_resolves_base_interpreter(tmp_path, monkeypatch):
+    executable = tmp_path / "bin" / "python"
+    resolved = tmp_path / "real" / "python"
+    monkeypatch.setattr(web_entry.sys, "executable", str(executable))
+    monkeypatch.setattr(web_entry.sys, "prefix", str(tmp_path / "base"))
+    monkeypatch.setattr(web_entry.sys, "base_prefix", str(tmp_path / "base"))
+
+    monkeypatch.setattr(Path, "resolve", lambda _path, *_args, **_kwargs: resolved)
+
+    assert web_entry.protocol_python_executable() == resolved
+
+
 def test_protocol_uri_accepts_only_the_web_entry_actions():
     assert web_entry.parse_protocol_uri("mklink-ai-probe://web/start") == "start"
     assert web_entry.parse_protocol_uri("mklink-ai-probe://web/open") == "open"
@@ -33,13 +59,120 @@ def test_launcher_html_is_one_offline_file_with_cross_platform_protocol_links(tm
     assert "mklink-ai-probe://web/start" in html
     assert "mklink-ai-probe://web/stop" in html
     assert "data:image/png;base64,AA==" in html
-    assert "launchTimeoutSeconds = 25" in html
+    assert "autoLaunchDelaySeconds = 3" in html
+    assert "launchTimeoutSeconds = 50" in html
+    assert "scheduleAutomaticLaunch" in html
+    assert "window.location.href = startUri" in html
     assert "启动超时" in html
-    assert "更新 Skill 或改变安装位置后" in html
-    assert "重新注册一次快速启动器" in html
+    assert "让 AI 从官方仓库安装或更新完整 MKLink AI Probe Skill" in html
+    assert "Web GUI 与 MCP 依赖" in html
     assert "http://" not in html
     assert "https://" not in html
     assert list(tmp_path.iterdir()) == [output]
+
+
+def test_launcher_html_is_byte_identical_for_every_user(tmp_path):
+    first = tmp_path / "first.html"
+    second = tmp_path / "second.html"
+
+    web_entry.write_launcher_html(first, icon_data_uri="data:image/png;base64,AA==")
+    web_entry.write_launcher_html(second, icon_data_uri="data:image/png;base64,AA==")
+
+    assert first.read_bytes() == second.read_bytes()
+    assert b"\r\n" not in first.read_bytes()
+
+
+def test_quick_launcher_prefers_microkeen_and_falls_back_to_desktop(tmp_path):
+    disk = tmp_path / "MICROKEEN"
+    desktop = tmp_path / "Desktop"
+    disk.mkdir()
+
+    on_probe = web_entry.write_quick_launchers(
+        find_probe_disks=lambda: [disk],
+        desktop=desktop,
+        icon_data_uri="",
+    )
+    assert on_probe == [(disk / web_entry.QUICK_LAUNCH_FILE_NAME).resolve()]
+    assert on_probe[0].is_file()
+
+    without_probe = web_entry.write_quick_launchers(
+        find_probe_disks=lambda: [],
+        desktop=desktop,
+        icon_data_uri="",
+    )
+    assert without_probe == [(desktop / web_entry.QUICK_LAUNCH_FILE_NAME).resolve()]
+    assert without_probe[0].is_file()
+
+
+def test_web_entry_requirements_cover_gui_mcp_and_assets(tmp_path):
+    available = {
+        "serial", "pymodbus", "elftools", "pycparser", "websockets",
+        "fastapi", "starlette", "uvicorn", "pyocd", "intelhex", "multipart",
+        "fastmcp", "pydantic",
+    }
+    (tmp_path / "gui" / "dist").mkdir(parents=True)
+    (tmp_path / "gui" / "dist" / "index.html").write_text("ok", encoding="utf-8")
+
+    ready = web_entry.check_web_entry_requirements(
+        root=tmp_path,
+        module_available=lambda name: name in available,
+    )
+    assert ready == {"ready": True, "missing": []}
+
+    missing = web_entry.check_web_entry_requirements(
+        root=tmp_path,
+        module_available=lambda name: name not in {"fastmcp", "pyocd"},
+    )
+    assert missing["ready"] is False
+    assert "mcp:fastmcp" in missing["missing"]
+    assert "gui:pyocd" in missing["missing"]
+
+    (tmp_path / "gui" / "dist" / "index.html").unlink()
+    no_assets = web_entry.check_web_entry_requirements(
+        root=tmp_path,
+        module_available=lambda _name: True,
+    )
+    assert "gui:built-web-assets" in no_assets["missing"]
+
+
+def test_quick_install_rejects_missing_dependencies_before_registration(tmp_path, monkeypatch):
+    registered = []
+    monkeypatch.setattr(
+        web_entry,
+        "check_web_entry_requirements",
+        lambda: {"ready": False, "missing": ["gui:pyocd", "mcp:fastmcp"]},
+    )
+    monkeypatch.setattr(
+        web_entry,
+        "install_protocol",
+        lambda: registered.append(True) or {"status": "installed"},
+    )
+
+    with pytest.raises(web_entry.WebEntryError, match=r"\[gui,mcp\]"):
+        web_entry.install_quick_launcher(desktop=tmp_path)
+
+    assert registered == []
+
+
+def test_quick_install_registers_protocol_and_reports_launcher(tmp_path, monkeypatch):
+    launcher = tmp_path / web_entry.QUICK_LAUNCH_FILE_NAME
+    monkeypatch.setattr(
+        web_entry,
+        "check_web_entry_requirements",
+        lambda: {"ready": True, "missing": []},
+    )
+    monkeypatch.setattr(
+        web_entry,
+        "install_protocol",
+        lambda: {"status": "installed", "scheme": web_entry.SCHEME},
+    )
+    monkeypatch.setattr(web_entry, "write_quick_launchers", lambda **_kwargs: [launcher])
+
+    result = web_entry.install_quick_launcher(desktop=tmp_path)
+
+    assert result["status"] == "installed"
+    assert result["requirements"] == {"ready": True, "missing": []}
+    assert result["html"] == [str(launcher.resolve())]
 
 
 @pytest.mark.parametrize(
@@ -125,6 +258,7 @@ def test_gui_server_command_reuses_the_existing_cli_without_touching_mcp_or_serv
 
     assert command[:4] == [str(executable), "-m", "mklink", "gui"]
     assert "--no-browser" in command
+    assert command[command.index("--browser-session-timeout") + 1] == "15"
     assert "--port" in command and "8771" in command
     assert command[command.index("--project-root") + 1] == str(tmp_path / "runtime workspace")
     assert "serve" not in command
@@ -179,15 +313,53 @@ def test_start_scans_the_port_range_before_starting_a_competing_backend(tmp_path
     assert opened == [web_entry.web_entry_url(8766)]
 
 
-def test_start_refuses_to_compete_with_a_running_mklink_api_without_web_assets(tmp_path):
-    with pytest.raises(web_entry.WebEntryError, match="already running"):
-        web_entry.start_web_entry(
-            data_dir=tmp_path,
-            probe=lambda port: "api" if port == 8765 else None,
-            port_available=lambda _port: False,
-            spawn=lambda *_args, **_kwargs: None,
-            browser_open=lambda _url: None,
-        )
+def test_start_skips_a_running_api_without_web_assets_and_uses_next_port(tmp_path):
+    opened = []
+    commands = []
+
+    def probe(port):
+        if port == 8765:
+            return "api"
+        return "web" if port == 8766 else None
+
+    result = web_entry.start_web_entry(
+        data_dir=tmp_path,
+        probe=probe,
+        port_available=lambda port: port == 8766,
+        spawn=lambda *args, **kwargs: commands.append((args, kwargs)),
+        browser_open=opened.append,
+    )
+
+    assert result == {"status": "reused", "port": 8766, "owned": False}
+    assert commands == []
+    assert opened == [web_entry.web_entry_url(8766)]
+
+
+def test_start_spawns_web_gui_after_api_only_port(tmp_path):
+    opened = []
+    commands = []
+
+    def probe(port):
+        return "api" if port == 8765 else "web" if len(commands) else None
+
+    def spawn(*args, **kwargs):
+        commands.append((args, kwargs))
+        return SimpleNamespace(pid=4321)
+
+    result = web_entry.start_web_entry(
+        data_dir=tmp_path,
+        probe=probe,
+        port_available=lambda port: port == 8766,
+        spawn=spawn,
+        browser_open=opened.append,
+        process_identity=lambda pid: f"process-{pid}",
+        sleep=lambda _seconds: None,
+        timeout=1,
+    )
+
+    assert result == {"status": "started", "port": 8766, "owned": True, "pid": 4321}
+    assert commands and "8766" in commands[0][0][0]
+    assert opened == [web_entry.web_entry_url(8766)]
 
 
 def test_start_spawns_one_owned_gui_and_stop_only_terminates_that_pid(tmp_path):
@@ -283,6 +455,44 @@ def test_stop_never_terminates_a_reused_or_missing_service(tmp_path):
 
     assert result["status"] == "not_owned"
     assert terminated == []
+
+
+def test_status_reports_an_exited_owned_backend_as_stopped(tmp_path):
+    (tmp_path / "state.json").write_text(json.dumps({
+        "pid": 4321,
+        "port": 8765,
+        "owned": True,
+        "process_identity": "exited-process",
+    }), encoding="utf-8")
+
+    result = web_entry.web_entry_status(
+        data_dir=tmp_path,
+        process_identity=lambda _pid: None,
+    )
+
+    assert result == {
+        "status": "stopped", "port": 8765, "pid": 4321, "owned": False,
+    }
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_status_clears_an_owned_process_that_no_longer_serves_web(tmp_path, monkeypatch):
+    (tmp_path / "state.json").write_text(json.dumps({
+        "pid": 4321,
+        "port": 8765,
+        "owned": True,
+        "process_identity": "same-process",
+    }), encoding="utf-8")
+    monkeypatch.setattr(web_entry, "probe_server", lambda _port: None)
+
+    result = web_entry.web_entry_status(
+        data_dir=tmp_path,
+        process_identity=lambda _pid: "same-process",
+    )
+
+    assert result["status"] == "stopped"
+    assert result["owned"] is False
+    assert not (tmp_path / "state.json").exists()
 
 
 def test_protocol_handler_dispatches_start_open_and_stop(monkeypatch, tmp_path):
@@ -392,10 +602,16 @@ def test_windows_install_writes_only_the_user_protocol_keys(tmp_path, monkeypatc
     )
 
     assert result["status"] == "installed"
-    assert (r"Software\Classes\mklink-ai-probe", "URL Protocol") in values
-    assert values[(r"Software\Classes\mklink-ai-probe", "Mklink Web Entry Owner")]
-    command_key = (r"Software\Classes\mklink-ai-probe\shell\open\command", "")
-    assert '"%1"' in values[command_key]
+    base = r"Software\Classes\mklink-ai-probe"
+    assert values[(base, "URL Protocol")] == ""
+    assert values[(base, "FriendlyTypeName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base, "ApplicationName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base + r"\Application", "ApplicationName")] == web_entry.WINDOWS_FRIENDLY_NAME
+    assert values[(base + r"\Application", "ApplicationDescription")] == web_entry.WINDOWS_DESCRIPTION
+    command = values[(base + r"\shell\open\command", "")]
+    assert "pythonw.exe" in command
+    assert str(tmp_path / "data" / "handler.py") in command
+    assert '"%1"' in command
 
 
 def test_windows_uninstall_preserves_a_foreign_protocol_registration(tmp_path, monkeypatch):

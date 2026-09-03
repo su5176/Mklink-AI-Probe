@@ -6,8 +6,10 @@
       :symbol-error="symbolError"
       :latest-values="latestValues"
       :hidden-channels="hiddenChannels"
+      :snapshot-path="snapshotPath"
       @visibility-change="setChannelVisibility"
       @selection-removed="clearChannelVisibility"
+      @snapshot-change="snapshotPath = $event"
     />
     <div class="workspace-resizer" :title="tr('调整变量目录宽度', 'Resize variable catalog')" @mousedown="startResize"></div>
     <div class="waveform-pane">
@@ -15,6 +17,7 @@
         mode="SuperWatch"
         :device-connected="deviceConnected"
         :hidden-channels="hiddenChannels"
+        :array-snapshot-path="snapshotPath"
         @latest-values="latestValues = $event"
       />
     </div>
@@ -22,12 +25,13 @@
 </template>
 
 <script setup lang="ts">
-import { onUnmounted, ref, shallowRef } from 'vue'
+import { onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import SymbolVariablePanel from './SymbolVariablePanel.vue'
 import WaveformViewer from './WaveformViewer.vue'
 import { tr } from '../../composables/useLanguage'
+import { API_BASE } from '../../lib/runtimeEndpoint'
 
-withDefaults(defineProps<{
+const props = withDefaults(defineProps<{
   deviceConnected: boolean
   symbolLoaded?: boolean
   symbolError?: string
@@ -39,6 +43,7 @@ withDefaults(defineProps<{
 const panelWidth = ref(340)
 const latestValues = shallowRef<Record<string, number | boolean>>({})
 const hiddenChannels = shallowRef(new Set<string>())
+const snapshotPath = ref<string | null>(null)
 let resizeStartX = 0
 let resizeStartWidth = 0
 
@@ -75,6 +80,24 @@ onUnmounted(() => {
   document.removeEventListener('mousemove', resizePanel)
   document.removeEventListener('mouseup', stopResize)
 })
+
+async function loadSnapshotSelection(): Promise<void> {
+  if (!props.deviceConnected) {
+    snapshotPath.value = null
+    return
+  }
+  try {
+    const response = await fetch(`${API_BASE}/api/dash/superwatch/array-snapshot`)
+    if (!response.ok) return
+    const payload = await response.json()
+    snapshotPath.value = payload?.snapshot?.name ?? null
+  } catch {
+    // The dashboard can mount before the API is ready; retry on reconnect.
+  }
+}
+
+onMounted(loadSnapshotSelection)
+watch(() => props.deviceConnected, loadSnapshotSelection)
 </script>
 
 <style scoped>
@@ -91,7 +114,11 @@ onUnmounted(() => {
   cursor: col-resize;
 }
 .workspace-resizer:hover { background: var(--accent); }
-.waveform-pane { min-width: 0; min-height: 0; overflow: hidden; }
+.waveform-pane {
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
 
 @media (max-width: 760px) {
   .superwatch-workspace {

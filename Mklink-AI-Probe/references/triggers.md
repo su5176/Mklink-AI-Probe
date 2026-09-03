@@ -19,12 +19,12 @@
 | "HardFault 分析" / "解码 Hard Fault" | `python -m mklink hardfault --source <axf> --sp <异常栈帧地址>` |
 | "查看变量类型" / "DWARF 类型" / "结构体布局" | `python -m mklink typeinfo --source <axf> --var <变量>` 或 `--struct <结构体>` |
 | "变量快照" / "watch 变量" | `python -m mklink watch var1,var2 --source <axf>` |
-| "SuperWatch" / "连续观察变量" / "变量和寄存器实时看板" / "read_ram 时间戳采样" | `python -m mklink superwatch var1,struct.field,SCB.CFSR --source <axf> --visualize --period 0.1` |
+| "SuperWatch" / "连续观察变量" / "变量和寄存器实时看板" / "变量二进制流采样" | `python -m mklink superwatch var1,struct.field,SCB.CFSR --source <axf> --visualize --period 0.1`（仅走 `dump_memory`，不循环 `read_ram`） |
 | "dump memory" / "内存二进制 dump" / "高速读取内存" | `python -m mklink dump-memory 0x20000000:16`（公共 `cmd.dump_memory` CLI；按地址/长度直接 dump） |
-| "SuperWatch 高速模式" / "变量二进制流采样" | `python -m mklink superwatch var1,var2 --source <axf> --dump-mem --visualize` |
+| "SuperWatch 高速模式" | `python -m mklink superwatch var1,var2 --source <axf> --visualize`（`--dump-mem` 仅为兼容旧命令的空操作参数） |
 | "内存占用" / "memmap" / "RAM Flash 占用" | `python -m mklink memmap --source <axf>` |
 | "写入 RAM" / "写内存" | `python -m mklink write-ram --addr 0x20001000 0xDE 0xAD` |
-| "静默写 RAM" / "无 ACK 写" / "flush 写入" / "边 dump 边写" | `python -m mklink flush-memory 0x20010000:0x11,0x22 0x20010100:0x44,0x55`（多地址多字节；与 `dump_memory` / `vofa` 并发场景使用） |
+| "静默写 RAM" / "无 ACK 写" / "flush 写入" | `python -m mklink flush-memory 0x20010000:0x11,0x22 0x20010100:0x44,0x55`（多地址多字节；先停止并释放所有流式会话） |
 | "读取 Flash" / "查看 Flash 内容" / "看中断向量表" | `python -m mklink read-flash --addr 0x08000000 --size 128` |
 | "VOFA 观测" / "变量观测" / "实时波形" | 需进一步询问变量地址/类型 → `python -m mklink vofa <地址> <类型> [...] --period <秒>` |
 | "连续读取 float" / "VOFA 快速模式" / "连续观测 N 个 float" | `python -m mklink vofa 0x20000030 5 --period 0.00001`（方式1） |

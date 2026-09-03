@@ -1,7 +1,12 @@
 import pytest
 from elftools.dwarf.structs import DWARFStructs
 
-from mklink.elf_backend import ElfParseError, ElfSection
+from mklink.elf_backend import (
+    ElfParseError,
+    ElfSection,
+    list_writable_object_symbols,
+    writable_memory_ranges,
+)
 from mklink.elf_builtin import BuiltinElfBackend, _fixed_address, _member_offset
 
 
@@ -205,6 +210,76 @@ def test_builtin_sections_preserve_header_fields(tmp_path):
     assert sections == [
         ElfSection(".text", 0x08000000, 0x120, 0x6, "SHT_PROGBITS"),
         ElfSection(".bss", 0x20000000, 0x40, 0x3, "SHT_NOBITS"),
+    ]
+
+
+def test_builtin_sections_cover_uncompressed_symbol_execution_range(
+    tmp_path, monkeypatch
+):
+    elf = FakeElf(
+        symbols=[
+            FakeSymbol(
+                "compressed_data",
+                kind="STT_OBJECT",
+                address=0x20000018,
+                size=0x100,
+                section=1,
+            ),
+            FakeSymbol(
+                "code_alias",
+                kind="STT_FUNC",
+                address=0x20000010,
+                size=0x1F0,
+                section=1,
+            ),
+            FakeSymbol(
+                "before_section",
+                kind="STT_OBJECT",
+                address=0x1FFFFFF0,
+                size=0x20,
+                section=1,
+            ),
+            FakeSymbol(
+                "crosses_next_section",
+                kind="STT_OBJECT",
+                address=0x200001F0,
+                size=0x20,
+                section=1,
+            ),
+        ],
+        sections=[
+            FakeSection("", address=0, size=0, flags=0, section_type="SHT_NULL"),
+            FakeSection(
+                "RW_IRAM1",
+                address=0x20000000,
+                size=0x20,
+                flags=0x3,
+                section_type="SHT_PROGBITS",
+            ),
+            FakeSection(
+                ".bss",
+                address=0x20000200,
+                size=0x40,
+                flags=0x3,
+                section_type="SHT_NOBITS",
+            ),
+        ],
+    )
+    backend, source = make_backend(tmp_path, elf)
+
+    assert backend.sections(source) == [
+        ElfSection("RW_IRAM1", 0x20000000, 0x118, 0x3, "SHT_PROGBITS"),
+        ElfSection(".bss", 0x20000200, 0x40, 0x3, "SHT_NOBITS"),
+    ]
+    monkeypatch.setattr(
+        "mklink.elf_backend.get_elf_backend", lambda *_args, **_kwargs: backend
+    )
+    assert writable_memory_ranges(source) == (
+        (0x20000000, 0x20000118),
+        (0x20000200, 0x20000240),
+    )
+    assert [item.name for item in list_writable_object_symbols(source)] == [
+        "compressed_data"
     ]
 
 

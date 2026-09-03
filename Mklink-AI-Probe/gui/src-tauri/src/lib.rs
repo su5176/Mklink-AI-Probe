@@ -1,14 +1,18 @@
+mod desktop_clipboard;
 mod site_agent_config;
 mod site_agent_network;
 mod site_agent_secret;
+#[cfg(target_os = "windows")]
+mod usb_port_naming;
 
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 #[cfg(target_os = "windows")]
 use windows::core::PCWSTR;
@@ -38,8 +42,10 @@ impl Drop for JobHandle {
 
 struct Sidecar {
     child: Mutex<Option<Child>>,
-    port: u16,
-    project_root: String,
+    port: Mutex<Option<u16>>,
+    instance_id: String,
+    runtime_info_path: PathBuf,
+    project_root: Mutex<String>,
     site_agent_root: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "windows")]
     job: Mutex<Option<JobHandle>>,
@@ -48,6 +54,17 @@ struct Sidecar {
 const MAX_RESTARTS: u32 = 5;
 const HEALTH_CHECK_INTERVAL_SECS: u64 = 5;
 const MAX_CONSECUTIVE_FAILS: u32 = 3;
+const DEFAULT_SIDECAR_PORT: u16 = 8765;
+const LAST_SIDECAR_PORT: u16 = 8799;
+const SIDECAR_START_TIMEOUT_SECS: u64 = 20;
+const SIDECAR_SHUTDOWN_TIMEOUT_SECS: u64 = 2;
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackendEndpoint {
+    port: u16,
+    instance_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SidecarLaunch {
@@ -89,6 +106,10 @@ fn resolve_sidecar_launch() -> Result<SidecarLaunch, String> {
 
 fn default_project_root() -> String {
     ".".into()
+}
+
+fn desktop_workspace_root(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join("workspace")
 }
 
 fn configured_site_agent_root(state: &Sidecar) -> Result<PathBuf, String> {
@@ -249,6 +270,91 @@ fn site_agent_bind_addresses() -> Vec<String> {
     site_agent_network::local_bind_addresses()
 }
 
+#[tauri::command]
+fn write_file(path: String, contents: Vec<u8>) -> Result<(), String> {
+    let target = PathBuf::from(path);
+    if target.as_os_str().is_empty() {
+        return Err("file path is empty".into());
+    }
+    std::fs::write(&target, contents).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn clipboard_read_text() -> Result<String, String> {
+    desktop_clipboard::read_text()
+}
+
+#[tauri::command]
+fn clipboard_write_text(window: tauri::WebviewWindow, text: String) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    let raw_owner = window
+        .hwnd()
+        .map_err(|error| format!("Unable to access the application window handle: {error}"))?
+        .0 as isize;
+    #[cfg(not(target_os = "windows"))]
+    let raw_owner = {
+        let _ = window;
+        1
+    };
+    let owner = desktop_clipboard::ClipboardOwner::from_raw(raw_owner)?;
+    desktop_clipboard::write_text(owner, &text)
+}
+
+fn powershell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn elevated_helper_arguments(executable: &Path, operation: &str) -> (String, String) {
+    let executable = executable.to_string_lossy().into_owned();
+    let arguments = format!("--manage-usb-port-names {}", operation);
+    (executable, arguments)
+}
+
+#[tauri::command]
+fn rename_usb_ports(action: String) -> Result<serde_json::Value, String> {
+    if action != "apply" && action != "restore" {
+        return Err("USB port naming action must be apply or restore".into());
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Err("USB port naming is only available on Windows".into());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("cannot resolve desktop executable: {error}"))?;
+        let (file_path, child_arguments) = elevated_helper_arguments(&executable, &action);
+        // The helper itself performs identity validation, registry backup and
+        // write verification. Start-Process -Verb RunAs supplies the UAC
+        // boundary when the desktop app is running as a normal user.
+        let command = format!(
+            "$p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; exit $p.ExitCode",
+            powershell_single_quote(&file_path),
+            powershell_single_quote(&child_arguments),
+        );
+        let status = Command::new("powershell.exe")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["-NoProfile", "-NonInteractive", "-Command", &command])
+            .status()
+            .map_err(|error| format!("failed to start USB naming helper: {error}"))?;
+        let code = status.code().unwrap_or(1);
+        if code != 0 {
+            return Err(format!("USB port naming helper exited with code {code}"));
+        }
+        Ok(serde_json::json!({ "action": action, "status": "completed" }))
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub fn run_usb_port_naming_cli(action: &str) -> Result<serde_json::Value, String> {
+    serde_json::to_value(usb_port_naming::apply(action)?).map_err(|error| error.to_string())
+}
+
 #[cfg(target_os = "windows")]
 fn which_exists(name: &str) -> bool {
     use std::os::windows::process::CommandExt;
@@ -318,6 +424,8 @@ fn assign_to_job(job: &JobHandle, child: &Child) -> Result<(), String> {
 fn spawn_sidecar(
     launch: &SidecarLaunch,
     port: u16,
+    instance_id: &str,
+    runtime_info_path: &Path,
     project_root: &str,
     site_agent_root: Option<&Path>,
 ) -> Result<Child, String> {
@@ -342,6 +450,12 @@ fn spawn_sidecar(
             "127.0.0.1",
             "--port",
             &port.to_string(),
+            "--desktop-port-end",
+            &LAST_SIDECAR_PORT.to_string(),
+            "--desktop-runtime-info",
+            &runtime_info_path.to_string_lossy(),
+            "--desktop-instance-id",
+            instance_id,
             "--project-root",
             project_root,
         ])
@@ -394,7 +508,14 @@ fn spawn_registered_sidecar(
         .lock()
         .map_err(|error| error.to_string())?
         .clone();
-    let child = spawn_sidecar(launch, port, project_root, site_agent_root.as_deref())?;
+    let child = spawn_sidecar(
+        launch,
+        port,
+        &state.instance_id,
+        &state.runtime_info_path,
+        project_root,
+        site_agent_root.as_deref(),
+    )?;
     retain_child_if_registered(
         child,
         |child| assign_to_job(job, child),
@@ -405,8 +526,63 @@ fn spawn_registered_sidecar(
     )
 }
 
+fn request_sidecar_shutdown(port: u16, instance_id: &str) -> bool {
+    use std::io::{Read, Write};
+
+    let addr = format!("127.0.0.1:{}", port);
+    let mut stream = match std::net::TcpStream::connect_timeout(
+        &addr.parse().unwrap(),
+        std::time::Duration::from_millis(500),
+    ) {
+        Ok(stream) => stream,
+        Err(_) => return false,
+    };
+    let timeout = std::time::Duration::from_secs(SIDECAR_SHUTDOWN_TIMEOUT_SECS);
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+
+    let body = serde_json::json!({ "instance_id": instance_id }).to_string();
+    let request = format!(
+        "POST /api/desktop/shutdown HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        port,
+        body.len(),
+        body,
+    );
+    if stream.write_all(request.as_bytes()).is_err() {
+        return false;
+    }
+    let mut response = Vec::new();
+    if stream.take(8192).read_to_end(&mut response).is_err() {
+        return false;
+    }
+    String::from_utf8_lossy(&response)
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "))
+}
+
+fn wait_for_child_exit(child: &mut Child) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SIDECAR_SHUTDOWN_TIMEOUT_SECS);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return true,
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => return false,
+        }
+    }
+    child.try_wait().is_ok_and(|status| status.is_some())
+}
+
 fn terminate_sidecar_tree(state: &Sidecar) -> Result<(), String> {
-    let child = state.child.lock().map_err(|e| e.to_string())?.take();
+    let port = *state.port.lock().map_err(|e| e.to_string())?;
+    let mut child = state.child.lock().map_err(|e| e.to_string())?.take();
+    let graceful_exit = port.is_some_and(|port| {
+        request_sidecar_shutdown(port, &state.instance_id)
+            && child.as_mut().is_none_or(wait_for_child_exit)
+    });
+    *state.port.lock().map_err(|e| e.to_string())? = None;
+    let _ = std::fs::remove_file(&state.runtime_info_path);
 
     // A PyInstaller onefile executable can leave the actual Python worker in
     // the app-owned Job after its tracked launcher exits. Closing the Job is
@@ -419,14 +595,16 @@ fn terminate_sidecar_tree(state: &Sidecar) -> Result<(), String> {
     }
 
     if let Some(mut child) = child {
-        let _ = child.kill();
+        if !graceful_exit {
+            let _ = child.kill();
+        }
         let _ = child.wait();
     }
     Ok(())
 }
 
-/// Minimal HTTP health check using raw TCP — no external deps needed.
-fn check_health(port: u16) -> bool {
+/// Minimal owned-backend health check using raw TCP — no external deps needed.
+fn check_health(port: u16, instance_id: &str) -> bool {
     use std::io::{Read, Write};
     let addr = format!("127.0.0.1:{}", port);
     let mut stream = match std::net::TcpStream::connect_timeout(
@@ -446,13 +624,122 @@ fn check_health(port: u16) -> bool {
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
     }
-    let mut buf = [0u8; 256];
-    match stream.read(&mut buf) {
-        Ok(n) if n > 0 => {
-            let resp = String::from_utf8_lossy(&buf[..n]);
-            resp.contains("200")
+    let mut response = Vec::new();
+    if stream.take(8192).read_to_end(&mut response).is_err() {
+        return false;
+    }
+    let response = String::from_utf8_lossy(&response);
+    health_response_matches(&response, instance_id)
+}
+
+fn health_response_matches(response: &str, instance_id: &str) -> bool {
+    let Some((headers, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    if !headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "))
+    {
+        return false;
+    }
+    serde_json::from_str::<serde_json::Value>(body).is_ok_and(|payload| {
+        payload.get("status").and_then(|value| value.as_str()) == Some("ok")
+            && payload
+                .get("desktop_instance_id")
+                .and_then(|value| value.as_str())
+                == Some(instance_id)
+    })
+}
+
+fn current_endpoint(state: &Sidecar) -> Result<Option<BackendEndpoint>, String> {
+    Ok(state
+        .port
+        .lock()
+        .map_err(|error| error.to_string())?
+        .map(|port| BackendEndpoint {
+            port,
+            instance_id: state.instance_id.clone(),
+        }))
+}
+
+fn wait_for_runtime_endpoint(state: &Sidecar) -> Result<BackendEndpoint, String> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(SIDECAR_START_TIMEOUT_SECS);
+    while std::time::Instant::now() < deadline {
+        if let Ok(raw) = std::fs::read_to_string(&state.runtime_info_path) {
+            if let Ok(endpoint) = serde_json::from_str::<BackendEndpoint>(&raw) {
+                if endpoint.instance_id == state.instance_id
+                    && (DEFAULT_SIDECAR_PORT..=LAST_SIDECAR_PORT).contains(&endpoint.port)
+                {
+                    *state.port.lock().map_err(|error| error.to_string())? = Some(endpoint.port);
+                    return Ok(endpoint);
+                }
+            }
         }
-        _ => false,
+        let exited = {
+            let mut guard = state.child.lock().map_err(|error| error.to_string())?;
+            match guard.as_mut() {
+                Some(child) => child
+                    .try_wait()
+                    .map_err(|error| error.to_string())?
+                    .is_some(),
+                None => true,
+            }
+        };
+        if exited {
+            return Err("The sidecar exited before publishing its API endpoint".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err("Timed out waiting for the sidecar API endpoint".into())
+}
+
+fn start_owned_sidecar(
+    state: &Sidecar,
+    project_root: Option<String>,
+    preferred_port: Option<u16>,
+) -> Result<BackendEndpoint, String> {
+    let process_alive = {
+        let mut guard = state.child.lock().map_err(|error| error.to_string())?;
+        match guard.as_mut() {
+            Some(child) => child
+                .try_wait()
+                .map(|status| status.is_none())
+                .unwrap_or(false),
+            None => false,
+        }
+    };
+    if process_alive {
+        if let Some(endpoint) = current_endpoint(state)? {
+            return Ok(endpoint);
+        }
+        return wait_for_runtime_endpoint(state);
+    }
+
+    terminate_sidecar_tree(state)?;
+    let port = preferred_port.unwrap_or(DEFAULT_SIDECAR_PORT);
+    if !(DEFAULT_SIDECAR_PORT..=LAST_SIDECAR_PORT).contains(&port) {
+        return Err("The preferred sidecar port is outside the desktop range".into());
+    }
+    let project_root = match project_root {
+        Some(path) => path,
+        None => state
+            .project_root
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clone(),
+    };
+    let launch = resolve_sidecar_launch()?;
+    let child = spawn_registered_sidecar(state, &launch, port, &project_root)?;
+    *state.child.lock().map_err(|error| error.to_string())? = Some(child);
+
+    match wait_for_runtime_endpoint(state) {
+        Ok(endpoint) => Ok(endpoint),
+        Err(error) => {
+            let _ = terminate_sidecar_tree(state);
+            Err(error)
+        }
     }
 }
 
@@ -476,31 +763,8 @@ fn sidecar_status(state: State<Sidecar>) -> Result<bool, String> {
 fn start_sidecar(
     state: State<Sidecar>,
     project_root: Option<String>,
-    port: Option<u16>,
-) -> Result<u16, String> {
-    let port = port.unwrap_or(state.port);
-    let mut guard = state.child.lock().map_err(|e| e.to_string())?;
-    if guard.is_some()
-        && guard
-            .as_mut()
-            .unwrap()
-            .try_wait()
-            .map(|s| s.is_none())
-            .unwrap_or(false)
-    {
-        return Ok(port);
-    }
-    if check_health(port) {
-        return Ok(port);
-    }
-
-    let project_root = project_root.unwrap_or_else(|| state.project_root.clone());
-
-    let launch = resolve_sidecar_launch()?;
-    let child = spawn_registered_sidecar(state.inner(), &launch, port, &project_root)?;
-
-    *guard = Some(child);
-    Ok(port)
+) -> Result<BackendEndpoint, String> {
+    start_owned_sidecar(state.inner(), project_root, None)
 }
 
 #[tauri::command]
@@ -509,15 +773,15 @@ fn stop_sidecar(state: State<Sidecar>) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn restart_sidecar(state: State<Sidecar>) -> Result<u16, String> {
+fn restart_sidecar(state: State<Sidecar>) -> Result<BackendEndpoint, String> {
+    let preferred_port = state.port.lock().map_err(|e| e.to_string())?.to_owned();
     terminate_sidecar_tree(state.inner())?;
-    for _ in 0..20 {
-        if !check_health(state.port) {
-            return start_sidecar(state, None, None);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    Err("The previous sidecar did not release its API port".into())
+    start_owned_sidecar(state.inner(), None, preferred_port)
+}
+
+#[tauri::command]
+fn backend_endpoint(state: State<Sidecar>) -> Result<Option<BackendEndpoint>, String> {
+    current_endpoint(state.inner())
 }
 
 #[tauri::command]
@@ -532,7 +796,10 @@ fn backend_alive(state: State<Sidecar>) -> Result<bool, String> {
     if !running {
         return Ok(false);
     }
-    Ok(check_health(state.port))
+    let Some(endpoint) = current_endpoint(state.inner())? else {
+        return Ok(false);
+    };
+    Ok(check_health(endpoint.port, &endpoint.instance_id))
 }
 
 fn run_monitor(handle: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
@@ -572,31 +839,11 @@ fn run_monitor(handle: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             // Longer backoff: 3s base + 2s per restart attempt
             let backoff = 3 + 2 * (restart_count - 1);
             std::thread::sleep(std::time::Duration::from_secs(backoff as u64));
-
-            // Check if port is already in use — no point restarting if so
-            if check_health(state.port) {
-                eprintln!(
-                    "[tauri] port {} already in use, skipping restart",
-                    state.port
-                );
-                restart_count = restart_count.saturating_sub(1); // don't count this
-                continue;
-            }
-
-            let launch = match resolve_sidecar_launch() {
-                Ok(launch) => launch,
-                Err(error) => {
-                    eprintln!("[tauri] cannot resolve sidecar: {}", error);
-                    continue;
-                }
-            };
-
-            match spawn_registered_sidecar(state.inner(), &launch, state.port, &state.project_root)
-            {
-                Ok(child) => {
-                    let mut guard = state.child.lock().unwrap();
-                    *guard = Some(child);
-                    eprintln!("[tauri] sidecar restarted");
+            let preferred_port = state.port.lock().ok().and_then(|port| *port);
+            match start_owned_sidecar(state.inner(), None, preferred_port) {
+                Ok(endpoint) => {
+                    let _ = handle.emit("backend-endpoint-changed", &endpoint);
+                    eprintln!("[tauri] sidecar restarted on port {}", endpoint.port);
                     consecutive_fails = 0;
                 }
                 Err(e) => eprintln!("[tauri] restart failed: {}", e),
@@ -604,8 +851,11 @@ fn run_monitor(handle: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             continue;
         }
 
-        // Process alive — check HTTP health
-        if check_health(state.port) {
+        let endpoint = current_endpoint(state.inner()).ok().flatten();
+        if endpoint
+            .as_ref()
+            .is_some_and(|endpoint| check_health(endpoint.port, &endpoint.instance_id))
+        {
             consecutive_fails = 0;
         } else {
             consecutive_fails += 1;
@@ -615,13 +865,7 @@ fn run_monitor(handle: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
             );
             if consecutive_fails >= MAX_CONSECUTIVE_FAILS {
                 eprintln!("[tauri] backend unresponsive, killing...");
-                {
-                    let mut guard = state.child.lock().unwrap();
-                    if let Some(mut child) = guard.take() {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                    }
-                }
+                let _ = terminate_sidecar_tree(state.inner());
                 consecutive_fails = 0;
             }
         }
@@ -631,6 +875,12 @@ fn run_monitor(handle: tauri::AppHandle, shutdown: std::sync::Arc<AtomicBool>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let shutdown = std::sync::Arc::new(AtomicBool::new(false));
+    let instance_id = format!("{:032x}", rand::random::<u128>());
+    let runtime_info_path = std::env::temp_dir().join(format!(
+        "mklink-ai-probe-runtime-{}-{}.json",
+        std::process::id(),
+        instance_id
+    ));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -639,8 +889,10 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(Sidecar {
             child: Mutex::new(None),
-            port: 8765,
-            project_root: default_project_root(),
+            port: Mutex::new(None),
+            instance_id,
+            runtime_info_path,
+            project_root: Mutex::new(default_project_root()),
             site_agent_root: Mutex::new(None),
             #[cfg(target_os = "windows")]
             job: Mutex::new(None),
@@ -650,6 +902,7 @@ pub fn run() {
             start_sidecar,
             stop_sidecar,
             restart_sidecar,
+            backend_endpoint,
             backend_alive,
             site_agent_config_get,
             site_agent_config_save,
@@ -657,8 +910,21 @@ pub fn run() {
             site_agent_generate_token_and_copy,
             site_agent_stcp_credentials_configure,
             site_agent_bind_addresses,
+            write_file,
+            clipboard_read_text,
+            clipboard_write_text,
+            rename_usb_ports,
         ])
         .setup(move |app| {
+            let workspace_root = desktop_workspace_root(&app.path().app_local_data_dir()?);
+            std::fs::create_dir_all(&workspace_root)?;
+            {
+                let state: State<Sidecar> = app.state();
+                *state
+                    .project_root
+                    .lock()
+                    .map_err(|error| error.to_string())? = workspace_root.to_string_lossy().into_owned();
+            }
             let site_agent_root = app.path().app_local_data_dir()?.join("site-agent");
             site_agent_config::ensure_root(&site_agent_root)?;
             {
@@ -675,7 +941,21 @@ pub fn run() {
             let exit_item = MenuItem::with_id(app, "exit", "Exit", true, None::<&str>)?;
             let tray_menu = Menu::with_items(app, &[&show_item, &exit_item])?;
             let tray_shutdown = shutdown.clone();
+            // TrayIconBuilder does not inherit the window icon automatically.
+            // Reuse the generated bundle icon so Windows never creates an
+            // empty tray item when the app starts from the installer.
+            let tray_icon = app
+                .default_window_icon()
+                .cloned()
+                .map(tauri::image::Image::to_owned)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "Tauri default window icon is missing",
+                    )
+                })?;
             TrayIconBuilder::new()
+                .icon(tray_icon)
                 .menu(&tray_menu)
                 .show_menu_on_left_click(false)
                 .on_menu_event(move |app, event| match event.id.as_ref() {
@@ -709,24 +989,21 @@ pub fn run() {
                 })
                 .build(app)?;
 
-            // Keep the unified sidecar alive in the tray while Site Agent is enabled.
+            // Closing the main window is a real application exit. The sidecar
+            // owns the Device and its serial/HIL locks, so it must be stopped
+            // even when Site Agent is configured. Users can start the desktop
+            // app again when they need the agent; a hidden window must never
+            // leave a probe locked unexpectedly.
             let cleanup_handle = app.handle().clone();
             let cleanup_shutdown = shutdown.clone();
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                    if let tauri::WindowEvent::CloseRequested { api: _, .. } = event {
                         let state: State<Sidecar> = cleanup_handle.state();
-                        let keep_running = configured_site_agent_root(state.inner())
-                            .ok()
-                            .and_then(|root| site_agent_config::load(&root).ok())
-                            .is_some_and(|config| config.enabled);
-                        if keep_running {
-                            api.prevent_close();
-                            if let Some(window) = cleanup_handle.get_webview_window("main") {
-                                let _ = window.hide();
-                            }
-                            return;
-                        }
+                        // The close request is allowed to continue after the
+                        // owned sidecar has been asked to shut down. This
+                        // keeps the serial release on the same synchronous
+                        // path as tray Exit and process shutdown.
                         eprintln!("[tauri] window closing, cleaning up sidecar...");
                         cleanup_shutdown.store(true, Ordering::Relaxed);
                         if terminate_sidecar_tree(state.inner()).is_ok() {
@@ -737,14 +1014,13 @@ pub fn run() {
             }
 
             std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_secs(1));
                 let state: State<Sidecar> = handle.state();
-                match start_sidecar(state, None, Some(8765)) {
-                    Ok(port) => {
-                        eprintln!("[tauri] sidecar started on port {}", port);
+                match start_owned_sidecar(state.inner(), None, None) {
+                    Ok(endpoint) => {
+                        eprintln!("[tauri] sidecar started on port {}", endpoint.port);
                         // Wait for Python to fully initialize before monitoring
                         for _ in 0..20 {
-                            if check_health(port) {
+                            if check_health(endpoint.port, &endpoint.instance_id) {
                                 eprintln!("[tauri] backend healthy");
                                 break;
                             }
@@ -799,6 +1075,60 @@ mod tests {
     }
 
     #[test]
+    fn installed_runtime_uses_a_user_writable_workspace() {
+        assert_eq!(
+            desktop_workspace_root(Path::new(r"C:\Users\test\AppData\Local\Mklink AI Probe")),
+            PathBuf::from(r"C:\Users\test\AppData\Local\Mklink AI Probe\workspace"),
+        );
+    }
+
+    #[test]
+    fn clipboard_write_command_receives_the_invoking_webview_window() {
+        let command: fn(tauri::WebviewWindow, String) -> Result<(), String> = clipboard_write_text;
+        let _ = command;
+    }
+
+    #[test]
+    fn powershell_paths_are_single_quote_escaped() {
+        assert_eq!(
+            powershell_single_quote(r"C:\Program Files\Owner's MKLink\rename.ps1"),
+            r"'C:\Program Files\Owner''s MKLink\rename.ps1'"
+        );
+        assert_eq!(
+            elevated_helper_arguments(
+                Path::new(r"C:\Program Files\Mklink AI Probe\resources\rename.ps1"),
+                "restore",
+            ),
+            (
+                r"C:\Program Files\Mklink AI Probe\resources\rename.ps1".into(),
+                "--manage-usb-port-names restore".into(),
+            ),
+        );
+    }
+
+    #[test]
+    fn health_check_requires_the_owning_desktop_instance() {
+        let response = concat!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n",
+            r#"{"status":"ok","desktop_instance_id":"instance-a"}"#,
+        );
+        assert!(health_response_matches(response, "instance-a"));
+        assert!(!health_response_matches(response, "instance-b"));
+        assert!(!health_response_matches(
+            "HTTP/1.1 200 OK\r\n\r\n{\"status\":\"ok\"}",
+            "instance-a"
+        ));
+    }
+
+    #[test]
+    fn runtime_endpoint_uses_the_frontend_field_names() {
+        let endpoint: BackendEndpoint =
+            serde_json::from_str(r#"{"port":8766,"instanceId":"instance-b"}"#).unwrap();
+        assert_eq!(endpoint.port, 8766);
+        assert_eq!(endpoint.instance_id, "instance-b");
+    }
+
+    #[test]
     fn failed_child_registration_runs_cleanup() {
         let mut cleaned = false;
         let result = retain_child_if_registered(
@@ -842,8 +1172,10 @@ mod tests {
 
         let state = Sidecar {
             child: Mutex::new(Some(tracked)),
-            port: 8765,
-            project_root: default_project_root(),
+            port: Mutex::new(Some(DEFAULT_SIDECAR_PORT)),
+            instance_id: "test-instance".into(),
+            runtime_info_path: std::env::temp_dir().join("mklink-test-runtime-info.json"),
+            project_root: Mutex::new(default_project_root()),
             site_agent_root: Mutex::new(None),
             job: Mutex::new(Some(job)),
         };
@@ -851,6 +1183,7 @@ mod tests {
         terminate_sidecar_tree(&state).expect("terminate sidecar tree");
         assert!(state.child.lock().unwrap().is_none());
         assert!(state.job.lock().unwrap().is_none());
+        assert!(state.port.lock().unwrap().is_none());
 
         for _ in 0..40 {
             if worker.try_wait().expect("poll worker").is_some() {

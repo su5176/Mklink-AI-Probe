@@ -3,7 +3,7 @@ import { computed } from 'vue'
 import { Play, Square } from '@lucide/vue'
 import type { JobAction, JobState } from '../../types/onlineFlash'
 import { tr } from '../../composables/useLanguage'
-const props = defineProps<{ actions: JobAction[]; canStart: boolean; active: boolean; stopping: boolean; state: JobState | null; totalProgress: number }>()
+const props = defineProps<{ actions: JobAction[]; canStart: boolean; active: boolean; stopping: boolean; state: JobState | null; totalProgress: number; progressLabel?: string; progressState?: string }>()
 const emit = defineEmits<{ actions: [actions: JobAction[]]; start: []; stop: [] }>()
 const choices = computed<Array<{ value: JobAction; label: string }>>(() => [{value:'connect',label:tr('连接', 'Connect')},{value:'erase',label:tr('擦除', 'Erase')},{value:'program',label:tr('烧录', 'Program')},{value:'verify',label:tr('校验', 'Verify')},{value:'reset',label:tr('复位', 'Reset')},{value:'disconnect',label:tr('断开', 'Disconnect')}])
 const mandatory = new Set<JobAction>(['connect', 'disconnect'])
@@ -27,8 +27,8 @@ const totalPercent = computed(() => Math.round(Math.min(1, Math.max(0, props.tot
     </div>
     <div class="progress-block">
       <div class="progress-meta">
-        <span class="progress-title">{{ tr('烧录总进度', 'Total Progress') }}</span>
-        <span data-testid="job-state" class="state">{{ stateLabel(state) }}</span>
+        <span class="progress-title">{{ progressLabel || tr('烧录总进度', 'Total Progress') }}</span>
+        <span data-testid="job-state" class="state">{{ progressState || stateLabel(state) }}</span>
         <strong data-testid="total-progress-label">{{ totalPercent }}%</strong>
       </div>
       <progress data-testid="total-progress" :value="totalProgress" max="1" :aria-label="tr('烧录总进度', 'Total flash progress')" />

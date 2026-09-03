@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from unittest.mock import patch, MagicMock
 
+import pytest
 from fastapi.testclient import TestClient
 
-from mklink.device import Device, initialize_target
+from mklink.device import Device, DeviceNotConnectedError, initialize_target
 
 
 # ----------------------------------------------------------------------
@@ -112,7 +113,7 @@ class TestDeviceConnectInitializesTarget:
         new_bridge = MagicMock()
         new_bridge.connect.return_value = True
         with patch("mklink.bridge.MKLinkSerialBridge", return_value=new_bridge), \
-             patch("mklink.cli._resolve_port", return_value="COM6"), \
+             patch("mklink.project_config.load_config", return_value={"com_port": "COM6"}), \
              patch("mklink.device.initialize_target") as mock_init:
             dev._port = None
             dev._connect()
@@ -121,6 +122,74 @@ class TestDeviceConnectInitializesTarget:
         assert args[0] is new_bridge            # bridge
         assert kwargs.get("project_root") == "."
         assert dev.connected is True
+
+    def test_automatic_connect_falls_back_when_preferred_port_is_claimed(self, tmp_path):
+        created = []
+        events = []
+
+        class DiscoveryLock:
+            def __init__(self, name):
+                assert name == "mklink_auto_connect"
+
+            def acquire(self):
+                events.append("discovery-lock-acquired")
+                return True
+
+            def release(self):
+                events.append("discovery-lock-released")
+
+        class Bridge:
+            def __init__(self, port):
+                self.port = port
+                self._ctx = MagicMock()
+                created.append(port)
+
+            def connect(self):
+                return self.port == "COM228"
+
+            def _verify_identity(self):
+                return True
+
+            def close(self):
+                pass
+
+        dev = Device(preferred_port="COM46", project_root=str(tmp_path))
+        with patch("mklink.bridge.MKLinkSerialBridge", Bridge), \
+             patch("mklink.discovery.find_mklink_cdc_port", side_effect=lambda **_kwargs: (
+                 events.append("discovered") or "COM228"
+             )) as discover, \
+             patch("mklink.discovery.list_available_ports", return_value=[
+                 {"device": "COM46"}, {"device": "COM228"}
+             ]), \
+             patch("mklink.project_config.load_config", return_value={"com_port": "COM46"}), \
+             patch("mklink.project_config.save_config") as save_config, \
+             patch("mklink.serial._port._PortLock", DiscoveryLock), \
+             patch("mklink.device.initialize_target"):
+            dev._connect()
+
+        assert created == ["COM46", "COM46", "COM228"]
+        discover.assert_called_once_with(exclude_ports={"com46"})
+        assert events == [
+            "discovery-lock-acquired",
+            "discovered",
+            "discovery-lock-released",
+        ]
+        save_config.assert_not_called()
+        assert dev.port == "COM228"
+
+    def test_explicit_port_does_not_fall_back(self, tmp_path):
+        bridge = MagicMock()
+        bridge.connect.return_value = False
+        dev = Device(port="COM46", project_root=str(tmp_path))
+
+        with patch("mklink.bridge.MKLinkSerialBridge", return_value=bridge), \
+             patch("mklink.discovery.find_mklink_cdc_port") as discover, \
+             patch("mklink.project_config.load_config", return_value={}):
+            with pytest.raises(DeviceNotConnectedError):
+                dev._connect()
+
+        discover.assert_not_called()
+        assert bridge.connect.call_count == 2
 
 
 # ----------------------------------------------------------------------

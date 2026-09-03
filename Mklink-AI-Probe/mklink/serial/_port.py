@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import os
-import re
 import threading
 from typing import Optional
 
 import serial
 import serial.tools.list_ports
 
-from mklink._types import KNOWN_MKLINK_VID_PIDS
+from mklink.local_resources import serial_lock_path
+from mklink.usb_interfaces import (
+    MKLINK_COMMAND_INTERFACE,
+    is_mklink_usb_port,
+    usb_interface_number,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -22,9 +26,7 @@ class _PortLock:
     _guard = threading.Lock()
 
     def __init__(self, port: str):
-        safe_port = re.sub(r"[^A-Za-z0-9_.-]+", "_", port.upper())
-        lock_dir = os.path.join(os.environ.get("TEMP", "/tmp"), "mklink_serial_locks")
-        self._path = os.path.join(lock_dir, f"{safe_port}.lock")
+        self._path = serial_lock_path(port)
         self._fd: Optional[object] = None
         self._locked = False
 
@@ -32,8 +34,12 @@ class _PortLock:
         if self._locked:
             return True
         with self._guard:
-            os.makedirs(os.path.dirname(self._path), exist_ok=True)
-            self._fd = open(self._path, "a+")
+            try:
+                os.makedirs(os.path.dirname(self._path), exist_ok=True)
+                self._fd = open(self._path, "a+")
+            except OSError:
+                self._fd = None
+                return False
             try:
                 if os.name == "nt":
                     import msvcrt
@@ -78,35 +84,26 @@ class _PortLock:
 # MKLink port detection
 # ---------------------------------------------------------------------------
 def is_mklink_port(port: str) -> bool:
-    """判断指定 COM 口是否为 MKLink 调试探针。"""
+    """判断指定 COM 口是否为 MKLink 命令接口。"""
     for info in serial.tools.list_ports.comports():
         if info.device.upper() != port.upper():
             continue
-        mfr = (info.manufacturer or "").lower()
-        desc = (info.description or "").lower()
-        if any(kw in mfr for kw in ("microkeen", "microlink", "mklink")):
-            return True
-        if any(kw in desc for kw in ("microkeen", "microlink", "mklink")):
-            return True
-        if info.vid is not None and info.pid is not None:
-            if (info.vid, info.pid) in KNOWN_MKLINK_VID_PIDS:
-                return True
-        break
+        return (
+            is_mklink_usb_port(info)
+            and usb_interface_number(info) == MKLINK_COMMAND_INTERFACE
+        )
     return False
 
 
 def list_uart_ports() -> list[dict]:
-    """列出所有非 MKLink 的可用串口。"""
+    """列出通用串口，排除 MKLink 的 MI_04 命令接口。"""
     results: list[dict] = []
     for info in serial.tools.list_ports.comports():
-        mfr = (info.manufacturer or "").lower()
-        desc_lower = (info.description or "").lower()
-        mklink = any(kw in mfr for kw in ("microkeen", "microlink", "mklink"))
-        if not mklink:
-            mklink = any(kw in desc_lower for kw in ("microkeen", "microlink", "mklink"))
-        if not mklink and info.vid is not None and info.pid is not None:
-            mklink = (info.vid, info.pid) in KNOWN_MKLINK_VID_PIDS
-        if not mklink:
+        is_command = (
+            is_mklink_usb_port(info)
+            and usb_interface_number(info) == MKLINK_COMMAND_INTERFACE
+        )
+        if not is_command:
             results.append({
                 "device": info.device,
                 "description": info.description or "",

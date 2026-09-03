@@ -122,6 +122,10 @@
           <span>Runtime Drop</span>
           <b :title="meta.sessionDropped ? `session dropped: ${meta.sessionDropped}` : 'runtime dropped'">{{ meta.dropped.toLocaleString() }}</b>
         </div>
+        <div v-if="meta.targetOverflowEvents > 0 || meta.targetDroppedPackets > 0" class="sv-health-card warn">
+          <span>Target Overflow</span>
+          <b :title="`target dropped packets: ${meta.targetDroppedPackets.toLocaleString()}`">{{ meta.targetOverflowEvents.toLocaleString() }}</b>
+        </div>
         <div class="sv-health-card" :class="{ warn: !meta.cpuFreq }">
           <span>CPU Clock</span>
           <b :title="meta.cpuFreqSource || 'cpu_freq'">{{ meta.cpuFreq ? fmtCpuFreq(meta.cpuFreq) : 'Unknown' }}</b>
@@ -129,6 +133,10 @@
         <div class="sv-health-card" :class="{ warn: !meta.synced && dash.state.value === 'running' }">
           <span>Sync</span>
           <b>{{ meta.synced || dash.state.value !== 'running' ? 'Ready' : 'Unsynced' }}</b>
+        </div>
+        <div v-if="meta.autoRetryCount > 0" data-testid="systemview-auto-retry" class="sv-health-card warn">
+          <span>Recovery</span>
+          <b :title="meta.autoRetryStopError || meta.autoRetryReason">{{ tr('首次启动已自动重试', 'First start retried') }}</b>
         </div>
         <div v-if="analysisBufferCount" class="sv-health-card">
           <span>Analysis Buffer</span>
@@ -286,14 +294,15 @@ import { useMklinkApi } from '../../composables/useMklinkApi'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
 import {
   DESKTOP_SETTINGS_CHANGED_EVENT,
-  isMapFilePath,
+  isSameFileSourcePath,
   isSymbolFilePath,
   loadDesktopSettings,
   saveDesktopSettings,
   type DesktopSettings,
 } from '../../lib/desktopSettings'
 import { SvTimeline } from '../../lib/svTimeline'
-import { RenderScheduler } from '../../lib/stream/renderScheduler'
+import { cancelRttAddressRefresh } from '../../lib/rttSymbolAddress'
+import { AdaptiveFrameRateController, RenderScheduler } from '../../lib/stream/renderScheduler'
 import { appendManyToLast } from '../../lib/boundedBuffer'
 import { takeNewStreamPoints } from '../../lib/streamCursor'
 import { ingestSystemViewIntervals, type SystemViewIntervalState } from '../../lib/systemViewIntervals'
@@ -321,9 +330,7 @@ const binaryStream = useBinaryStream('systemview', { capacity: 300_000, channelC
 const renderPaused = ref(false)
 const desktopStorage = localStorage
 const settings = ref<DesktopSettings>(loadDesktopSettings(desktopStorage))
-const hasAddressFileSource = computed(() => (
-  isSymbolFilePath(settings.value.symbolPath) || isMapFilePath(settings.value.mapPath)
-))
+const hasAddressFileSource = computed(() => isSymbolFilePath(settings.value.symbolPath))
 const rttAddress = ref(settings.value.rttAddress)
 const addressError = ref('')
 const addressSource = ref('')
@@ -363,6 +370,12 @@ let analysisEvents: any[] = []
 const analysisBufferCount = ref(0)
 const taskStats = reactive<Record<number, TaskStat>>({})
 const intervals = shallowRef<TaskInterval[]>([])
+// The worker returns a pixel envelope for the requested viewport. Its bucket
+// boundaries move as the follow window advances, so replacing the previous
+// response makes whole groups of intervals disappear and reappear. Keep a
+// bounded live cache keyed by interval start and update it incrementally;
+// rendering still filters this cache to the current viewport.
+const visibleIntervalCache = new Map<string, TaskInterval>()
 const exactRuntimeRows = shallowRef<any[]>([])
 let intervalState: SystemViewIntervalState = { currentTaskId: null, currentStart: null }
 const idleUs = ref(0)
@@ -372,6 +385,9 @@ const meta = reactive({
   synced: false,
   dropped: 0,
   sessionDropped: 0,
+  targetOverflowEvents: 0,
+  targetDroppedPackets: 0,
+  targetDropCount: null as number | null,
   cpuFreq: 0,
   cpuFreqSource: '',
   taskNames: {} as Record<number, string>,
@@ -380,7 +396,13 @@ const meta = reactive({
   recordingPath: '',
   recordingSummaryPath: '',
   recordingError: '',
+  connectionGeneration: 0,
+  sessionGeneration: 0,
+  autoRetryCount: 0,
+  autoRetryReason: '',
+  autoRetryStopError: '',
 })
+let lastAutoRetryKey = ''
 let lastStreamSeq = 0
 const totalEventCount = ref(0)
 const windowUs = ref(10_000_000)
@@ -401,6 +423,7 @@ const recordingBusy = ref(false)
 let connectTimer: ReturnType<typeof setTimeout> | null = null
 let mounted = false
 let operationGeneration = 0
+let searchGeneration = 0
 const SYSTEMVIEW_CHANNEL = 1
 const RTT_SEARCH_SIZE = 1024
 
@@ -414,15 +437,31 @@ function isRttAddress(value: string): boolean {
 
 function syncRttAddressFromSettings(): void {
   const latest = loadDesktopSettings(desktopStorage)
+  const sourceChanged = !sameRttSearchSource(settings.value.symbolPath, latest.symbolPath)
+  const addressChanged = latest.rttAddress !== rttAddress.value
+  if (sourceChanged || addressChanged) {
+    searchGeneration++
+    searching.value = false
+  }
   settings.value = latest
-  if (latest.rttAddress !== rttAddress.value) {
+  if (addressChanged) {
     rttAddress.value = latest.rttAddress
     addressError.value = ''
     addressSource.value = ''
   }
 }
 
+function sameRttSearchSource(left: string | undefined, right: string | undefined): boolean {
+  const leftPath = left?.trim() || ''
+  const rightPath = right?.trim() || ''
+  if (!leftPath || !rightPath) return leftPath === rightPath
+  return isSameFileSourcePath(leftPath, rightPath)
+}
+
 function onAddressInput(): void {
+  cancelRttAddressRefresh(desktopStorage)
+  searchGeneration++
+  searching.value = false
   addressError.value = ''
   addressSource.value = ''
   const address = rttAddress.value.trim()
@@ -433,13 +472,23 @@ function onAddressInput(): void {
 
 async function searchRttAddress(): Promise<void> {
   if (searching.value || starting.value) return
+  cancelRttAddressRefresh(desktopStorage)
+  const generation = ++searchGeneration
   searching.value = true
   addressError.value = ''
-  const latest = loadDesktopSettings(desktopStorage)
-  settings.value = latest
-  const source = latest.symbolPath.trim() || latest.mapPath.trim() || undefined
+  const initialSettings = loadDesktopSettings(desktopStorage)
+  settings.value = initialSettings
+  const initialAddress = initialSettings.rttAddress
+  const symbolPath = initialSettings.symbolPath.trim()
+  const source = symbolPath || undefined
   try {
     const result = await findRtt(source)
+    if (!mounted || generation !== searchGeneration) return
+    const latest = loadDesktopSettings(desktopStorage)
+    if (
+      !sameRttSearchSource(symbolPath, latest.symbolPath)
+      || latest.rttAddress !== initialAddress
+    ) return
     if (!result.addr || !isRttAddress(result.addr)) {
       throw new Error(result.details?.join(tr('；', '; ')) || result.warnings?.join(tr('；', '; ')) || tr('未找到 RTT 地址', 'RTT address not found'))
     }
@@ -447,9 +496,11 @@ async function searchRttAddress(): Promise<void> {
     addressSource.value = result.source || (source ? tr('所选文件', 'Selected file') : tr('工程自动检测', 'Project auto-detection'))
     persistSettings({ ...latest, rttAddress: result.addr })
   } catch (caught) {
-    addressError.value = caught instanceof Error ? caught.message : String(caught)
+    if (mounted && generation === searchGeneration) {
+      addressError.value = caught instanceof Error ? caught.message : String(caught)
+    }
   } finally {
-    searching.value = false
+    if (mounted && generation === searchGeneration) searching.value = false
   }
 }
 
@@ -459,7 +510,16 @@ const tlTip = ref<HTMLDivElement | null>(null)
 const tlLegend = ref<HTMLDivElement | null>(null)
 let tlInstance: SvTimeline | null = null
 let renderScheduler: RenderScheduler | null = null
+const timelineFrameRate = new AdaptiveFrameRateController()
+// Keep the initial fill cadence stable. The viewport still follows the newest
+// event; only the intentional 60/30/20 FPS adaptation waits until one full
+// timeline window is available.
+const TIMELINE_STARTUP_FRAME_RATE = 30
+let timelineStartupLocked = true
+let timelineVisibleItemCount = 0
 let visibleRequestId = 0
+let visibleRequestInFlight = false
+let visibleRequestPending = false
 let latestBinaryTime: number | null = null
 let binaryTickOrigin = 0n
 let lastTableUpdate = Number.NEGATIVE_INFINITY
@@ -484,6 +544,74 @@ function tlGetContexts() {
 }
 function tlReset() { tlInstance?.reset() }
 
+function requestTimelineVisibleRange(
+  start: number,
+  end: number,
+  pixelWidth: number,
+): void {
+  // HPM traces can make Worker range extraction slower than one frame. Keep
+  // only the newest request so the Worker queue cannot grow into bursty UI.
+  visibleRequestPending = true
+  if (visibleRequestInFlight) return
+  visibleRequestInFlight = true
+  visibleRequestPending = false
+  binaryStream.requestVisibleRange(++visibleRequestId, start, end, pixelWidth)
+}
+
+function intervalCacheKey(interval: TaskInterval): string {
+  const start = interval.startTk ?? interval.start
+  return `${interval.taskId}:${String(start)}`
+}
+
+function mergeVisibleIntervals(next: TaskInterval[], latestTime: number): TaskInterval[] {
+  const retainAfter = latestTime - ANALYSIS_BUFFER_US
+  for (const interval of next) {
+    if (interval.end >= retainAfter) visibleIntervalCache.set(intervalCacheKey(interval), interval)
+  }
+  for (const [key, interval] of visibleIntervalCache) {
+    if (interval.end < retainAfter) visibleIntervalCache.delete(key)
+  }
+  if (visibleIntervalCache.size > MAX_INTERVALS) {
+    const oldest = [...visibleIntervalCache.entries()]
+      .sort((a, b) => a[1].end - b[1].end)
+      .slice(0, visibleIntervalCache.size - MAX_INTERVALS)
+    for (const [key] of oldest) visibleIntervalCache.delete(key)
+  }
+  return [...visibleIntervalCache.values()].sort((a, b) => a.start - b.start || a.end - b.end)
+}
+
+function resetTimelineRefreshPolicy(): void {
+  timelineStartupLocked = true
+  timelineFrameRate.reset()
+}
+
+function timelineWindowFilled(): boolean {
+  if (latestBinaryTime === null || !Number.isFinite(latestBinaryTime)) return false
+  const followSpan = tlInstance?.getFollowSpan?.() || windowUs.value
+  const tickScale = meta.cpuFreq ? 1_000_000 / meta.cpuFreq : 1
+  const windowTicks = meta.cpuFreq ? followSpan / tickScale : followSpan
+  return latestBinaryTime >= windowTicks
+}
+
+function observeTimelineFrameRate(
+  now: number,
+  renderCostMs: number,
+  pixelWidth: number,
+): number {
+  if (offlineMode.value) timelineStartupLocked = false
+  if (timelineStartupLocked && timelineWindowFilled()) {
+    timelineStartupLocked = false
+    timelineFrameRate.reset()
+  }
+  if (timelineStartupLocked) return TIMELINE_STARTUP_FRAME_RATE
+  return timelineFrameRate.observe({
+    now,
+    renderCostMs,
+    visibleItems: timelineVisibleItemCount,
+    pixelWidth,
+  })
+}
+
 onMounted(() => {
   mounted = true
   window.addEventListener(DESKTOP_SETTINGS_CHANGED_EVENT, syncRttAddressFromSettings)
@@ -504,29 +632,57 @@ onMounted(() => {
       },
     )
   }
-  renderScheduler = new RenderScheduler(() => {
+  renderScheduler = new RenderScheduler((reasons) => {
+    // The timeline itself interpolates toward the newest follow range. Keep
+    // this repaint loop independent from worker delivery so the ruler moves
+    // every frame instead of jumping once per data batch.
+    const renderStarted = performance.now()
+    tlInstance?.renderFrame(renderStarted)
+    const nextFrameRate = observeTimelineFrameRate(
+      renderStarted,
+      performance.now() - renderStarted,
+      tlCanvas.value?.clientWidth || 800,
+    )
+    renderScheduler?.setFrameRate(nextFrameRate)
+    if (!reasons.has('data') && !reasons.has('zoom') && !reasons.has('resize')) return
     if (offlineMode.value) {
-      tlInstance?.setData(tlGetIntervals())
+      if (reasons.has('data')) tlInstance?.setData(tlGetIntervals())
+      return
+    }
+    const manualView = tlInstance && !tlInstance.follow ? tlInstance.getViewRange?.() : null
+    const tickScale = meta.cpuFreq ? 1_000_000 / meta.cpuFreq : 1
+    if (manualView) {
+      // Keep a zoomed/panned frame stable while continuing to acquire and
+      // repaint intervals that fall inside that frame.
+      requestTimelineVisibleRange(
+        Math.max(0, Math.floor(manualView.start / tickScale)),
+        Math.max(0, Math.ceil(manualView.end / tickScale)),
+        tlCanvas.value?.clientWidth || 800,
+      )
       return
     }
     const end = latestBinaryTime ?? Number.MAX_SAFE_INTEGER
+    const followSpanUs = tlInstance?.getFollowSpan?.() || windowUs.value
     const windowTicks = meta.cpuFreq
-      ? windowUs.value * meta.cpuFreq / 1_000_000
-      : windowUs.value
+      ? followSpanUs * meta.cpuFreq / 1_000_000
+      : followSpanUs
     const start = latestBinaryTime === null ? 0 : Math.max(0, end - windowTicks)
-    binaryStream.requestVisibleRange(++visibleRequestId, start, end, tlCanvas.value?.clientWidth || 800)
-  })
+    requestTimelineVisibleRange(start, end, tlCanvas.value?.clientWidth || 800)
+  }, undefined, undefined, { frameRate: TIMELINE_STARTUP_FRAME_RATE, continuous: true })
   renderScheduler.start()
   reconnectRunningTrace(generation)
 })
 onUnmounted(() => {
   mounted = false
   operationGeneration++
+  searchGeneration++
   window.removeEventListener(DESKTOP_SETTINGS_CHANGED_EVENT, syncRttAddressFromSettings)
   abortImport()
   cancelPendingConnect()
   disconnectStatus()
   binaryStream.stop()
+  visibleRequestInFlight = false
+  visibleRequestPending = false
   renderScheduler?.dispose()
   renderScheduler = null
   tlInstance?.destroy()
@@ -744,6 +900,8 @@ async function reconnectRunningTrace(generation: number) {
     const status = await dash.getStatus()
     if (!operationIsActive(generation)) return
     if (status?.running) {
+      applySessionStatus(status)
+      applyTargetOverflowStatus(status)
       if (status.synced !== undefined) meta.synced = !!status.synced
       if (status.cpu_freq !== undefined) meta.cpuFreq = Number(status.cpu_freq) || 0
       if (status.cpu_freq_source !== undefined) meta.cpuFreqSource = status.cpu_freq_source || ''
@@ -771,6 +929,8 @@ watch(statusData, (nw) => {
   const fresh = takeNewStreamPoints(nw as any[], lastStreamSeq)
   for (const dp of fresh.points as any[]) {
     const evt = dp.event || dp._event
+    applySessionStatus(dp)
+    applyTargetOverflowStatus(dp)
     if (dp.synced !== undefined) meta.synced = !!dp.synced
     if (dp.dropped_bytes !== undefined) meta.sessionDropped = dp.dropped_bytes + (dp.dropped_packets || 0)
     if (dp.runtime_dropped_bytes !== undefined || dp.dropped_bytes !== undefined) {
@@ -800,9 +960,33 @@ watch(binaryStream.telemetry, telemetry => {
   renderScheduler?.invalidate('data')
 })
 
+// The first live frame can arrive after the scheduler's initial range request.
+// Before the decoder sees a SystemView record it answers that request with the
+// generic render-envelope shape. Release the request gate so the next frame
+// can ask again once SystemView mode is active.
+watch(binaryStream.envelope, envelope => {
+  if (!envelope || offlineMode.value || !visibleRequestInFlight) return
+  visibleRequestInFlight = false
+  renderScheduler?.invalidate('data')
+})
+
+watch(binaryStream.error, error => {
+  if (error) runtimeError.value = `SystemView stream: ${error}`
+})
+
 watch(binaryStream.systemViewVisible, visible => {
-  if (!visible || renderPaused.value || offlineMode.value || visible.requestId !== visibleRequestId) return
+  if (!visible) return
+  if (renderPaused.value || offlineMode.value || visible.requestId !== visibleRequestId) return
+  visibleRequestInFlight = false
   latestBinaryTime = visible.latestTime
+  // candidateIntervalCount is the Worker scan cost, not the amount painted.
+  // HPM traces contain many 1 ms ISR intervals; using the scan count here
+  // incorrectly forces the live canvas to 20/30 FPS even when painting is
+  // cheap. The controller also observes measured paint cost below.
+  timelineVisibleItemCount = Math.max(
+    visible.intervalCount,
+    visible.eventCount,
+  )
   binaryTickOrigin = visible.tickOrigin
   const tickScale = meta.cpuFreq ? 1_000_000 / meta.cpuFreq : 1
   const taskIds = new Uint32Array(visible.taskIds)
@@ -849,11 +1033,12 @@ watch(binaryStream.systemViewVisible, visible => {
       pct: totalTicks > 0 ? contextSummary.totalTicks / totalTicks * 100 : 0,
     }
   }).sort((a, b) => b.totalUs - a.totalUs || a.name.localeCompare(b.name))
-  intervals.value = nextIntervals
+  intervals.value = mergeVisibleIntervals(nextIntervals, visible.latestTime * tickScale)
   lastT = visible.latestTime * tickScale
   tlInstance?.setTickOrigin(binaryTickOrigin)
-  tlInstance?.setContexts?.(tlGetContexts())
+  tlInstance?.setContexts?.(tlGetContexts(), { render: false })
   tlInstance?.setPrefilteredIntervals(tlGetIntervals())
+  if (visibleRequestPending) renderScheduler?.invalidate('data')
 
   const now = performance.now()
   if (now - lastTableUpdate >= TABLE_UPDATE_INTERVAL_MS) {
@@ -891,6 +1076,49 @@ const currentSummaryPath = computed(() => meta.recordingSummaryPath || latestLog
 
 // ---- 辅助 ----
 function clamp(v: number) { return Math.max(0, Math.min(100, v)) }
+
+function applyTargetOverflowStatus(status: Record<string, unknown>): void {
+  const events = Number(status.target_overflow_events)
+  const droppedPackets = Number(status.target_dropped_packets_since_baseline)
+  const dropCount = Number(status.target_drop_count)
+  if (Number.isFinite(events) && events >= 0) {
+    meta.targetOverflowEvents = Math.max(meta.targetOverflowEvents, Math.trunc(events))
+  }
+  if (Number.isFinite(droppedPackets) && droppedPackets >= 0) {
+    meta.targetDroppedPackets = Math.max(meta.targetDroppedPackets, Math.trunc(droppedPackets))
+  }
+  if (Number.isFinite(dropCount) && dropCount >= 0) {
+    meta.targetDropCount = Math.trunc(dropCount)
+  }
+}
+
+function applySessionStatus(status: Record<string, unknown>): void {
+  const connectionGeneration = Number(status.connection_generation)
+  const sessionGeneration = Number(status.session_generation)
+  const autoRetryCount = Number(status.auto_retry_count)
+  const retryCount = Number.isFinite(autoRetryCount)
+    ? Math.max(0, Math.trunc(autoRetryCount))
+    : 0
+  const retryKey = retryCount > 0 && Number.isFinite(sessionGeneration)
+    ? `${Math.trunc(sessionGeneration)}:${retryCount}`
+    : ''
+  if (retryKey && retryKey !== lastAutoRetryKey) {
+    lastAutoRetryKey = retryKey
+    // Discard the failed reset burst so the replacement session owns one
+    // coherent timeline and event count.
+    clearAll()
+  }
+  if (Number.isFinite(connectionGeneration)) {
+    meta.connectionGeneration = Math.trunc(connectionGeneration)
+  }
+  if (Number.isFinite(sessionGeneration)) {
+    meta.sessionGeneration = Math.trunc(sessionGeneration)
+  }
+  meta.autoRetryCount = retryCount
+  meta.autoRetryReason = String(status.auto_retry_reason || '')
+  meta.autoRetryStopError = String(status.auto_retry_stop_error || '')
+}
+
 function hexId(id: number) { return '0x' + (id >>> 0).toString(16).toUpperCase() }
 function fmtCpuFreq(freq: number) {
   return freq >= 1_000_000 ? (freq / 1_000_000).toFixed(0) + 'MHz' : freq.toLocaleString() + 'Hz'
@@ -918,21 +1146,29 @@ function evtColor(k: string) {
 }
 function clearAll() {
   binaryStream.reset()
+  visibleRequestId++
+  visibleRequestInFlight = false
+  visibleRequestPending = false
   eventList.value = []
   analysisEvents = []
   analysisBufferCount.value = 0
   intervals.value = []
+  visibleIntervalCache.clear()
   exactRuntimeRows.value = []
   Object.keys(taskStats).forEach(k => delete taskStats[Number(k)])
   intervalState = { currentTaskId: null, currentStart: null }
   totalEventCount.value = 0
   idleUs.value = 0; firstT = 0; lastT = 0; lastStreamSeq = 0
   latestBinaryTime = null
+  resetTimelineRefreshPolicy()
   binaryTickOrigin = 0n
   lastTableUpdate = Number.NEGATIVE_INFINITY
   meta.synced = false
   meta.dropped = 0
   meta.sessionDropped = 0
+  meta.targetOverflowEvents = 0
+  meta.targetDroppedPackets = 0
+  meta.targetDropCount = null
   meta.cpuFreq = 0
   meta.cpuFreqSource = ''
   meta.taskNames = {}
@@ -941,6 +1177,11 @@ function clearAll() {
   meta.recordingPath = ''
   meta.recordingSummaryPath = ''
   meta.recordingError = ''
+  meta.connectionGeneration = 0
+  meta.sessionGeneration = 0
+  meta.autoRetryCount = 0
+  meta.autoRetryReason = ''
+  meta.autoRetryStopError = ''
 }
 
 async function refreshLogList() {
@@ -1125,6 +1366,7 @@ function restartReplay() {
 }
 
 function applyImportedMeta(record: Record<string, unknown>) {
+  applyTargetOverflowStatus(record)
   const cpuFreq = Number(record.cpu_freq)
   if (Number.isFinite(cpuFreq) && cpuFreq > 0) meta.cpuFreq = cpuFreq
   if (typeof record.cpu_freq_source === 'string') meta.cpuFreqSource = record.cpu_freq_source
@@ -1175,6 +1417,7 @@ async function waitForSystemViewReady(generation: number, timeoutMs = 8_000): Pr
     try {
       const status = await dash.getStatus()
       if (!operationIsActive(generation)) return false
+      applySessionStatus(status)
       if (status?.progress_state === 'error') {
         runtimeError.value = status.progress_error || tr('SystemView 启动失败', 'SystemView startup failed')
         return false
@@ -1258,6 +1501,8 @@ async function onStart() {
 function onPauseRender() {
   renderPaused.value = true
   visibleRequestId++
+  visibleRequestInFlight = false
+  visibleRequestPending = false
   renderScheduler?.stop()
   tlInstance?.pauseRendering()
 }

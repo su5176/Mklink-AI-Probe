@@ -29,7 +29,11 @@ export function exactTickFromOffset(origin, offset) {
   return (origin + BigInt(Math.round(offset))).toString();
 }
 
-const FOLLOW_FRAME_INTERVAL_MS = 1000 / 30;
+const FOLLOW_FRAME_INTERVAL_MS = 1000 / 60;
+const FOLLOW_INTERPOLATION_MS = 100;
+const MIN_INTERVAL_LABEL_WIDTH = 34;
+const MIN_INTERVAL_STROKE_WIDTH = 2;
+const LABEL_WIDTH_CACHE_LIMIT = 512;
 
 export class SvTimeline {
   constructor(roots, data) {
@@ -44,6 +48,10 @@ export class SvTimeline {
     this.nameColW = 132;
     this.rulerH = 42;
     this.laneH = 28;
+    // Keep a compact, stable viewport for small traces. The capacity only
+    // grows when new tasks appear, so live discovery does not make the page
+    // jump up and down while avoiding a large empty 20-lane canvas.
+    this.laneCapacity = 2;
     this.padR = 6;
     this.hidden = new Set();
     this.hover = null;
@@ -61,9 +69,15 @@ export class SvTimeline {
     this._explicitContexts = [];
     this.follow = (data && data.follow) !== false;
     this.windowSize = Number((data && data.windowSize) || 0);
-    this.followEase = 0.22;
-    this._followRaf = 0;
+    this.followSpan = null;
+    // The displayed range at the moment the current follow transition began.
+    // Keep this separate from viewStart/viewEnd, which are advanced every
+    // animation frame and therefore cannot be reused as interpolation input.
+    this._followFrom = null;
+    this._followTarget = null;
+    this._followTransitionAt = null;
     this._lastLiveRender = Number.NEGATIVE_INFINITY;
+    this._labelWidthCache = new Map();
     this._renderPaused = (data && data.renderPaused) === true;
     this.emptyText = (data && data.emptyText) || '窗口内无任务';
     this.setData((data && data.intervals) || []);
@@ -78,9 +92,9 @@ export class SvTimeline {
     this._acceptData(this._filterContinuous(intervals || []));
   }
 
-  setContexts(contexts) {
+  setContexts(contexts, options = {}) {
     this._explicitContexts = Array.isArray(contexts) ? contexts : [];
-    this._acceptData(this.intervals || []);
+    this._acceptData(this.intervals || [], options);
   }
 
   setLabels(labels) {
@@ -89,16 +103,23 @@ export class SvTimeline {
     this._updateStatus();
   }
 
-  _acceptData(intervals) {
+  _acceptData(intervals, options = {}) {
     // 按任务汇总，确定泳道顺序（总运行时间降序，最多 12 条）
     const hadIntervalsBefore = this._hadIntervals;
-    this._hadIntervals = intervals.length > 0;
+    const previousTMin = this.tMin;
+    const previousTMax = this.tMax;
+    this._hadIntervals = options.preserveDataRange
+      ? hadIntervalsBefore || intervals.length > 0
+      : intervals.length > 0;
     this.intervals = intervals;
     const run = new Map(), names = new Map(), types = new Map();
+    let tMin = Infinity, tMax = -Infinity;
     for (const it of this.intervals) {
       run.set(it.tid, (run.get(it.tid) || 0) + (it.end - it.start));
       names.set(it.tid, it.name);
       if (it.type) types.set(it.tid, it.type);
+      if (it.start < tMin) tMin = it.start;
+      if (it.end > tMax) tMax = it.end;
     }
     for (const context of (this._explicitContexts || [])) {
       if (!context || !Number.isFinite(context.tid)) continue;
@@ -110,20 +131,53 @@ export class SvTimeline {
     this.taskOf = new Map(this.tasks.map(t => [t.tid, t]));
     // 时间范围
     if (this.intervals.length) {
-      this.tMin = Math.min(...this.intervals.map(i => i.start));
-      this.tMax = Math.max(...this.intervals.map(i => i.end));
+      this.tMin = tMin;
+      this.tMax = tMax;
     } else { this.tMin = 0; this.tMax = 1; }
+    // Visible-range responses are a moving slice of one trace. Preserve the
+    // accumulated data bounds so follow advances from the previous frame
+    // instead of rebuilding the time axis from the newest slice's first item.
+    if (options.preserveDataRange) {
+      if (this.intervals.length === 0 && Number.isFinite(previousTMin) && Number.isFinite(previousTMax)) {
+        this.tMin = previousTMin;
+        this.tMax = previousTMax;
+      } else {
+        if (Number.isFinite(previousTMin)) this.tMin = Math.min(previousTMin, this.tMin);
+        if (Number.isFinite(previousTMax)) this.tMax = Math.max(previousTMax, this.tMax);
+      }
+    }
     if (this.tMax <= this.tMin) this.tMax = this.tMin + 1;
     const viewInvalid = this.viewStart == null || this.viewEnd == null || this.viewEnd <= this.viewStart;
+    const preserveManualView = !this.follow && !viewInvalid;
     const shouldFollow = this.follow && this.windowSize > 0 && this.intervals.length;
-    if (shouldFollow && (viewInvalid || !hadIntervalsBefore)) {
-      this._snapFollowRange();
-    } else if (shouldFollow) {
-      const span = this.windowSize;
-      if (Math.abs((this.viewEnd - this.viewStart) - span) > 0.001) {
-        this.viewStart = this.viewEnd - span;
+    if (shouldFollow) {
+      const target = this._targetFollowRange();
+      if (
+        viewInvalid
+        || !hadIntervalsBefore
+      ) {
+        this.viewStart = target.start;
+        this.viewEnd = target.end;
+        this._followFrom = null;
+        this._followTarget = null;
+        this._followTransitionAt = null;
+      } else if (
+        Math.abs((this._followTarget?.start ?? this.viewStart) - target.start) > 0.001
+        || Math.abs((this._followTarget?.end ?? this.viewEnd) - target.end) > 0.001
+      ) {
+        // Capture the displayed frame and ease toward the newest range.
+        const now = performance.now();
+        const current = this._interpolatedFollowRange(now);
+        this.viewStart = current.start;
+        this.viewEnd = current.end;
+        this._followFrom = current;
+        this._followTarget = target;
+        // Each target starts a fresh, short transition from the range that is
+        // actually on screen. This prevents a completed transition's stale
+        // timestamp from making the next worker batch jump in one frame.
+        this._followTransitionAt = now;
       }
-    } else {
+    } else if (!preserveManualView) {
       const viewOutsideData = this.viewEnd < this.tMin || this.viewStart > this.tMax;
       if (viewInvalid || viewOutsideData || (!hadIntervalsBefore && this.intervals.length)) {
       this.viewStart = this.tMin;
@@ -137,19 +191,33 @@ export class SvTimeline {
       }
       }
     }
-    this._layout();
-    const drew = shouldFollow ? this._drawLive() : (this._draw(), true);
+    const resized = this._layout();
+    const drew = options.render === false
+      ? false
+      : shouldFollow ? this._drawLive(undefined, resized) : (this._draw(), true);
     if (drew) this._updateStatus();
-    if (shouldFollow && !viewInvalid && hadIntervalsBefore) this._scheduleFollow();
   }
 
   // Live workers already filter the requested visible range. This entrypoint
   // deliberately avoids slicing/sorting the retained 50k interval history.
   setPrefilteredIntervals(intervals) {
-    // User interaction leaves follow mode so the inspected frame stays stable
-    // while acquisition and the Runtime/Context tables continue updating.
-    if (!this.follow && this._hadIntervals) return;
-    this._acceptData(intervals || []);
+    // User interaction leaves follow mode so the inspected frame stays stable,
+    // but the intervals inside that frame must continue to repaint as new
+    // samples arrive. The caller requests the current view range from the
+    // worker, so accepting every frame does not pull the view back to "now".
+    // The continuous render scheduler owns the live paint cadence. Painting
+    // here as well doubles the frame load whenever a worker response arrives.
+    this._acceptData(intervals || [], { render: false, preserveDataRange: true });
+  }
+
+  getViewRange() {
+    if (!Number.isFinite(this.viewStart) || !Number.isFinite(this.viewEnd)
+      || this.viewEnd <= this.viewStart) return null;
+    return { start: this.viewStart, end: this.viewEnd };
+  }
+
+  getFollowSpan() {
+    return this.followSpan > 0 ? this.followSpan : this.windowSize;
   }
 
   _mergeTasks(run, names, types = new Map()) {
@@ -199,6 +267,10 @@ export class SvTimeline {
 
   setWindowSize(windowSize) {
     this.windowSize = Math.max(0, Number(windowSize) || 0);
+    this.followSpan = null;
+    this._followFrom = null;
+    this._followTarget = null;
+    this._followTransitionAt = null;
     if (this.follow && this.windowSize > 0) this._snapFollowRange();
   }
 
@@ -209,68 +281,87 @@ export class SvTimeline {
 
   setFollowMode(enabled) {
     this.follow = !!enabled;
+    if (!this.follow) {
+      this.followSpan = null;
+      this._followFrom = null;
+      this._followTarget = null;
+      this._followTransitionAt = null;
+    }
     if (this.follow && this.windowSize > 0) this._snapFollowRange();
   }
 
   _targetFollowRange() {
-    if (!this.windowSize || this.windowSize <= 0) {
+    const span = this.followSpan > 0 ? this.followSpan : this.windowSize;
+    if (!span || span <= 0) {
       return { start: this.tMin, end: this.tMax };
     }
-    const end = this.tMax;
-    return { start: end - this.windowSize, end };
+    return { start: this.tMax - span, end: this.tMax };
   }
 
   _snapFollowRange() {
     const target = this._targetFollowRange();
     this.viewStart = target.start;
     this.viewEnd = target.end;
+    this._followFrom = null;
+    this._followTarget = null;
+    this._followTransitionAt = null;
     if (this.W && this.H) {
       this._draw();
       this._updateStatus();
     }
   }
 
-  _drawLive(timestamp = performance.now()) {
+  _drawLive(timestamp = performance.now(), force = false) {
     if (this._renderPaused) return false;
     const lastRender = Number.isFinite(this._lastLiveRender)
       ? this._lastLiveRender
       : Number.NEGATIVE_INFINITY;
-    if (timestamp - lastRender < FOLLOW_FRAME_INTERVAL_MS) return false;
+    if (!force && timestamp - lastRender < FOLLOW_FRAME_INTERVAL_MS) return false;
     this._lastLiveRender = timestamp;
     this._draw();
     return true;
   }
 
-  _scheduleFollow() {
-    if (this._renderPaused || !this.follow || this.windowSize <= 0 || this._followRaf) return;
-    const step = (timestamp) => {
-      this._followRaf = 0;
-      if (this._renderPaused || !this.follow || this.windowSize <= 0) return;
-      const now = Number.isFinite(timestamp) ? timestamp : performance.now();
-      const target = this._targetFollowRange();
-      const currentEnd = Number.isFinite(this.viewEnd) ? this.viewEnd : target.end;
-      const delta = target.end - currentEnd;
-      if (Math.abs(delta) < 0.5) {
-        this.viewEnd = target.end;
-        this.viewStart = target.start;
-      } else {
-        this.viewEnd = currentEnd + delta * this.followEase;
-        this.viewStart = this.viewEnd - this.windowSize;
-      }
-      if (this._drawLive(now)) this._updateStatus();
-      if (Math.abs(target.end - this.viewEnd) >= 0.5) {
-        this._followRaf = requestAnimationFrame(step);
-      }
+  _interpolatedFollowRange(timestamp) {
+    if (!this._followTarget || this._followTransitionAt == null
+      || !Number.isFinite(this.viewStart) || !Number.isFinite(this.viewEnd)) {
+      return { start: this.viewStart, end: this.viewEnd };
+    }
+    const from = this._followFrom || {
+      start: this.viewStart,
+      end: this.viewEnd,
     };
-    this._followRaf = requestAnimationFrame(step);
+    const progress = Math.min(1, Math.max(0,
+      (timestamp - this._followTransitionAt) / FOLLOW_INTERPOLATION_MS));
+    const ease = 1 - Math.pow(1 - progress, 3);
+    return {
+      start: from.start + (this._followTarget.start - from.start) * ease,
+      end: from.end + (this._followTarget.end - from.end) * ease,
+    };
+  }
+
+  /** Paint one live frame and advance the follow viewport toward its target. */
+  renderFrame(timestamp = performance.now()) {
+    if (this._renderPaused) return false;
+    if (this._followTarget) {
+      const next = this._interpolatedFollowRange(timestamp);
+      this.viewStart = next.start;
+      this.viewEnd = next.end;
+      if (this._followTransitionAt != null
+        && timestamp - this._followTransitionAt >= FOLLOW_INTERPOLATION_MS) {
+        this.viewStart = this._followTarget.start;
+        this.viewEnd = this._followTarget.end;
+        this._followTarget = null;
+        this._followFrom = null;
+        this._followTransitionAt = null;
+      }
+    }
+    this._draw();
+    return true;
   }
 
   pauseRendering() {
     this._renderPaused = true;
-    if (this._followRaf) {
-      cancelAnimationFrame(this._followRaf);
-      this._followRaf = 0;
-    }
   }
 
   resumeRendering() {
@@ -279,19 +370,21 @@ export class SvTimeline {
     this._lastLiveRender = Number.NEGATIVE_INFINITY;
     this._layout();
     if (this._drawLive()) this._updateStatus();
-    this._scheduleFollow();
   }
 
   _layout() {
     this.lanes = this.tasks.filter(t => !this.hidden.has(t.tid));
+    this.laneIndexByTid = new Map(this.lanes.map((task, index) => [task.tid, index]));
     const dpr = window.devicePixelRatio || 1;
     const cssW = this.canvas.clientWidth || 800;
-    const cssH = this.rulerH + this.lanes.length * this.laneH + 4;
+    if (this.lanes.length > this.laneCapacity) this.laneCapacity = this.lanes.length;
+    const cssH = this.rulerH + Math.max(1, this.laneCapacity) * this.laneH + 4;
+    let resized = false;
     if (!this._renderPaused) {
-      const width = cssW * dpr;
-      const height = cssH * dpr;
-      if (this.canvas.width !== width) this.canvas.width = width;
-      if (this.canvas.height !== height) this.canvas.height = height;
+      const width = Math.max(1, Math.round(cssW * dpr));
+      const height = Math.max(1, Math.round(cssH * dpr));
+      if (this.canvas.width !== width) { this.canvas.width = width; resized = true; }
+      if (this.canvas.height !== height) { this.canvas.height = height; resized = true; }
       this.canvas.style.height = cssH + 'px';
     }
     this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
@@ -299,6 +392,7 @@ export class SvTimeline {
     this.plotX0 = this.nameColW;
     this.plotX1 = this.W - this.padR;
     this.plotW = this.plotX1 - this.plotX0;
+    return resized;
   }
 
   _resize = () => {
@@ -440,10 +534,18 @@ export class SvTimeline {
   }
 
   _labelWidth(text) {
+    if (!this._labelWidthCache) this._labelWidthCache = new Map();
+    const cached = this._labelWidthCache.get(text);
+    if (cached !== undefined) return cached;
+    let width;
     if (this.ctx && typeof this.ctx.measureText === 'function') {
-      return this.ctx.measureText(text).width;
+      width = this.ctx.measureText(text).width;
+    } else {
+      width = String(text).length * 7;
     }
-    return String(text).length * 7;
+    if (this._labelWidthCache.size >= LABEL_WIDTH_CACHE_LIMIT) this._labelWidthCache.clear();
+    this._labelWidthCache.set(text, width);
+    return width;
   }
 
   _draw() {
@@ -467,36 +569,43 @@ export class SvTimeline {
     for (const it of this.intervals) {
       const task = this.taskOf.get(it.tid);
       if (!task || this.hidden.has(it.tid)) continue;
-      const laneIdx = this.lanes.indexOf(task);
-      if (laneIdx < 0) continue;
+      const laneIdx = this.laneIndexByTid
+        ? this.laneIndexByTid.get(it.tid)
+        : this.lanes.indexOf(task);
+      if (laneIdx === undefined || laneIdx < 0) continue;
       if (it.end < this.viewStart || it.start > this.viewEnd) continue;
       const x0 = Math.max(this._t2x(it.start), this.plotX0);
       const x1 = Math.min(this._t2x(it.end), this.plotX1);
-      if (x1 - x0 < 0.4) continue; // 太细跳过
       const y = this.rulerH + laneIdx * this.laneH + 3;
       const w = Math.max(x1 - x0, 0.8);
       const h = this.laneH - 6;
       ctx.fillStyle = task.type === 'Scheduler' ? '#eef0f3'
         : task.type === 'Idle' ? '#f7f8fa' : task.color;
       ctx.fillRect(x0, y, w, h);
-      ctx.strokeStyle = task.type === 'Scheduler' || task.type === 'Idle'
-        ? '#969da6' : 'rgba(31, 41, 55, 0.32)';
-      ctx.lineWidth = 1;
-      ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(w - 1, 0.8), Math.max(h - 1, 1));
-      const durationLabel = this._fmtIntervalLabel(it);
-      ctx.font = '10px ui-monospace,SFMono-Regular,Consolas,monospace';
-      const labelWidth = this._labelWidth(durationLabel);
-      if (w >= labelWidth + 10) {
-        ctx.fillStyle = task.type === 'Scheduler' || task.type === 'Idle' ? '#4b535d' : '#ffffff';
-        ctx.textAlign = 'center';
-        ctx.textBaseline = 'middle';
-        ctx.fillText(durationLabel, x0 + w / 2, y + h / 2 + 0.5);
+      if (w >= MIN_INTERVAL_STROKE_WIDTH) {
+        ctx.strokeStyle = task.type === 'Scheduler' || task.type === 'Idle'
+          ? '#969da6' : 'rgba(31, 41, 55, 0.32)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x0 + 0.5, y + 0.5, Math.max(w - 1, 0.8), Math.max(h - 1, 1));
+      }
+      if (w >= MIN_INTERVAL_LABEL_WIDTH) {
+        const durationLabel = this._fmtIntervalLabel(it);
+        ctx.font = '10px ui-monospace,SFMono-Regular,Consolas,monospace';
+        const labelWidth = this._labelWidth(durationLabel);
+        if (w >= labelWidth + 10) {
+          ctx.fillStyle = task.type === 'Scheduler' || task.type === 'Idle' ? '#4b535d' : '#ffffff';
+          ctx.textAlign = 'center';
+          ctx.textBaseline = 'middle';
+          ctx.fillText(durationLabel, x0 + w / 2, y + h / 2 + 0.5);
+        }
       }
     }
     if (this.hover) {
       const task = this.taskOf.get(this.hover.tid);
-      const laneIdx = this.lanes.indexOf(task);
-      if (laneIdx >= 0) {
+      const laneIdx = this.laneIndexByTid
+        ? this.laneIndexByTid.get(task?.tid)
+        : this.lanes.indexOf(task);
+      if (laneIdx !== undefined && laneIdx >= 0) {
         const x0 = Math.max(this._t2x(this.hover.start), this.plotX0);
         const x1 = Math.min(this._t2x(this.hover.end), this.plotX1);
         const y = this.rulerH + laneIdx * this.laneH + 2;
@@ -618,15 +727,15 @@ export class SvTimeline {
     this._onWheel = (e) => {
       const rect = this.canvas.getBoundingClientRect();
       const mx = e.clientX - rect.left;
-      if (!this._shouldZoomWheel(mx) || e.deltaY === 0) return;
+      if (!this._shouldZoomWheel(mx, e) || e.deltaY === 0) return;
       e.preventDefault();
-      this.setFollowMode(false);
       const t = this._x2t(mx);
       const factor = e.deltaY < 0 ? 0.8 : 1.25; // 缩放因子
       const fullSpan = Math.max(this.tMax - this.tMin, Number.EPSILON);
       const currentSpan = Math.max(this.viewEnd - this.viewStart, Number.EPSILON);
       const minSpan = Math.max(fullSpan * 1e-5, this.unit === 'us' ? 0.001 : 1);
       const nextSpan = Math.min(fullSpan, Math.max(minSpan, currentSpan * factor));
+      this.followSpan = nextSpan;
       const anchor = Math.min(1, Math.max(0, (mx - this.plotX0) / this.plotW));
       let ns = t - nextSpan * anchor;
       let ne = ns + nextSpan;
@@ -634,6 +743,9 @@ export class SvTimeline {
       if (ne > this.tMax) { ns -= ne - this.tMax; ne = this.tMax; }
       this.viewStart = Math.max(this.tMin, ns);
       this.viewEnd = Math.min(this.tMax, ne);
+      // Zoom keeps the live cursor at the newest data while preserving the
+      // zoom level. Dragging is still the explicit way to inspect history.
+      this.setFollowMode(true);
       this._draw(); this._updateStatus();
     };
 
@@ -643,7 +755,6 @@ export class SvTimeline {
       const mx = e.clientX - rect.left;
       if (mx < this.plotX0 || mx > this.plotX1) return;
       e.preventDefault();
-      this.setFollowMode(false);
       this.dragging = true;
       this.dragMoved = false;
       this.dragX0 = e.clientX;
@@ -656,7 +767,12 @@ export class SvTimeline {
       const mx = e.clientX - rect.left, my = e.clientY - rect.top;
       if (this.dragging) {
         const dx = e.clientX - this.dragX0;
-        if (Math.abs(dx) >= 3) this.dragMoved = true;
+        if (Math.abs(dx) >= 3) {
+          this.dragMoved = true;
+          // A click only pins the marker; leave live follow enabled. Enter
+          // manual inspection mode once the pointer has actually moved.
+          this.setFollowMode(false);
+        }
         const dt = -dx / this.plotW * (this.dragView0[1] - this.dragView0[0]);
         let ns = this.dragView0[0] + dt, ne = this.dragView0[1] + dt;
         if (ns < this.tMin) { ne += this.tMin - ns; ns = this.tMin; }
@@ -708,8 +824,12 @@ export class SvTimeline {
     this._listenersBound = true;
   }
 
-  _shouldZoomWheel(mx) {
-    return Number.isFinite(mx) && mx >= this.plotX0 && mx <= this.plotX1;
+  _shouldZoomWheel(mx, event = null) {
+    // Plain wheel input belongs to page scrolling. Require an explicit
+    // modifier before taking over the wheel for timeline zooming; otherwise
+    // merely reaching the Timeline while scrolling freezes live follow mode.
+    const modified = event ? Boolean(event.ctrlKey || event.metaKey) : false;
+    return modified && Number.isFinite(mx) && mx >= this.plotX0 && mx <= this.plotX1;
   }
 
   _escapeHtml(value) {
@@ -753,6 +873,10 @@ export class SvTimeline {
   reset() {
     this.markerPinned = false;
     this.markerTime = null;
+    this.followSpan = null;
+    this._followFrom = null;
+    this._followTarget = null;
+    this._followTransitionAt = null;
     if (this.windowSize > 0) {
       this.setFollowMode(true);
       return;
@@ -761,10 +885,6 @@ export class SvTimeline {
   }
 
   destroy() {
-    if (this._followRaf) {
-      cancelAnimationFrame(this._followRaf);
-      this._followRaf = 0;
-    }
     window.removeEventListener('resize', this._resize);
     if (this._listenersBound) {
       this.canvas.removeEventListener('wheel', this._onWheel);
@@ -777,6 +897,9 @@ export class SvTimeline {
       this._listenersBound = false;
     }
     this._hideTip();
+    this._followFrom = null;
+    this._followTarget = null;
+    this._followTransitionAt = null;
     // （其它监听挂在 window/canvas，组件卸载时随 DOM 释放；简单场景可接受）
   }
 }

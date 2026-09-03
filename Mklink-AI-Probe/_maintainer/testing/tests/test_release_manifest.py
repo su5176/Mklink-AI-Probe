@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -37,6 +38,8 @@ def release_inputs(tmp_path):
             json.dumps({"version": "0.1.0"}),
         )
         archive.writestr(f"{root}/scripts/skill_update.py", "# updater\n")
+        archive.writestr(f"{root}/scripts/win_usb_rename.ps1", "# rename\n")
+
     portable = tmp_path / "MKLink-Site-Agent-v0.1.0-windows-x86_64-portable.zip"
     portable.write_bytes(b"portable")
     portable_manifest = tmp_path / "portable.manifest.json"
@@ -123,6 +126,7 @@ def test_prepare_release_rejects_nested_repository_skill_layout(
             json.dumps({"version": "0.1.0"}),
         )
         archive.writestr(f"{root}/scripts/skill_update.py", "# updater\n")
+        archive.writestr(f"{root}/scripts/win_usb_rename.ps1", "# rename\n")
 
     with pytest.raises(ValueError, match="directly contain"):
         release_module.prepare_release(
@@ -132,6 +136,93 @@ def test_prepare_release_rejects_nested_repository_skill_layout(
             nsis=nsis,
             updater_signature=signature,
             skill_archive=nested,
+            site_agent_archive=portable,
+            site_agent_manifest=portable_manifest,
+        )
+
+
+def test_public_skill_archive_excludes_repository_maintenance(
+    release_module, tmp_path,
+):
+    source_commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=release_module.REPO_ROOT,
+        text=True,
+    ).strip()
+    source_plugin = json.loads(subprocess.check_output(
+        ["git", "show", f"{source_commit}:./.claude-plugin/plugin.json"],
+        cwd=release_module.REPO_ROOT,
+        text=True,
+    ))
+    version = source_plugin["version"]
+    archive_path = tmp_path / "public-skill.zip"
+
+    release_module._build_skill_archive(
+        version=version,
+        source_commit=source_commit,
+        output=archive_path,
+    )
+
+    with zipfile.ZipFile(archive_path) as archive:
+        root = f"Mklink-AI-Probe-v{version}/"
+        files = {
+            info.filename.removeprefix(root)
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
+    assert {
+        "SKILL.md",
+        "agents/openai.yaml",
+        "gui/dist/index.html",
+        "scripts/skill_update.py",
+        "scripts/win_usb_rename.ps1",
+    } <= files
+    assert not any(
+        path == name or path.startswith(f"{name}/")
+        for path in files
+        for name in (
+            "_maintainer",
+            "commands",
+            "docs",
+            "native",
+            "skills",
+            "site-agent-gui",
+        )
+    )
+    assert {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}.isdisjoint(files)
+    assert not any(path.startswith("MK-Firmware/") for path in files)
+
+
+def test_public_skill_allowlist_includes_only_bundled_runtime_scripts(release_module):
+    assert release_module._is_public_skill_file(
+        release_module.PurePosixPath("scripts/skill_update.py")
+    )
+    assert release_module._is_public_skill_file(
+        release_module.PurePosixPath("scripts/win_usb_rename.ps1")
+    )
+    assert not release_module._is_public_skill_file(
+        release_module.PurePosixPath("scripts/ai_memory.py")
+    )
+
+
+def test_prepare_release_rejects_maintenance_content(
+    release_module, tmp_path,
+):
+    nsis, signature, skill, portable, portable_manifest = release_inputs(tmp_path)
+    with zipfile.ZipFile(skill, "a") as archive:
+        archive.writestr(
+            "Mklink-AI-Probe-v0.1.0/skills/maintaining-mklink-ai-probe/SKILL.md",
+            "maintainer only",
+        )
+
+    with pytest.raises(ValueError, match="non-user content"):
+        release_module.prepare_release(
+            version="0.1.0",
+            source_commit="a" * 40,
+            output_dir=tmp_path / "release",
+            nsis=nsis,
+            updater_signature=signature,
+            skill_archive=skill,
             site_agent_archive=portable,
             site_agent_manifest=portable_manifest,
         )

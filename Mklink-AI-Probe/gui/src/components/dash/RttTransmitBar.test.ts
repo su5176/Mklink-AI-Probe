@@ -7,7 +7,7 @@ function settings(overrides: Partial<DesktopSettings> = {}): DesktopSettings {
   return {
     version: 1,
     symbolPath: '',
-    mapPath: '',
+    symbolDisplayPath: '',
     rttAddress: '',
     rttEncoding: 'utf-8',
     transmitMode: 'text',

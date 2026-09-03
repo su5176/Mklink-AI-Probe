@@ -51,6 +51,7 @@ def test_builtin_flm_bundle_exposes_targets_regions_and_verified_bytes(tmp_path:
     assert [(item.part_number, item.vendor, item.source) for item in targets] == [
         ("PART-A", "Vendor", "daplink-builtin")
     ]
+    assert targets[0].series == "Family"
     assert len(algorithms) == 1
     assert algorithms[0].source_kind == "daplink-builtin"
     assert algorithms[0].flash_start == 0x90000000

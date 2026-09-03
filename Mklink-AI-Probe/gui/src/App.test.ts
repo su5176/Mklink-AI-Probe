@@ -14,6 +14,9 @@ const installAndRelaunch = vi.fn()
 const retryUpdate = vi.fn()
 const updateState = ref<'idle' | 'checking' | 'downloading' | 'ready' | 'installing' | 'error'>('idle')
 const nativeRuntime = ref(true)
+const { startBrowserSessionLease } = vi.hoisted(() => ({
+  startBrowserSessionLease: vi.fn(() => vi.fn()),
+}))
 
 vi.mock('vue-router', () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -45,6 +48,8 @@ vi.mock('./composables/useAppUpdater', () => ({
     retry: retryUpdate,
   }),
 }))
+
+vi.mock('./lib/browserSessionLease', () => ({ startBrowserSessionLease }))
 
 function mountApp() {
   return shallowMount(App, {
@@ -84,22 +89,41 @@ describe('App version footer', () => {
     wrapper.unmount()
   })
 
-  it('exposes documentation and store as browser links without showing raw URLs', () => {
+  it('leases the backend only for browser GUI windows', () => {
+    startBrowserSessionLease.mockClear()
+    nativeRuntime.value = false
+    const wrapper = mountApp()
+
+    expect(startBrowserSessionLease).toHaveBeenCalledWith(true)
+    wrapper.unmount()
+  })
+
+  it('exposes documentation and the ordered store menu without showing raw URLs', () => {
     const wrapper = mountApp()
     const docs = wrapper.get('[data-testid="online-docs-link"]')
     const store = wrapper.get('[data-testid="taobao-link"]')
+    const official = wrapper.get('[data-testid="official-store-link"]')
+    const xianji = wrapper.get('[data-testid="xianji-store-link"]')
     expect(docs.attributes()).toMatchObject({
       href: 'https://microboot.readthedocs.io/zh-cn/latest/tools/microlink/microlink/',
       target: '_blank',
       rel: 'noopener noreferrer',
     })
-    expect(store.attributes()).toMatchObject({
+    expect(official.attributes()).toMatchObject({
       href: 'https://item.taobao.com/item.htm?ft=t&id=1020501356342',
       target: '_blank',
       rel: 'noopener noreferrer',
     })
+    expect(xianji.attributes()).toMatchObject({
+      href: 'https://item.taobao.com/item.htm?ft=t&id=1074695414484',
+      target: '_blank',
+      rel: 'noopener noreferrer',
+    })
     expect(docs.text()).toBe('在线文档')
-    expect(store.text()).toBe('淘宝店')
+    expect(store.text()).toBe('淘宝店铺')
+    expect(official.text()).toBe('官方智沐店铺')
+    expect(xianji.text()).toBe('先楫定制店铺')
+    expect(xianji.attributes('disabled')).toBeUndefined()
     expect(wrapper.text()).not.toContain('microboot.readthedocs.io')
     expect(wrapper.text()).not.toContain('item.taobao.com')
     wrapper.unmount()
@@ -130,6 +154,8 @@ describe('App version footer', () => {
     expect(source).toContain('grid-template-columns: auto minmax(0, 1fr)')
     expect(source).toContain('.header-right .status-bar')
     expect(source).toContain('width: max-content')
+    expect(source).toMatch(/\.nav-tab\s*\{[^}]*white-space:\s*nowrap/s)
+    expect(source).toMatch(/@media \(max-width: 720px\)[\s\S]*\.store-menu-panel\s*\{[^}]*position:\s*fixed[^}]*top:\s*46px[^}]*right:\s*8px/s)
   })
 
   it('does not mount route views or poll device state before the backend API is ready', async () => {

@@ -60,6 +60,19 @@ def test_build_latest_document_matches_tauri_v2_schema(publisher):
     }
 
 
+def test_publisher_defaults_to_official_repositories(publisher, tmp_path):
+    args = publisher._parser().parse_args([
+        "--version", "0.1.6",
+        "--notes", "Release notes",
+        "--release-dir", str(tmp_path),
+        "--updater-installer", str(tmp_path / "setup.exe"),
+        "--updater-signature", str(tmp_path / "setup.exe.sig"),
+    ])
+
+    assert args.github_repo == "Aladdin-Wang/Mklink-AI-Probe"
+    assert args.gitee_repo == "Aladdin-Wang/Mklink-AI-Probe"
+
+
 def test_gitee_request_uses_official_token_parameter_and_redacts_errors(
     publisher, monkeypatch,
 ):

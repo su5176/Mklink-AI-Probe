@@ -94,4 +94,20 @@ describe('VirtualLogPanel', () => {
     expect(expanded).toBeLessThan(40)
     wrapper.unmount()
   })
+
+  it('exports every retained row including pending data as tab-separated text', () => {
+    vi.useFakeTimers()
+    const wrapper = mount(VirtualLogPanel)
+    ;(wrapper.vm as any).append([
+      { time: 1_000_000n, level: 'data', label: 'RX', text: '4F4B  OK' },
+      { time: 2_000_000n, level: 'warning', label: 'TX', text: '41  A' },
+    ])
+
+    const exported = (wrapper.vm as any).exportText()
+
+    expect(exported).toMatch(/\d{2}:00:00\.001\tRX\t4F4B  OK/)
+    expect(exported).toMatch(/\d{2}:00:00\.002\tTX\t41  A/)
+    expect((wrapper.vm as any).retainedCount).toBe(2)
+    wrapper.unmount()
+  })
 })

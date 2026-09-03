@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import struct
-import math
+import binascii
 import json
-from dataclasses import dataclass
+import math
+import re
+import struct
+from dataclasses import dataclass, field
 from enum import IntEnum
 
 
@@ -19,8 +21,35 @@ MAX_PAYLOAD_SIZE = 4 * 1024 * 1024
 WAVEFORM_SAMPLE_MAJOR_FLOAT32 = 0x01
 RTT_RAW_UTF8_LINES = 0x01
 RTT_TERMINAL_UTF8 = 0x02
+SERIAL_RX_BYTES = 0x01
+SERIAL_TX_BYTES = 0x02
 SUPERWATCH_SAMPLE_MAJOR_FLOAT32 = 0x01
 SUPERWATCH_METADATA_JSON = 0x02
+# Float64 sample times (milliseconds), then sample-major Float32 values.
+SUPERWATCH_TIMESTAMPED_FLOAT32 = 0x03
+MEMORY_JSON_V1 = 0x01
+MAX_MEMORY_CHUNK_BYTES = 256
+MAX_MEMORY_JSON_BYTES = 2048
+MAX_MEMORY_REGIONS = 8
+MAX_MEMORY_SAMPLES = 64
+_MAX_U64 = 0xFFFFFFFFFFFFFFFF
+_MEMORY_OPERATION_ID = re.compile(r"^op-[0-9a-f]{16}$")
+
+_MEMORY_JSON_KEYS = frozenset({
+    "schema_version",
+    "operation_id",
+    "operation",
+    "address",
+    "offset",
+    "total_bytes",
+    "byte_count",
+    "data_hex",
+    "crc32",
+    "sample_index",
+    "sample_count",
+    "region_index",
+    "region_count",
+})
 
 RTT_LINE_RECORD = struct.Struct("<QBI")
 RTT_LEVELS = {"raw": 0, "data": 1, "warning": 2, "error": 3}
@@ -73,6 +102,8 @@ class StreamType(IntEnum):
     WAVEFORM = 2
     RTT_RAW = 3
     SUPERWATCH = 4
+    SERIAL = 5
+    MEMORY = 6
     CONTROL = 255
 
 
@@ -84,7 +115,7 @@ class Frame:
     sequence: int
     timestamp_ns: int
     item_count: int
-    payload: bytes
+    payload: bytes = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -92,6 +123,212 @@ class RttLine:
     timestamp_ns: int
     level: str
     text: str
+
+
+def _unsigned_integer(value, name: str, maximum: int) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= maximum:
+        raise ValueError(f"memory {name} must be an unsigned integer")
+    return value
+
+
+def canonical_memory_address(address: int) -> str:
+    """Format one unsigned target address as canonical 32- or 64-bit hex."""
+    value = _unsigned_integer(address, "address", _MAX_U64)
+    width = 8 if value <= 0xFFFFFFFF else 16
+    return f"0x{value:0{width}X}"
+
+
+def _validate_memory_dimensions(
+    operation: str,
+    *,
+    sample_index: int,
+    sample_count: int,
+    region_index: int,
+    region_count: int,
+) -> None:
+    if region_count <= 0 or region_index >= region_count:
+        raise ValueError("memory region index/count are inconsistent")
+    if sample_count <= 0 or sample_index >= sample_count:
+        raise ValueError("memory sample index/count are inconsistent")
+    if operation == "read" and (
+        sample_index != 0
+        or sample_count != 1
+        or region_index != 0
+        or region_count != 1
+    ):
+        raise ValueError(
+            "memory read must use sample_index=0, sample_count=1, "
+            "region_index=0, and region_count=1"
+        )
+
+
+def encode_memory_record(
+    operation_id: str,
+    operation: str,
+    address: int,
+    offset: int,
+    total_bytes: int,
+    data: bytes,
+    *,
+    sample_index: int,
+    sample_count: int,
+    region_index: int,
+    region_count: int,
+) -> bytes:
+    """Encode one strict ``MEMORY_JSON_V1`` chunk.
+
+    ``offset`` and ``total_bytes`` are local to the current region.  ``address``
+    is the actual start address of this chunk (region base + offset).
+    """
+    if not isinstance(operation_id, str) or not _MEMORY_OPERATION_ID.fullmatch(
+        operation_id,
+    ):
+        raise ValueError("memory operation_id must be op- plus 16 lowercase hex digits")
+    if operation not in {"read", "dump"}:
+        raise ValueError("memory operation must be 'read' or 'dump'")
+    address_text = canonical_memory_address(address)
+    offset = _unsigned_integer(offset, "offset", _MAX_U64)
+    total_bytes = _unsigned_integer(
+        total_bytes, "total_bytes", _MAX_U64,
+    )
+    sample_index = _unsigned_integer(
+        sample_index, "sample_index", _MAX_U64,
+    )
+    sample_count = _unsigned_integer(
+        sample_count, "sample_count", MAX_MEMORY_SAMPLES,
+    )
+    region_index = _unsigned_integer(region_index, "region_index", 0xFFFFFFFF)
+    region_count = _unsigned_integer(region_count, "region_count", MAX_MEMORY_REGIONS)
+    chunk = bytes(data)
+    if not 1 <= len(chunk) <= MAX_MEMORY_CHUNK_BYTES:
+        raise ValueError(
+            f"memory chunk must contain 1..{MAX_MEMORY_CHUNK_BYTES} bytes"
+        )
+    if total_bytes <= 0 or offset > total_bytes or len(chunk) > total_bytes - offset:
+        raise ValueError("memory chunk is outside its declared region range")
+    if address < offset or address - offset + total_bytes > _MAX_U64 + 1:
+        raise ValueError("memory address/range cannot describe a valid region")
+    _validate_memory_dimensions(
+        operation,
+        sample_index=sample_index,
+        sample_count=sample_count,
+        region_index=region_index,
+        region_count=region_count,
+    )
+
+    document = {
+        "schema_version": 1,
+        "operation_id": operation_id,
+        "operation": operation,
+        "address": address_text,
+        "offset": offset,
+        "total_bytes": total_bytes,
+        "byte_count": len(chunk),
+        "data_hex": chunk.hex().upper(),
+        "crc32": f"{binascii.crc32(chunk) & 0xFFFFFFFF:08X}",
+        "sample_index": sample_index,
+        "sample_count": sample_count,
+        "region_index": region_index,
+        "region_count": region_count,
+    }
+    payload = json.dumps(
+        document, ensure_ascii=True, separators=(",", ":"),
+    ).encode("utf-8")
+    if len(payload) > MAX_MEMORY_JSON_BYTES:  # defensive shared wire ceiling
+        raise ValueError("memory JSON exceeds the v1 wire limit")
+    return payload
+
+
+def decode_memory_record(payload: bytes) -> dict:
+    """Strict reference decoder for tests and non-browser consumers."""
+    def reject_duplicate_keys(pairs):
+        document = {}
+        for key, value in pairs:
+            if key in document:
+                raise ValueError(f"duplicate memory JSON key: {key}")
+            document[key] = value
+        return document
+
+    wire_payload = bytes(payload)
+    if not 1 <= len(wire_payload) <= MAX_MEMORY_JSON_BYTES:
+        raise ValueError("memory JSON payload is outside the v1 wire limit")
+    try:
+        document = json.loads(
+            wire_payload.decode("utf-8", errors="strict"),
+            object_pairs_hook=reject_duplicate_keys,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid memory JSON") from exc
+    if not isinstance(document, dict) or set(document) != _MEMORY_JSON_KEYS:
+        raise ValueError("memory JSON keys do not match the v1 closed set")
+    operation_id = document.get("operation_id")
+    if not isinstance(operation_id, str) or not _MEMORY_OPERATION_ID.fullmatch(
+        operation_id,
+    ):
+        raise ValueError("invalid memory operation_id")
+    operation = document.get("operation")
+    if type(document.get("schema_version")) is not int or document.get(
+        "schema_version",
+    ) != 1 or operation not in {
+        "read", "dump",
+    }:
+        raise ValueError("invalid memory JSON version or operation")
+    address = document.get("address")
+    if not isinstance(address, str):
+        raise ValueError("memory address must be canonical hex")
+    try:
+        numeric_address = int(address, 0)
+    except (ValueError, TypeError):
+        raise ValueError("memory address must be canonical hex") from None
+    if address != canonical_memory_address(numeric_address):
+        raise ValueError("memory address must be canonical hex")
+    offset = _unsigned_integer(document.get("offset"), "offset", _MAX_U64)
+    total_bytes = _unsigned_integer(
+        document.get("total_bytes"), "total_bytes", _MAX_U64,
+    )
+    byte_count = _unsigned_integer(document.get("byte_count"), "byte_count", 0xFFFFFFFF)
+    sample_index = _unsigned_integer(
+        document.get("sample_index"), "sample_index", _MAX_U64,
+    )
+    sample_count = _unsigned_integer(
+        document.get("sample_count"), "sample_count", MAX_MEMORY_SAMPLES,
+    )
+    region_index = _unsigned_integer(
+        document.get("region_index"), "region_index", 0xFFFFFFFF,
+    )
+    region_count = _unsigned_integer(
+        document.get("region_count"), "region_count", MAX_MEMORY_REGIONS,
+    )
+    data_hex = document.get("data_hex")
+    crc32 = document.get("crc32")
+    if (
+        not isinstance(data_hex, str)
+        or data_hex != data_hex.upper()
+        or len(data_hex) != byte_count * 2
+    ):
+        raise ValueError("memory data_hex length/case is invalid")
+    try:
+        data = bytes.fromhex(data_hex)
+    except ValueError:
+        raise ValueError("memory data_hex is invalid") from None
+    if not 1 <= byte_count <= MAX_MEMORY_CHUNK_BYTES or len(data) != byte_count:
+        raise ValueError("memory byte_count is invalid")
+    if total_bytes <= 0 or offset > total_bytes or byte_count > total_bytes - offset:
+        raise ValueError("memory chunk is outside its declared region range")
+    if numeric_address < offset or numeric_address - offset + total_bytes > _MAX_U64 + 1:
+        raise ValueError("memory address/range cannot describe a valid region")
+    _validate_memory_dimensions(
+        operation,
+        sample_index=sample_index,
+        sample_count=sample_count,
+        region_index=region_index,
+        region_count=region_count,
+    )
+    expected_crc = f"{binascii.crc32(data) & 0xFFFFFFFF:08X}"
+    if not isinstance(crc32, str) or crc32 != expected_crc:
+        raise ValueError("memory crc32 is invalid")
+    # Keep the original closed document as the wire-level reference result.
+    return document
 
 
 def encode_waveform_samples(samples) -> bytes:

@@ -8,7 +8,10 @@ import type {
 } from '../types/offlineFlash'
 import { tr } from './useLanguage'
 import { API_BASE } from '../lib/runtimeEndpoint'
-const BASE = `${API_BASE}/api/offline-download`
+
+function base(): string {
+  return `${API_BASE}/api/offline-download`
+}
 
 function resourceOwnerLabel(owner: unknown): string {
   if (typeof owner !== 'string') return tr('其他功能', 'another feature')
@@ -39,7 +42,7 @@ async function responseError(response: Response): Promise<Error> {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
-  const response = await fetch(`${BASE}${path}`, {
+  const response = await fetch(`${base()}${path}`, {
     ...options,
     headers: options?.body instanceof FormData
       ? options.headers
@@ -88,7 +91,7 @@ export function useOfflineFlashApi() {
       'Content-Type': 'application/json',
       Accept: 'application/x-ndjson',
     })
-    const response = await fetch(`${BASE}/trigger`, {
+    const response = await fetch(`${base()}/trigger`, {
       method: 'POST',
       headers,
       body: JSON.stringify({

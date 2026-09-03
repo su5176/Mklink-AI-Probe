@@ -15,6 +15,15 @@ export interface TargetRecord {
   pack_version: string | null
   installed: boolean
   source: string
+  family: string
+  series: string
+}
+
+export interface TargetMemoryRegion {
+  name: string
+  start: number
+  length: number
+  sector_size: number
 }
 
 export interface PackStatus {
@@ -31,6 +40,17 @@ export interface CustomFlmRecord {
   flash_size: number
   page_size: number
   sector_sizes: Array<[number, number]>
+}
+
+export interface FlashAlgorithmRecord {
+  algorithm_id: string
+  target_part: string
+  file_name: string
+  flash_start: number
+  flash_size: number
+  default: boolean
+  source_kind: 'installed-pack' | 'builtin-pack' | 'daplink-builtin' | 'pyocd-builtin' | 'custom-flm' | 'hpm-rom-api' | string
+  source_name: string
 }
 
 export interface ImageSegment {
@@ -84,6 +104,20 @@ export interface JobRequest {
   reset_mode?: string
   base_address?: number | null
   sector_addresses?: number[]
+  board?: string | null
+  hpm_flash_cfg?: [string, string, string, string] | null
+}
+
+export interface ReadMemoryRequest {
+  address: string
+  size: number
+  probe_id: string
+  target_part: string
+  preempt_ai?: boolean
+  frequency?: number
+  connect_mode?: string
+  reset_mode?: string
+  chunk_sizes?: number[]
   board?: string | null
   hpm_flash_cfg?: [string, string, string, string] | null
 }

@@ -136,7 +136,7 @@ export class SystemViewIntervalRing extends TickRingBase {
     return this.endTicks[this.physical(logicalIndex)]
   }
 
-  private firstEndingAtOrAfter(target: bigint): number {
+  firstOverlappingIndex(target: bigint): number {
     let low = 0
     let high = this.count
     while (low < high) {
@@ -152,7 +152,7 @@ export class SystemViewIntervalRing extends TickRingBase {
     const lastByPixel = new Int32Array(pixelWidth)
     firstByPixel.fill(-1)
     lastByPixel.fill(-1)
-    const first = this.firstEndingAtOrAfter(start)
+    const first = this.firstOverlappingIndex(start)
     const span = end > start ? end - start : 1n
     let candidateCount = 0
 

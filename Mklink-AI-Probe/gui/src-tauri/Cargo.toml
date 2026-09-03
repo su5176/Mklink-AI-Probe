@@ -1,6 +1,6 @@
 [package]
 name = "mklink-ai-probe"
-version = "0.1.6"
+version = "0.1.9"
 description = "Mklink AI Probe"
 authors = ["MicroKeen"]
 edition = "2021"
@@ -31,7 +31,10 @@ windows = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Devices_Properties",
 ] }
+winreg = "0.55"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",

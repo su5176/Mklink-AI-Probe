@@ -2,7 +2,7 @@
   <div class="global-status-bar">
     <div class="status-item">
       <span :class="['status-dot', connected ? 'dot-ok' : 'dot-err']"></span>
-      <span class="status-text">{{ connected ? `${tr('已连接', 'Connected')} ${mcu || ''}` : tr('未连接', 'Disconnected') }}</span>
+      <span class="status-text">{{ connected ? tr('已连接', 'Connected') : tr('未连接', 'Disconnected') }}</span>
     </div>
     <div class="status-divider"></div>
     <div class="status-item">
@@ -37,7 +37,6 @@ const props = defineProps<{
 }>()
 
 const connected = computed(() => props.deviceStatus.connected)
-const mcu = computed(() => props.deviceStatus.mcu)
 const configValid = computed(() => props.configStatus?.is_valid ?? false)
 const errorCount = computed(() => props.configStatus?.errors?.length ?? 0)
 const warningCount = computed(() => props.configStatus?.warnings?.length ?? 0)

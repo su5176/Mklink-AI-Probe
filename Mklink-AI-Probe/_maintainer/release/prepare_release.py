@@ -7,6 +7,7 @@ import hashlib
 import json
 import platform
 import shutil
+import subprocess
 import sys
 import zipfile
 from datetime import datetime, timezone
@@ -15,6 +16,21 @@ from typing import Sequence
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+PUBLIC_SKILL_DIRECTORIES = (
+    PurePosixPath(".claude-plugin"),
+    PurePosixPath("agents"),
+    PurePosixPath("gui/dist"),
+    PurePosixPath("mklink"),
+    PurePosixPath("references"),
+)
+PUBLIC_SKILL_FILES = {
+    PurePosixPath(".mcp.json"),
+    PurePosixPath("pyproject.toml"),
+    PurePosixPath("README.md"),
+    PurePosixPath("scripts/skill_update.py"),
+    PurePosixPath("scripts/win_usb_rename.ps1"),
+    PurePosixPath("SKILL.md"),
+}
 
 
 def _sha256(path: Path) -> str:
@@ -57,6 +73,12 @@ def _require_file(value: Path | str) -> Path:
     return path
 
 
+def _is_public_skill_file(relative: PurePosixPath) -> bool:
+    return relative in PUBLIC_SKILL_FILES or any(
+        directory in relative.parents for directory in PUBLIC_SKILL_DIRECTORIES
+    )
+
+
 def _validate_skill_archive(path: Path, version: str) -> None:
     with zipfile.ZipFile(path) as archive:
         files = {
@@ -77,15 +99,60 @@ def _validate_skill_archive(path: Path, version: str) -> None:
             PurePosixPath(root, "SKILL.md"),
             PurePosixPath(root, ".claude-plugin", "plugin.json"),
             PurePosixPath(root, "scripts", "skill_update.py"),
+            PurePosixPath(root, "scripts", "win_usb_rename.ps1"),
         }
         if not required <= files:
             raise ValueError(
                 "Skill archive root must directly contain the installable project"
             )
+        root_path = PurePosixPath(root)
+        unexpected = sorted(
+            str(member.relative_to(root_path))
+            for member in files
+            if not _is_public_skill_file(member.relative_to(root_path))
+        )
+        if unexpected:
+            raise ValueError(
+                f"Skill archive contains non-user content: {unexpected[0]}"
+            )
         plugin_path = PurePosixPath(root, ".claude-plugin", "plugin.json")
         plugin = json.loads(archive.read(str(plugin_path)))
         if str(plugin.get("version")) != version:
             raise ValueError("Skill archive plugin version does not match the release")
+
+
+def _build_skill_archive(
+    *, version: str, source_commit: str, output: Path,
+) -> Path:
+    git_root = Path(subprocess.check_output(
+        ["git", "-C", str(REPO_ROOT), "rev-parse", "--show-toplevel"],
+        text=True,
+    ).strip()).resolve()
+    source_relative = REPO_ROOT.relative_to(git_root)
+    treeish = source_commit
+    if source_relative.parts:
+        treeish = f"{source_commit}:{source_relative.as_posix()}"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        "git",
+        "-C",
+        str(git_root),
+        "archive",
+        "--format=zip",
+        f"--prefix=Mklink-AI-Probe-v{version}/",
+        f"--output={output}",
+        treeish,
+        "--",
+        *(str(path) for path in PUBLIC_SKILL_DIRECTORIES),
+        *(str(path) for path in sorted(PUBLIC_SKILL_FILES)),
+    ]
+    try:
+        subprocess.run(command, check=True)
+        _validate_skill_archive(output, version)
+    except Exception:
+        output.unlink(missing_ok=True)
+        raise
+    return output
 
 
 def _validate_site_agent_portable(
@@ -114,9 +181,9 @@ def prepare_release(
     output_dir: Path | str,
     nsis: Path | str,
     updater_signature: Path | str,
-    skill_archive: Path | str,
     site_agent_archive: Path | str,
     site_agent_manifest: Path | str,
+    skill_archive: Path | str | None = None,
 ) -> dict[str, object]:
     if not version or any(separator in version for separator in ("/", "\\")):
         raise ValueError("release version must be a path-safe value")
@@ -125,8 +192,6 @@ def prepare_release(
     ):
         raise ValueError("source commit must be a 40-character hexadecimal SHA")
 
-    skill_source = _require_file(skill_archive)
-    _validate_skill_archive(skill_source, version)
     site_agent_source = _require_file(site_agent_archive)
     site_agent_manifest_source = _require_file(site_agent_manifest)
     _validate_site_agent_portable(
@@ -134,6 +199,18 @@ def prepare_release(
         site_agent_manifest_source,
         version,
     )
+    output = Path(output_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    skill_name = f"Mklink-AI-Probe-v{version}-Skill.zip"
+    if skill_archive is None:
+        skill_source = _build_skill_archive(
+            version=version,
+            source_commit=source_commit,
+            output=output / skill_name,
+        )
+    else:
+        skill_source = _require_file(skill_archive)
+        _validate_skill_archive(skill_source, version)
     sources = [
         (_require_file(nsis), f"Mklink-AI-Probe-v{version}-x64-Setup.exe"),
         (
@@ -142,7 +219,7 @@ def prepare_release(
         ),
         (
             skill_source,
-            f"Mklink-AI-Probe-v{version}-Skill.zip",
+            skill_name,
         ),
         (
             site_agent_source,
@@ -161,12 +238,11 @@ def prepare_release(
             raise ValueError(f"duplicate release asset name: {name}")
         names.add(folded)
 
-    output = Path(output_dir).resolve()
-    output.mkdir(parents=True, exist_ok=True)
     assets = []
     for source, name in sorted(sources, key=lambda item: item[1].casefold()):
         destination = output / name
-        shutil.copy2(source, destination)
+        if source.resolve() != destination:
+            shutil.copy2(source, destination)
         assets.append(
             {
                 "name": name,
@@ -205,7 +281,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--nsis", required=True, type=Path)
     parser.add_argument("--updater-signature", required=True, type=Path)
-    parser.add_argument("--skill-archive", required=True, type=Path)
+    parser.add_argument(
+        "--skill-archive",
+        type=Path,
+        help="prebuilt public Skill archive; omitted to build the sanitized archive from source-commit",
+    )
     parser.add_argument("--site-agent-archive", required=True, type=Path)
     parser.add_argument("--site-agent-manifest", required=True, type=Path)
     return parser

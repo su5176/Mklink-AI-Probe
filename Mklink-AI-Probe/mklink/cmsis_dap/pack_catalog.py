@@ -7,6 +7,7 @@ from typing import Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .models import TargetRecord
 from .paths import PackPaths
+from .pyocd_runtime import import_pyocd_attr
 
 
 @dataclass(frozen=True)
@@ -30,7 +31,7 @@ def _production_builtin_provider() -> Iterable[TargetRecord]:
 
     from .builtin_pack_bundle import load_builtin_pack_records
     from .builtin_flm_bundle import load_builtin_flm_targets
-    from pyocd.target import TARGET
+    TARGET = import_pyocd_attr("pyocd.target", "TARGET")
 
     if hasattr(TARGET, "items"):
         entries = TARGET.items()
@@ -44,12 +45,16 @@ def _production_builtin_provider() -> Iterable[TargetRecord]:
     for name, target_type in entries:
         part_number = getattr(target_type, "PART_NUMBER", None) or name
         vendor = getattr(target_type, "VENDOR", "") or ""
+        family = getattr(target_type, "FAMILY", "") or ""
+        series = getattr(target_type, "SERIES", "") or ""
         records.append(
             TargetRecord(
                 part_number=str(part_number),
                 vendor=str(vendor),
                 installed=True,
                 source="builtin",
+                family=str(family),
+                series=str(series),
             )
         )
     return records
@@ -126,7 +131,7 @@ class PackCatalog:
         matches = [
             record
             for record in records
-            if needle in record.part_number.casefold()
+            if self._matches_query(record, needle)
             and (vendor_key is None or record.vendor.casefold() == vendor_key)
             and (installed is None or record.installed is installed)
         ]
@@ -258,6 +263,12 @@ class PackCatalog:
         )
         version = pack_details.get("version") or details.get("version")
         explicit_pack_id = details.get("pack_id")
+        family = PackCatalog._metadata_text(details.get("family"))
+        series = PackCatalog._metadata_text(
+            details.get("series"),
+            details.get("sub_family"),
+            details.get("subfamily"),
+        )
 
         if explicit_pack_id:
             pack_id = str(explicit_pack_id)
@@ -277,6 +288,27 @@ class PackCatalog:
             pack_version=str(version) if version is not None else None,
             installed=False,
             source="index",
+            family=family,
+            series=series,
+        )
+
+    @staticmethod
+    def _metadata_text(*values: object) -> str:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _matches_query(record: TargetRecord, needle: str) -> bool:
+        return any(
+            needle in value.casefold()
+            for value in (
+                record.part_number,
+                record.vendor,
+                record.family,
+                record.series,
+            )
         )
 
     @staticmethod
@@ -288,9 +320,26 @@ class PackCatalog:
         for record in list(builtin_records) + list(cached_records):
             key = record.part_number.casefold()
             current = selected.get(key)
-            if current is None or PackCatalog._priority(record) > PackCatalog._priority(current):
+            if current is None:
                 selected[key] = record
+                continue
+            if PackCatalog._priority(record) > PackCatalog._priority(current):
+                primary, secondary = record, current
+            else:
+                primary, secondary = current, record
+            selected[key] = PackCatalog._merge_search_metadata(primary, secondary)
         return list(selected.values())
+
+    @staticmethod
+    def _merge_search_metadata(
+        primary: TargetRecord,
+        secondary: TargetRecord,
+    ) -> TargetRecord:
+        updates = {}
+        for field_name in ("vendor", "family", "series"):
+            if not getattr(primary, field_name) and getattr(secondary, field_name):
+                updates[field_name] = getattr(secondary, field_name)
+        return replace(primary, **updates) if updates else primary
 
     @staticmethod
     def _priority(record: TargetRecord) -> Tuple[bool, int, bool]:

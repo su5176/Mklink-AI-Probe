@@ -207,7 +207,7 @@ export interface SymbolTypeInfo {
 
 export interface RttFindResponse {
   found: boolean
-  addr?: string
+  addr?: string | null
   source?: string
   source_path?: string
   details?: string[]
@@ -257,6 +257,8 @@ export interface SymbolBrowseNode {
   child_count: number | null
   range_start: number | null
   range_end: number | null
+  array_dimensions?: readonly number[]
+  snapshot_eligible?: boolean
 }
 
 export interface SymbolBrowsePage {
@@ -389,13 +391,16 @@ export interface FirmwareInfo {
   name: string
   version: string
   model: 'V3' | 'V4'
+  family: 'microlink' | 'hpmlink'
   path: string
+  source: 'github' | 'gitee' | 'local'
 }
 
 export type ProbeFirmwareCheckStatus =
   | 'ok'
   | 'upgrade_required'
-  | 'no_firmware_dir'
+  | 'no_firmware'
+  | 'manifest_unavailable'
   | 'skipped'
 
 export interface ProbeFirmwareCheck {
@@ -406,6 +411,36 @@ export interface ProbeFirmwareCheck {
   all_uf2s: FirmwareInfo[]
   firmware_dir: string | null
   instructions: string
+}
+
+export type ProbeFirmwareUpgradeStatus =
+  | 'up_to_date'
+  | 'updated'
+  | 'copied_unverified'
+  | 'manual_required'
+  | 'no_probe_disk'
+  | 'no_firmware'
+
+export interface ProbeFirmwareUpgrade {
+  status: ProbeFirmwareUpgradeStatus
+  current_version?: string
+  latest_version?: string
+  verified_version?: string | null
+  firmware?: string
+  model?: 'V3' | 'V4'
+  family?: 'microlink' | 'hpmlink'
+  download_available?: boolean
+  source?: 'github' | 'gitee' | 'local'
+  message?: string
+  stopped?: string[]
+}
+
+export interface ProbeFirmwareDownload {
+  blob: Blob
+  filename: string
+  version: string
+  source: 'github' | 'gitee' | 'local'
+  family: 'microlink' | 'hpmlink'
 }
 
 export type FileSourceKind = 'symbol' | 'map'

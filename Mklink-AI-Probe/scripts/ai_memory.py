@@ -23,6 +23,16 @@ REQUIRED = {
     "known_limits",
     "next_actions",
 }
+MAX_SECTION_ITEMS = {
+    "milestones": 6,
+    "verification": 8,
+    "decisions": 10,
+    "known_limits": 8,
+    "next_actions": 5,
+    "continuation_protocol": 5,
+}
+MAX_ENTRY_CHARS = 1200
+MAX_HANDOFF_CHARS = 10000
 
 
 def load_memory() -> dict[str, Any]:
@@ -34,6 +44,22 @@ def load_memory() -> dict[str, Any]:
         raise ValueError("unsupported schema_version")
     if not data["next_actions"]:
         raise ValueError("next_actions must not be empty")
+    for section, limit in MAX_SECTION_ITEMS.items():
+        entries = data.get(section, [])
+        if not isinstance(entries, list):
+            raise ValueError(f"{section} must be a list")
+        if len(entries) > limit:
+            raise ValueError(f"{section} exceeds the {limit}-item context budget")
+        for entry in entries:
+            serialized = json.dumps(entry, ensure_ascii=False)
+            if len(serialized) > MAX_ENTRY_CHARS:
+                raise ValueError(
+                    f"{section} entry exceeds the {MAX_ENTRY_CHARS}-character context budget"
+                )
+    if len(render(data)) > MAX_HANDOFF_CHARS:
+        raise ValueError(
+            f"rendered handoff exceeds the {MAX_HANDOFF_CHARS}-character context budget"
+        )
     return data
 
 

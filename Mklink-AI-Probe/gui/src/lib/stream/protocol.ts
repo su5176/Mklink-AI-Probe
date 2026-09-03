@@ -8,14 +8,18 @@ export const StreamType = {
   WAVEFORM: 2,
   RTT_RAW: 3,
   SUPERWATCH: 4,
+  SERIAL: 5,
   CONTROL: 255,
 } as const
 
 export const WAVEFORM_SAMPLE_MAJOR_FLOAT32 = 0x01
 export const RTT_RAW_UTF8_LINES = 0x01
 export const RTT_TERMINAL_UTF8 = 0x02
+export const SERIAL_RX_BYTES = 0x01
+export const SERIAL_TX_BYTES = 0x02
 export const SUPERWATCH_SAMPLE_MAJOR_FLOAT32 = 0x01
 export const SUPERWATCH_METADATA_JSON = 0x02
+export const SUPERWATCH_TIMESTAMPED_FLOAT32 = 0x03
 
 export type StreamType = (typeof StreamType)[keyof typeof StreamType]
 

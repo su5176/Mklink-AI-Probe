@@ -1,6 +1,6 @@
 {
   "productName": "Mklink AI Probe",
-  "version": "0.1.6",
+  "version": "0.1.9",
   "identifier": "com.microkeen.mklink-ai-probe",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -16,6 +16,7 @@
         "height": 800,
         "minWidth": 800,
         "minHeight": 600,
+        "backgroundColor": "#020611",
         "resizable": true,
         "fullscreen": false
       }
@@ -31,10 +32,16 @@
   "bundle": {
     "active": true,
     "targets": ["nsis"],
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    },
     "createUpdaterArtifacts": true,
-    "resources": [
-      "resources/THIRD-PARTY-NOTICES.txt"
-    ],
+    "resources": {
+      "resources/THIRD-PARTY-NOTICES.txt": "resources/THIRD-PARTY-NOTICES.txt"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

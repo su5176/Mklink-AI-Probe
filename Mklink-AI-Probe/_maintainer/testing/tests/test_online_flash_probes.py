@@ -316,6 +316,101 @@ def test_rtt_start_requires_an_explicit_device_connection():
     managers["rtt"].start.assert_not_called()
 
 
+@pytest.mark.parametrize("dashboard", ("rtt", "systemview"))
+@pytest.mark.parametrize(
+    "payload",
+    (
+        {"addr": "0); reboot(); RTTView.start(0", "mode": 0},
+        {"addr": "0xFFFFFFFF", "search_size": 1024, "mode": 0},
+        {"addr": "0x20000000", "channel": 15, "mode": 0},
+        {"addr": "0x20000000", "search_size": 65537, "mode": 0},
+    ),
+)
+def test_stream_start_rejects_unsafe_parameters_before_preempting_a_peer(
+    dashboard,
+    payload,
+):
+    managers = {
+        name: SimpleNamespace(
+            running=name == "superwatch",
+            start=MagicMock(),
+            stop=MagicMock(),
+        )
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+
+    response = client.post(f"/api/dash/{dashboard}/start", json=payload)
+
+    assert response.status_code == 422
+    managers[dashboard].start.assert_not_called()
+    managers["superwatch"].stop.assert_not_called()
+    assert state["resource_manager"].get_status() == {}
+
+
+@pytest.mark.parametrize("dashboard", ("rtt", "systemview"))
+def test_stream_start_rejects_non_ram_window_before_preempting_a_peer(
+    dashboard,
+):
+    from mklink.device import DeviceError
+
+    managers = {
+        name: SimpleNamespace(
+            running=name == "superwatch",
+            start=MagicMock(),
+            stop=MagicMock(),
+        )
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    validate = MagicMock(side_effect=DeviceError(
+        "RTT scan window must stay inside known target writable RAM"
+    ))
+    state["device"] = SimpleNamespace(
+        connected=True,
+        validate_rtt_stream_request=validate,
+    )
+
+    response = client.post(
+        f"/api/dash/{dashboard}/start",
+        json={"addr": "0x40000000", "mode": 0, "search_size": 1024},
+    )
+
+    assert response.status_code == 422
+    validate.assert_called_once_with(
+        "0x40000000", search_size=1024, mode=0,
+    )
+    managers[dashboard].start.assert_not_called()
+    managers["superwatch"].stop.assert_not_called()
+    assert state["resource_manager"].get_status() == {}
+
+
+@pytest.mark.parametrize("dashboard", ("rtt", "systemview"))
+@pytest.mark.parametrize("field", ("channel", "mode", "search_size"))
+@pytest.mark.parametrize("value", (True, False, "1"))
+def test_stream_start_rejects_non_strict_integers_before_preempting_a_peer(
+    dashboard,
+    field,
+    value,
+):
+    managers = {
+        name: SimpleNamespace(
+            running=name == "superwatch",
+            start=MagicMock(),
+            stop=MagicMock(),
+        )
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+
+    response = client.post(f"/api/dash/{dashboard}/start", json={field: value})
+
+    assert response.status_code == 422
+    managers[dashboard].start.assert_not_called()
+    managers["superwatch"].stop.assert_not_called()
+    assert state["resource_manager"].get_status() == {}
+
+
 def test_quick_connect_restores_last_successful_device_inputs():
     managers = {
         name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
@@ -349,11 +444,13 @@ def test_quick_connect_restores_last_successful_device_inputs():
 
     assert response.status_code == 200
     connect.assert_called_once_with(
-        port="PROBE_PORT",
+        port=None,
+        preferred_port="PROBE_PORT",
         axf="firmware.axf",
         mcu="stm32f103rc",
         project_root=state["project_root"],
         elf_backend="builtin",
+        initialize_target_now=False,
     )
     managers["superwatch"].prepare.assert_called_once_with(restored)
     assert state["device"] is restored
@@ -724,6 +821,130 @@ def test_native_api_target_operation_releases_lease_on_success_and_failure():
     assert state["resource_manager"].get_status() == {}
 
 
+def test_reset_stops_bridge_dashboard_before_sending_command():
+    from mklink.remote.resource_manager import ResourceGroup
+
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    events = []
+    managers["rtt"].running = True
+
+    def stop_rtt():
+        events.append("stop-rtt")
+        managers["rtt"].running = False
+
+    managers["rtt"].stop.side_effect = stop_rtt
+    device = MagicMock()
+    device.connected = True
+    device.reset.side_effect = lambda: events.append("reset")
+    state["device"] = device
+    state["resource_manager"].acquire_many(
+        [ResourceGroup.MKLINK_BRIDGE, ResourceGroup.TARGET_DEBUG],
+        "user:dashboard:rtt",
+    )
+
+    with patch("mklink.remote.dashboards.get_managers", return_value=managers):
+        response = client.post("/api/device/reset")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "stopped": ["rtt"]}
+    assert events == ["stop-rtt", "reset"]
+    assert state["resource_manager"].get_status() == {}
+
+
+def test_reset_does_not_send_command_when_dashboard_cannot_stop():
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    managers["systemview"].running = True
+    device = MagicMock()
+    device.connected = True
+    state["device"] = device
+
+    with patch("mklink.remote.dashboards.get_managers", return_value=managers):
+        response = client.post("/api/device/reset")
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "DASHBOARD_STOP_FAILED"
+    device.reset.assert_not_called()
+
+
+def test_probe_power_api_requires_explicit_5v_confirmation_and_releases_lease():
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    calls = []
+    device = MagicMock()
+    device.connected = True
+
+    def set_power_on(voltage_mv, *, confirm_5v=False):
+        owner = state["resource_manager"].get_status()["target_debug"]["owner"]
+        calls.append((voltage_mv, confirm_5v, owner))
+        if voltage_mv == 5000 and not confirm_5v:
+            raise ValueError("5 V requires explicit confirmation")
+
+    device.set_power_on.side_effect = set_power_on
+    state["device"] = device
+
+    safe = client.post("/api/device/power", json={"voltage_mv": 3300})
+    refused = client.post("/api/device/power", json={"voltage_mv": 5000})
+    confirmed = client.post(
+        "/api/device/power",
+        json={"voltage_mv": 5000, "confirm_5v": True},
+    )
+
+    assert safe.status_code == 200
+    assert safe.json()["voltage_mv"] == 3300
+    assert refused.status_code == 400
+    assert confirmed.status_code == 200
+    assert calls == [
+        (3300, False, "user:api:set-power"),
+        (5000, False, "user:api:set-power"),
+        (5000, True, "user:api:set-power"),
+    ]
+    assert state["resource_manager"].get_status() == {}
+
+
+def test_probe_reboot_api_clears_disconnected_device_and_releases_lease():
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    owners_seen = []
+    device = MagicMock()
+    device.connected = True
+
+    def reboot():
+        owners_seen.append(
+            state["resource_manager"].get_status()["target_debug"]["owner"]
+        )
+        device.connected = False
+
+    device.reboot.side_effect = reboot
+    state["device"] = device
+
+    response = client.post("/api/device/reboot")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "rebooted",
+        "connected": False,
+        "stopped": [],
+    }
+    assert owners_seen == ["user:api:reboot-probe"]
+    assert state["device"] is None
+    assert state["dispatcher"] is None
+    assert state["resource_manager"].get_status() == {}
+
+
 def test_native_api_preempts_and_stops_dashboard_before_target_access():
     from mklink.remote.resource_manager import ResourceGroup
 
@@ -746,6 +967,37 @@ def test_native_api_preempts_and_stops_dashboard_before_target_access():
     assert response.status_code == 200
     managers["rtt"].stop.assert_called_once_with()
     device.halt.assert_called_once_with()
+    assert state["resource_manager"].get_status() == {}
+
+
+def test_memory_read_preempts_rtos_trace_and_releases_both_probe_resources():
+    from mklink.remote.resource_manager import ResourceGroup
+
+    managers = {
+        name: SimpleNamespace(running=False, start=MagicMock(), stop=MagicMock())
+        for name in ("rtt", "systemview", "superwatch", "vofa", "serial", "modbus")
+    }
+    client, state = _dashboard_client(managers)
+    managers["systemview"].running = True
+    device = MagicMock()
+    device.connected = True
+    device.read_memory.return_value = b"\x12\x34\x56\x78"
+    state["device"] = device
+    state["resource_manager"].acquire_many(
+        [ResourceGroup.MKLINK_BRIDGE, ResourceGroup.TARGET_DEBUG],
+        "user:dashboard:systemview",
+    )
+
+    with patch("mklink.remote.dashboards.get_managers", return_value=managers):
+        response = client.post(
+            "/api/device/read-memory",
+            json={"address": "0x20000000", "size": 4},
+        )
+
+    assert response.status_code == 200
+    managers["systemview"].stop.assert_called_once_with()
+    device.read_memory.assert_called_once_with(0x20000000, 4)
+    assert response.json()["data_hex"] == "12345678"
     assert state["resource_manager"].get_status() == {}
 
 
@@ -1393,6 +1645,100 @@ def test_stop_bridge_dashboards_releases_owner_when_stop_raises():
             dashboards.stop_bridge_dashboards(resource_manager=resource_manager)
 
     assert resource_manager.get_status() == {}
+
+
+def test_stop_bridge_dashboards_does_not_skip_live_stopping_worker():
+    from mklink.remote import dashboards
+    from mklink.remote.resource_manager import ResourceGroup, ResourceManager
+
+    class LiveThread:
+        def is_alive(self):
+            return True
+
+    manager = SimpleNamespace(
+        running=False,
+        _thread=LiveThread(),
+        stop=MagicMock(side_effect=TimeoutError("still active")),
+    )
+    managers = {name: None for name in dashboards.BRIDGE_DASHBOARD_TYPES}
+    managers["rtt"] = manager
+    resource_manager = ResourceManager()
+    resource_manager.acquire_many(
+        [ResourceGroup.MKLINK_BRIDGE, ResourceGroup.TARGET_DEBUG],
+        "user:dashboard:rtt",
+    )
+
+    with patch.object(dashboards, "get_managers", return_value=managers):
+        with pytest.raises(TimeoutError, match="still active"):
+            dashboards.stop_bridge_dashboards(
+                resource_manager=resource_manager,
+            )
+
+    manager.stop.assert_called_once_with()
+    assert resource_manager.get_active_lease(
+        ResourceGroup.TARGET_DEBUG,
+    ).owner == "user:dashboard:rtt"
+
+
+def test_dashboard_stop_transaction_waits_for_inflight_start(monkeypatch):
+    from mklink.remote.api import (
+        start_dashboard_manager,
+        stop_dashboard_manager_transaction,
+    )
+    from mklink.remote.resource_manager import ResourceGroup, ResourceManager
+
+    class Manager:
+        running = False
+
+        def __init__(self):
+            self.stop_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+            self.running = False
+
+    manager = Manager()
+    resources = ResourceManager()
+    state = {"resource_manager": resources}
+    start_entered = threading.Event()
+    allow_start = threading.Event()
+
+    def acquire(_state, dashboard):
+        resources.acquire_many(
+            [ResourceGroup.MKLINK_BRIDGE, ResourceGroup.TARGET_DEBUG],
+            f"user:dashboard:{dashboard}",
+        )
+        return []
+
+    def delayed_start():
+        start_entered.set()
+        assert allow_start.wait(timeout=2)
+        manager.running = True
+
+    monkeypatch.setattr(
+        "mklink.remote.api.acquire_dashboard_resources", acquire,
+    )
+
+    async def scenario():
+        starting = asyncio.create_task(start_dashboard_manager(
+            state, "rtt", manager, delayed_start,
+        ))
+        assert await asyncio.to_thread(start_entered.wait, 1)
+        stopping = asyncio.create_task(stop_dashboard_manager_transaction(
+            state, "rtt", manager,
+        ))
+        await asyncio.sleep(0.05)
+        assert not stopping.done()
+        assert manager.stop_calls == 0
+        allow_start.set()
+        await starting
+        await stopping
+
+    asyncio.run(scenario())
+
+    assert manager.stop_calls == 1
+    assert manager.running is False
+    assert resources.get_status() == {}
 
 
 def test_native_target_context_serializes_same_owner_across_threads():

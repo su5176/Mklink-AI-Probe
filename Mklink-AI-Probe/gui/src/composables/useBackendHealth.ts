@@ -1,5 +1,10 @@
 import { ref, onUnmounted } from 'vue'
-import { API_BASE, IS_TAURI } from '../lib/runtimeEndpoint'
+import {
+  API_BASE,
+  IS_TAURI,
+  restartRuntimeBackend,
+  runtimeBackendPort,
+} from '../lib/runtimeEndpoint'
 
 /** 'starting' = backend not yet checked / currently booting */
 const backendState = ref<'starting' | 'alive' | 'dead'>('starting')
@@ -75,7 +80,7 @@ async function restart(): Promise<void> {
   firstCheckDone = false
   if (IS_TAURI) {
     try {
-      await (window as any).__TAURI__.invoke('restart_sidecar')
+      await restartRuntimeBackend()
     } catch (e) {
       console.error('[useBackendHealth] restart failed:', e)
     }
@@ -107,6 +112,7 @@ export function useBackendHealth() {
 
   return {
     backendState,
+    backendPort: runtimeBackendPort,
     isTauri: IS_TAURI,
     startHealthPolling,
     stopHealthPolling,

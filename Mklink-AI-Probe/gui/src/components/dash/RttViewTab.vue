@@ -71,8 +71,8 @@
           </div>
           <div class="stream-metrics" aria-label="RTT stream status">
             <span>{{ retainedCount }} {{ tr('行', 'lines') }}</span>
-            <span>buffer {{ binary.telemetry.value?.bufferedSamples ?? 0 }}</span>
-            <span>drops {{ binary.telemetry.value?.transportDroppedBatches ?? 0 }}/{{ binary.telemetry.value?.backendDroppedBatches ?? 0 }}</span>
+            <span>buffer {{ activeTelemetry?.bufferedSamples ?? 0 }}</span>
+            <span>drops {{ activeTelemetry?.transportDroppedBatches ?? 0 }}/{{ activeTelemetry?.backendDroppedBatches ?? 0 }}</span>
           </div>
         </div>
         <div class="rtt-secondary-tools">
@@ -103,6 +103,14 @@
             <span>{{ chartEnabled ? tr('关闭曲线', 'Hide Chart') : tr('打开曲线', 'Show Chart') }}</span>
           </button>
           <button
+            v-if="viewMode === 'log'" data-testid="rtt-save-log" type="button"
+            class="icon-action" :disabled="retainedCount === 0"
+            :title="tr('保存日志', 'Save log')" :aria-label="tr('保存日志', 'Save log')"
+            @click="saveLog"
+          >
+            <Download :size="15" aria-hidden="true" />
+          </button>
+          <button
             data-testid="rtt-clear-logs" class="btn-clear icon-action" type="button"
             :title="viewMode === 'terminal' ? tr('清除终端', 'Clear terminal') : tr('清除日志', 'Clear log')"
             :aria-label="viewMode === 'terminal' ? tr('清除终端', 'Clear terminal') : tr('清除日志', 'Clear log')"
@@ -119,8 +127,8 @@
         />
         <div class="rtt-chart-hint">{{ tr('滚轮缩放坐标 · 左键拖动曲线 · 双击复位', 'Wheel to zoom axes · Left-drag to pan · Double-click to reset') }}</div>
       </div>
-      <VirtualLogPanel v-show="viewMode === 'log'" ref="logPanel" class="rtt-view-log" />
-      <div v-show="viewMode === 'terminal'" class="rtt-terminal-shell">
+      <VirtualLogPanel v-if="viewMode === 'log'" ref="logPanel" class="rtt-view-log" />
+      <div v-else class="rtt-terminal-shell">
         <RttTerminalPanel
           ref="terminalPanel" :input-enabled="transmitEnabled"
           @input="queueTerminalInput"
@@ -135,14 +143,14 @@
 
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { Eye, EyeOff, Info, ScrollText, Search, SquareTerminal, Trash2 } from '@lucide/vue'
+import { Download, Eye, EyeOff, Info, ScrollText, Search, SquareTerminal, Trash2 } from '@lucide/vue'
 import { useDashboard } from '../../composables/useDashboard'
 import { useBinaryStream } from '../../composables/useBinaryStream'
 import { useMklinkApi } from '../../composables/useMklinkApi'
 import { useDashboardSetup } from '../../composables/useDashboardSetup'
 import {
   DESKTOP_SETTINGS_CHANGED_EVENT,
-  isMapFilePath,
+  isSameFileSourcePath,
   isSymbolFilePath,
   loadDesktopSettings,
   saveDesktopSettings,
@@ -150,6 +158,8 @@ import {
   type RttEncoding,
 } from '../../lib/desktopSettings'
 import { RenderScheduler } from '../../lib/stream/renderScheduler'
+import { cancelRttAddressRefresh } from '../../lib/rttSymbolAddress'
+import { downloadTextFile, timestampedLogName } from '../../lib/downloadTextFile'
 import ControlToolbar from './ControlToolbar.vue'
 import RttTransmitBar from './RttTransmitBar.vue'
 import RttTerminalPanel from './RttTerminalPanel.vue'
@@ -160,7 +170,8 @@ import { API_BASE } from '../../lib/runtimeEndpoint'
 
 const props = defineProps<{ deviceConnected: boolean }>()
 const dash = useDashboard('rtt')
-const binary = useBinaryStream('rtt', { capacity: 200_000, channelCount: 1 })
+const logBinary = useBinaryStream('rtt', { capacity: 200_000, channelCount: 1 })
+const terminalBinary = useBinaryStream('rtt-terminal', { capacity: 64 * 1024, channelCount: 1 })
 const { findRtt, writeRtt, setRttEncoding } = useMklinkApi()
 const {
   connecting,
@@ -170,9 +181,7 @@ const {
 } = useDashboardSetup()
 const desktopStorage = localStorage
 const settings = ref<DesktopSettings>(loadDesktopSettings(desktopStorage))
-const hasAddressFileSource = computed(() => (
-  isMapFilePath(settings.value.mapPath) || isSymbolFilePath(settings.value.symbolPath)
-))
+const hasAddressFileSource = computed(() => isSymbolFilePath(settings.value.symbolPath))
 const rttAddress = ref(settings.value.rttAddress)
 const rttEncoding = ref<RttEncoding>(settings.value.rttEncoding)
 const addressError = ref('')
@@ -187,6 +196,9 @@ const logPanel = ref<InstanceType<typeof VirtualLogPanel> | null>(null)
 const terminalPanel = ref<InstanceType<typeof RttTerminalPanel> | null>(null)
 const chart = ref<HTMLCanvasElement | null>(null)
 const retainedCount = computed(() => logPanel.value?.retainedCount ?? 0)
+const activeTelemetry = computed(() => (
+  viewMode.value === 'log' ? logBinary.telemetry.value : terminalBinary.telemetry.value
+))
 const numericChannelCount = ref(0)
 const numericChannelNames = ref<string[]>([])
 const chartEnabled = ref(true)
@@ -219,8 +231,8 @@ let requestId = 0
 let statusTimer: ReturnType<typeof setTimeout> | null = null
 let disposed = false
 let searchGeneration = 0
-let binaryAttached = false
-let latestEnvelope: NonNullable<typeof binary.envelope.value> | null = null
+let attachedBinaryMode: 'log' | 'terminal' | null = null
+let latestEnvelope: NonNullable<typeof logBinary.envelope.value> | null = null
 let dataRange: { start: number, end: number } | null = null
 let visibleRange: { start: number, end: number } | null = null
 let manualTimeline = false
@@ -250,12 +262,25 @@ function persistSettings(next: DesktopSettings): void {
 
 function syncRttAddressFromSettings(): void {
   const latest = loadDesktopSettings(desktopStorage)
+  const sourceChanged = !sameRttSearchSource(settings.value.symbolPath, latest.symbolPath)
+  const addressChanged = latest.rttAddress !== rttAddress.value
+  if (sourceChanged || addressChanged) {
+    searchGeneration++
+    searching.value = false
+  }
   settings.value = latest
-  if (latest.rttAddress !== rttAddress.value) {
+  if (addressChanged) {
     rttAddress.value = latest.rttAddress
     addressError.value = ''
     addressSource.value = ''
   }
+}
+
+function sameRttSearchSource(left: string | undefined, right: string | undefined): boolean {
+  const leftPath = left?.trim() || ''
+  const rightPath = right?.trim() || ''
+  if (!leftPath || !rightPath) return leftPath === rightPath
+  return isSameFileSourcePath(leftPath, rightPath)
 }
 
 function isRttAddress(value: string): boolean {
@@ -263,6 +288,7 @@ function isRttAddress(value: string): boolean {
 }
 
 function onAddressInput(): void {
+  cancelRttAddressRefresh(desktopStorage)
   searchGeneration++
   searching.value = false
   addressError.value = ''
@@ -274,21 +300,29 @@ function onAddressInput(): void {
 }
 
 async function searchRttAddress(): Promise<void> {
+  cancelRttAddressRefresh(desktopStorage)
   const generation = ++searchGeneration
   searching.value = true
   addressError.value = ''
-  const symbolPath = settings.value.symbolPath.trim()
-  const mapPath = settings.value.mapPath.trim()
-  const source = symbolPath || mapPath || undefined
+  const initialSettings = loadDesktopSettings(desktopStorage)
+  settings.value = initialSettings
+  const initialAddress = initialSettings.rttAddress
+  const symbolPath = initialSettings.symbolPath.trim()
+  const source = symbolPath || undefined
   try {
     const result = await findRtt(source)
     if (disposed || generation !== searchGeneration) return
+    const latest = loadDesktopSettings(desktopStorage)
+    if (
+      !sameRttSearchSource(symbolPath, latest.symbolPath)
+      || latest.rttAddress !== initialAddress
+    ) return
     if (!result.addr || !isRttAddress(result.addr)) {
       throw new Error(result.details?.join(tr('；', '; ')) || result.warnings?.join(tr('；', '; ')) || tr('未找到 RTT 地址', 'RTT address not found'))
     }
     rttAddress.value = result.addr
     addressSource.value = result.source || (source ? tr('所选文件', 'Selected file') : tr('工程自动检测', 'Project auto-detection'))
-    persistSettings({ ...settings.value, rttAddress: result.addr })
+    persistSettings({ ...latest, rttAddress: result.addr })
   } catch (caught) {
     if (!disposed && generation === searchGeneration) {
       addressError.value = caught instanceof Error ? caught.message : String(caught)
@@ -318,30 +352,30 @@ const scheduler = new RenderScheduler(() => {
   if (viewMode.value !== 'log') return
   const canvas = chart.value
   if (!canvas || !chartEnabled.value || !hasChartData.value || numericChannelCount.value <= 0) return
-  const telemetry = binary.telemetry.value
+  const telemetry = logBinary.telemetry.value
   if (!telemetry?.bufferedSamples) return
   const range = visibleRange ?? dataRange
   if (!range || !Number.isFinite(range.start) || !Number.isFinite(range.end)) return
-  binary.requestVisibleRange(
+  logBinary.requestVisibleRange(
     ++requestId, range.start, range.end,
     Math.max(1, (canvas.clientWidth || 640) - CHART_MARGIN.left - CHART_MARGIN.right),
   )
 })
 
-watch(() => binary.rttLines.value, batch => {
-  if (!batch || renderPaused.value) return
+watch(() => logBinary.rttLines.value, batch => {
+  if (viewMode.value !== 'log' || !batch || renderPaused.value) return
   logPanel.value?.append(batch.lines.map(line => ({
     time: line.timestampNs, level: line.level, text: line.text,
   } satisfies VirtualLogInput)))
 })
 
-watch(() => binary.rttTerminal.value, chunk => {
-  if (!chunk || renderPaused.value) return
+watch(() => terminalBinary.rttTerminal.value, chunk => {
+  if (viewMode.value !== 'terminal' || !chunk || renderPaused.value) return
   terminalPanel.value?.write(chunk.text)
 })
 
-watch(() => binary.waveformBatch.value, batch => {
-  if (!batch) return
+watch(() => logBinary.waveformBatch.value, batch => {
+  if (viewMode.value !== 'log' || !batch) return
   numericChannelCount.value = batch.channelCount
   if (numericChannelNames.value.length !== batch.channelCount) {
     numericChannelNames.value = Array.from(
@@ -363,7 +397,7 @@ watch(() => binary.waveformBatch.value, batch => {
   }
 })
 
-watch(() => binary.envelope.value, envelope => {
+watch(() => logBinary.envelope.value, envelope => {
   if (!envelope || renderPaused.value || envelope.requestId !== requestId) return
   latestEnvelope = envelope
   drawEnvelope(envelope)
@@ -387,7 +421,7 @@ watch(chart, canvas => {
 })
 watch(language, () => scheduler.invalidate('resize'))
 
-function drawEnvelope(envelope: NonNullable<typeof binary.envelope.value>): void {
+function drawEnvelope(envelope: NonNullable<typeof logBinary.envelope.value>): void {
   const canvas = chart.value
   if (!canvas) return
   const width = Math.max(1, canvas.clientWidth || 640)
@@ -515,6 +549,7 @@ function setViewMode(mode: 'log' | 'terminal'): void {
   if (viewMode.value === mode) return
   viewMode.value = mode
   formatHelpOpen.value = false
+  if (statusRunning.value) attachBinary()
   if (mode === 'terminal') {
     scheduler.stop()
     void nextTick(() => terminalPanel.value?.activate())
@@ -662,15 +697,19 @@ function resetChartData(): void {
 }
 
 function attachBinary(): void {
-  if (binaryAttached) return
-  binaryAttached = true
-  binary.start()
+  const desired = viewMode.value
+  if (attachedBinaryMode === desired) return
+  if (attachedBinaryMode === 'log') logBinary.stop()
+  else if (attachedBinaryMode === 'terminal') terminalBinary.stop()
+  if (desired === 'log') logBinary.start()
+  else terminalBinary.start()
+  attachedBinaryMode = desired
 }
 
 function detachBinary(): void {
-  if (!binaryAttached) return
-  binaryAttached = false
-  binary.stop()
+  logBinary.stop()
+  terminalBinary.stop()
+  attachedBinaryMode = null
 }
 
 async function refreshStatus(): Promise<Record<string, any> | null> {
@@ -700,8 +739,7 @@ async function refreshStatus(): Promise<Record<string, any> | null> {
       }
       if (typeof status.error === 'string' && status.error) {
         runtimeError.value = status.error
-        binaryAttached = false
-        binary.stop()
+        detachBinary()
       } else if (statusRunning.value && !runtimeError.value) {
         attachBinary()
       } else {
@@ -771,7 +809,8 @@ async function onStart(): Promise<void> {
     renderPaused.value = false
     runtimeError.value = null
     scheduler.start()
-    binary.reset()
+    logBinary.reset()
+    terminalBinary.reset()
     const started = await dash.start({
       addr: address,
       mode: 0,
@@ -823,6 +862,11 @@ function clearAllOutputs(): void {
 function clearVisibleOutput(): void {
   if (viewMode.value === 'terminal') terminalPanel.value?.clear()
   else logPanel.value?.clear()
+}
+
+function saveLog(): void {
+  const text = logPanel.value?.exportText() || ''
+  if (text) downloadTextFile(timestampedLogName('rtt'), text)
 }
 
 onMounted(() => {

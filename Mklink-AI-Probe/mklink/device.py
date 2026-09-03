@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import os
 import re
 import struct
 import tempfile
@@ -59,6 +60,16 @@ _RT_NAME_MAX_DEFAULT = 8
 _SRAM_START = 0x20000000
 _SRAM_END = 0x40000000
 _FLASH_VERIFY_CHUNK = 1024
+_RTT_SIGNATURE = b"SEGGER RTT"
+_RTT_SCAN_CHUNK = 1024
+_RTT_DEFAULT_SEARCH_SIZE = 1024
+_RTT_MAX_SEARCH_SIZE = 64 * 1024
+_RTT_DESCRIPTOR_SIZE = 24
+_RTT_FIRMWARE_MAX_CHANNELS = 3
+_RTT_MAX_TARGET_BUFFERS = 16
+_RTT_MAX_BUFFER_SIZE = 1024 * 1024
+_RTT_RESERVED_STOP = b"RTTView.stop()"
+_SUPPORTED_POWER_VOLTAGES_MV = frozenset({1800, 3300, 5000})
 
 
 def _aligned_object_list_offset(name_max: int) -> int:
@@ -67,6 +78,77 @@ def _aligned_object_list_offset(name_max: int) -> int:
 
 def _is_sram_pointer(value: int) -> bool:
     return _SRAM_START <= value < _SRAM_END and value % 4 == 0
+
+
+def _resolve_rtt_stream_parameters(
+    addr: str | int | None,
+    channel: int,
+    search_size: int,
+    mode: int | None,
+    project_root: str,
+) -> tuple[str, int, int, int]:
+    """Resolve and validate the shared RTT/SystemView probe parameters.
+
+    Values reach PikaScript as source text, so validation must happen in the
+    Device entry point shared by Python, REST, and MCP callers.  Returning a
+    canonical hexadecimal address prevents an address-like string from being
+    interpreted as an arbitrary probe expression.
+    """
+    missing_addr = addr is None or (isinstance(addr, str) and not addr.strip())
+    rtt_cfg = None
+    if mode is None or missing_addr:
+        from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
+
+        rtt_cfg = load_rtt_config(project_root)
+        if mode is None:
+            mode = resolve_rtt_storage_mode(rtt_cfg)
+
+    if type(mode) is not int or mode not in (0, 1):
+        raise ValueError(f"rtt_storage_mode must be 0 or 1, got {mode!r}")
+    if type(channel) is not int or not 0 <= channel < _RTT_FIRMWARE_MAX_CHANNELS:
+        raise ValueError("channel must be between 0 and 2 for V4 probe firmware")
+    if (
+        type(search_size) is not int
+        or not 0 <= search_size <= _RTT_MAX_SEARCH_SIZE
+    ):
+        raise ValueError(
+            f"search_size must be between 0 and {_RTT_MAX_SEARCH_SIZE} bytes"
+        )
+
+    if missing_addr and rtt_cfg:
+        configured = rtt_cfg.get("rtt_addr")
+        if configured is not None and str(configured).strip():
+            addr = configured
+            missing_addr = False
+    if missing_addr:
+        if mode == 1:
+            raise ValueError("addr is required when rtt_storage_mode is 1")
+        # Preserve the historical dynamic/default behavior when a project has
+        # no RTT configuration.  The canonical form below still keeps the
+        # generated PikaScript command safe.
+        addr = 0x20000000
+
+    if isinstance(addr, bool) or not isinstance(addr, (str, int)):
+        raise ValueError("addr must be a 32-bit integer address")
+    try:
+        parsed_addr = int(addr.strip(), 0) if isinstance(addr, str) else addr
+    except ValueError as error:
+        raise ValueError("addr must be a 32-bit integer address") from error
+    if not 0 <= parsed_addr <= 0xFFFFFFFF:
+        raise ValueError("addr must be between 0x00000000 and 0xFFFFFFFF")
+    if parsed_addr % 4:
+        raise ValueError("addr must be 4-byte aligned")
+    # Dynamic mode reads enough overlap to recognize a signature whose first
+    # byte is still inside the requested search window.  Reject wraparound
+    # before any SWD or PikaScript operation is attempted.
+    scan_span = (
+        (search_size or _RTT_DEFAULT_SEARCH_SIZE) + len(_RTT_SIGNATURE) - 1
+        if mode == 0
+        else 24
+    )
+    if scan_span > 0x100000000 - parsed_addr:
+        raise ValueError("addr and search_size exceed the 32-bit address space")
+    return f"0x{parsed_addr:08X}", channel, search_size, mode
 
 
 def _decode_rt_thread_name(raw: bytes, name_max: int) -> str | None:
@@ -94,7 +176,7 @@ def initialize_target(
     *,
     mcu_hint: str | None = None,
     project_root: str = ".",
-    timeout: float = 10.0,
+    timeout: float = 2.0,
 ) -> int:
     """Initialize the target SWD DP, read IDCODE, and match the MCU profile.
 
@@ -189,20 +271,26 @@ class Device:
         self,
         *,
         port: str | None = None,
+        preferred_port: str | None = None,
         axf: str | None = None,
         mcu: str | None = None,
         project_root: str = ".",
         elf_backend: str | None = None,
+        initialize_target_now: bool = True,
     ):
         self._port = port
+        self._preferred_port = preferred_port
         self._axf = axf
         self._mcu_hint = mcu
         self._project_root = project_root
         self._elf_backend_requested = elf_backend
+        self._initialize_target_now = initialize_target_now
         self._elf_backend = None
         self._bridge = None
         self._flash = None
         self._rtt_session = None
+        self._rtt_control_block_info: dict[str, Any] | None = None
+        self._rtt_write_guard_tail = b""
         self._systemview_session = None
         self._systemview_parser = None
         self._dwarf_info = None
@@ -226,19 +314,86 @@ class Device:
     # ------------------------------------------------------------------
     def _connect(self) -> None:
         from mklink.bridge import MKLinkSerialBridge
-        from mklink.discovery import find_mklink_cdc_port
-        from mklink.cli import _resolve_port
+        from mklink.discovery import find_mklink_cdc_port, list_available_ports
+        from mklink.project_config import load_config, save_config
+        from mklink.serial._port import _PortLock
 
-        port = self._port
-        if port is None:
-            port = _resolve_port(None, self._project_root)
-            self._port = port
+        automatic = self._port is None
+        config = load_config(self._project_root) or {}
+        saved_port = str(config.get("com_port") or "").strip() or None
+        candidate = self._port or self._preferred_port or saved_port
+        attempted: set[str] = set()
+        candidate_attempts: dict[str, int] = {}
+        discovery_lock = None
 
-        self._bridge = MKLinkSerialBridge(port)
-        if not self._bridge.connect():
+        try:
+            while True:
+                if candidate is None:
+                    if discovery_lock is None:
+                        discovery_lock = _PortLock("mklink_auto_connect")
+                        deadline = time.monotonic() + 60.0
+                        while not discovery_lock.acquire():
+                            if time.monotonic() >= deadline:
+                                break
+                            time.sleep(0.05)
+                        else:
+                            deadline = None
+                        if deadline is not None:
+                            break
+
+                    candidate = find_mklink_cdc_port(exclude_ports=set(attempted))
+                    if candidate is None:
+                        break
+
+                candidate_key = candidate.strip().casefold()
+                attempt = candidate_attempts.get(candidate_key, 0)
+                bridge = MKLinkSerialBridge(candidate)
+                if bridge.connect():
+                    self._bridge = bridge
+                    self._port = candidate
+                    break
+                bridge.close()
+
+                # USB CDC ports can be visible a short moment before the
+                # firmware REPL is ready. Retry the same candidate once so a
+                # transient enumeration race does not require a second user
+                # click. Only exhausted candidates are excluded from the next
+                # discovery pass.
+                if attempt == 0:
+                    candidate_attempts[candidate_key] = 1
+                    time.sleep(0.15)
+                    continue
+
+                attempted.add(candidate_key)
+
+                if not automatic:
+                    break
+                candidate = None
+        finally:
+            if discovery_lock is not None:
+                discovery_lock.release()
+
+        if self._bridge is None:
+            ports = ", ".join(sorted(attempted)) or "none"
             raise DeviceNotConnectedError(
-                f"Failed to connect to MKLink on {port}"
+                f"Failed to connect to an available MKLink port (tried: {ports})"
             )
+
+        if automatic and self._port != saved_port:
+            visible_ports = {
+                str(info.get("device") or "").strip().casefold()
+                for info in list_available_ports()
+            }
+            saved_port_is_present = (
+                saved_port is not None and saved_port.casefold() in visible_ports
+            )
+            if not saved_port_is_present:
+                updated = dict(config)
+                updated["com_port"] = self._port
+                try:
+                    save_config(self._project_root, updated)
+                except Exception:
+                    pass
         self._connected = True
 
         from mklink.flash import MKLinkFlash
@@ -251,12 +406,13 @@ class Device:
         # 0. Doing it here fixes all of them at once. Tolerant: a missing
         # target leaves idcode at 0 rather than failing connect (see
         # initialize_target docstring).
-        initialize_target(
-            self._bridge,
-            self._flash,
-            mcu_hint=self._mcu_hint,
-            project_root=self._project_root,
-        )
+        if self._initialize_target_now:
+            initialize_target(
+                self._bridge,
+                self._flash,
+                mcu_hint=self._mcu_hint,
+                project_root=self._project_root,
+            )
 
         if self._axf:
             self._load_dwarf_info()
@@ -276,11 +432,38 @@ class Device:
             self._bridge.close()
         self._bridge = None
         self._flash = None
+        self._rtt_session = None
+        self._rtt_control_block_info = None
+        self._rtt_write_guard_tail = b""
+        self._systemview_session = None
+        self._systemview_parser = None
         self._connected = False
+        # HIL-Infra lockd 协议互操作锁（connect 时获取）：断连即释放
+        renew_stop = getattr(self, "_hil_renew_stop", None)
+        if renew_stop is not None:
+            renew_stop.set()
+            thread = getattr(self, "_hil_renew_thread", None)
+            if thread is not None:
+                thread.join(timeout=2)
+            self._hil_renew_stop = None
+            self._hil_renew_thread = None
+        hil_lock = getattr(self, "_hil_lock", None)
+        if hil_lock is not None:
+            hil_lock.release()
+            self._hil_lock = None
 
     @property
     def connected(self) -> bool:
-        return self._connected and self._bridge is not None
+        bridge = self._bridge
+        if not self._connected or bridge is None:
+            return False
+        transport_error = getattr(bridge, "_transport_error", None)
+        if isinstance(transport_error, BaseException):
+            return False
+        return getattr(bridge, "state", None) not in (
+            DeviceState.DISCONNECTED,
+            DeviceState.ERROR,
+        )
 
     def _require_connected(self) -> None:
         if not self.connected:
@@ -702,12 +885,13 @@ class Device:
                 raise DeviceError(f"Flash failed: {result}")
             result = dict(result)
             result["algorithm_source"] = "hpm-rom-api"
+            # The HPM ROM programming routine finishes with the target-specific
+            # RISC-V reset/resume sequence. A generic SWD reset can halt HPM.
+            result["reset_handled_by_rom_api"] = True
             result["verified"] = False
             if verify:
                 self._verify_firmware_readback(firmware, _fmt_hex(address))
                 result["verified"] = True
-            if reset_after:
-                self.reset()
             return result
 
         if resolved_target:
@@ -911,8 +1095,65 @@ class Device:
         return self._flash.erase_sector(f"0x{addr:08X}")
 
     def reset(self) -> None:
+        """Reset the target MCU while keeping the probe session connected."""
         self._require_connected()
-        self._bridge.send_command("cmd.reset_chip()", timeout=10.0)
+        self._bridge.send_command("cmd.set_reset()", timeout=10.0)
+
+    def _stop_active_probe_streams(self) -> None:
+        if self._rtt_session and self._rtt_session._running:
+            self.rtt_stop()
+        if self._systemview_session and self._systemview_session._running:
+            self.systemview_stop()
+
+    def set_power_on(self, voltage_mv: int, *, confirm_5v: bool = False) -> None:
+        """Enable probe VCC output at one supported voltage.
+
+        ``5000`` mV can permanently damage a 3.3 V target.  Callers must make
+        that risk explicit for every 5 V request with ``confirm_5v=True``.
+        """
+        self._require_connected()
+        if isinstance(voltage_mv, bool) or not isinstance(voltage_mv, int):
+            raise ValueError("voltage_mv must be one of 1800, 3300, or 5000")
+        if voltage_mv not in _SUPPORTED_POWER_VOLTAGES_MV:
+            raise ValueError("voltage_mv must be one of 1800, 3300, or 5000")
+        if voltage_mv == 5000 and confirm_5v is not True:
+            raise ValueError(
+                "5 V may damage a 3.3 V target; pass confirm_5v=True only "
+                "after verifying the connected hardware is 5 V tolerant"
+            )
+        self._stop_active_probe_streams()
+        self._bridge.send_command(f"cmd.set_power_on({voltage_mv})", timeout=10.0)
+
+    def reboot(self) -> None:
+        """Reboot the MKLink probe, then release serial and HIL locks.
+
+        Unlike :meth:`reset`, this restarts the probe itself.  A successful
+        call intentionally leaves this ``Device`` disconnected; reconnect
+        after the probe enumerates again.
+        """
+        self._require_connected()
+        self._stop_active_probe_streams()
+        bridge = self._bridge
+        try:
+            bridge.send_command_nowait("reboot()")
+        finally:
+            self.close()
+
+    def enter_bootloader(self) -> None:
+        """Ask the probe to enumerate its UF2 bootloader drive.
+
+        The command intentionally has no trailing prompt: entering UF2 mode
+        tears down the CDC connection.  Close the bridge immediately so the
+        caller can observe the drive re-enumeration without holding the serial
+        resource lock.
+        """
+        self._require_connected()
+        self._stop_active_probe_streams()
+        bridge = self._bridge
+        try:
+            bridge.send_command_nowait("cmd.enter_bootloader()")
+        finally:
+            self.close()
 
     def _get_mcu_profile(self) -> dict | None:
         from mklink.profiles import load_mcu_profiles, match_mcu_by_idcode, match_mcu_by_device
@@ -1037,40 +1278,356 @@ class Device:
     # ------------------------------------------------------------------
     # RTT
     # ------------------------------------------------------------------
-    def _read_rtt_down_buffers(self, control_block_addr: int) -> list[dict]:
-        descriptor_size = 24
+    @staticmethod
+    def _merge_address_ranges(
+        ranges: list[tuple[int, int]],
+    ) -> tuple[tuple[int, int], ...]:
+        normalized = sorted(
+            (int(start), int(end))
+            for start, end in ranges
+            if 0 <= int(start) < int(end) <= 0x100000000
+        )
+        merged: list[tuple[int, int]] = []
+        for start, end in normalized:
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        return tuple(merged)
+
+    def _target_writable_ram_ranges(self) -> tuple[tuple[int, int], ...]:
+        """Return trusted target RAM ranges for RTT control/data buffers.
+
+        AXF writable sections, explicit project memory metadata, and an
+        identified MCU profile are authoritative.  There is deliberately no
+        broad ARM SRAM-aperture fallback: it includes bit-band aliases and
+        unimplemented address holes, so treating it as writable RAM can make a
+        malformed RTT descriptor unsafe.
+        """
+        ranges: list[tuple[int, int]] = []
+
+        catalog = self.symbol_catalog
+        catalog_ranges = getattr(catalog, "_ram_ranges", ()) if catalog else ()
+        for start, end in catalog_ranges:
+            ranges.append((int(start), int(end)))
+
+        if self._axf and Path(self._axf).exists() and not catalog_ranges:
+            try:
+                from mklink.elf_backend import writable_memory_ranges
+
+                ranges.extend(writable_memory_ranges(
+                    self._axf,
+                    backend=self._elf_backend,
+                    project_root=self._project_root,
+                    fallback=(),
+                ))
+            except Exception:
+                pass
+
+        try:
+            from mklink.project_config import load_project_info
+
+            project = load_project_info(self._project_root) or {}
+        except Exception:
+            project = {}
+        if isinstance(project, dict):
+            project_regions = project.get("regions") or ()
+            for region in project_regions:
+                if not isinstance(region, dict):
+                    continue
+                try:
+                    start = int(str(region.get("start") or "0"), 0)
+                    size = int(str(region.get("size") or "0"), 0)
+                except (TypeError, ValueError):
+                    continue
+                name = str(region.get("name") or "").lower()
+                if (
+                    size > 0
+                    and start + size <= 0x100000000
+                    and (
+                        any(token in name for token in (
+                            "ram", "sram", "dtcm", "ilm", "dlm",
+                        ))
+                        or (
+                            _SRAM_START <= start < _SRAM_END
+                            and "flash" not in name
+                        )
+                    )
+                ):
+                    ranges.append((start, start + size))
+            try:
+                ram_base = int(str(project.get("ram_base") or "0"), 0)
+                ram_size = int(str(project.get("ram_size") or "0"), 0)
+            except (TypeError, ValueError):
+                ram_base = ram_size = 0
+            if (
+                ram_size > 0
+                and 0 <= ram_base < ram_base + ram_size <= 0x100000000
+            ):
+                ranges.append((ram_base, ram_base + ram_size))
+
+        try:
+            profile = self._get_mcu_profile()
+        except Exception:
+            profile = None
+        if isinstance(profile, dict):
+            try:
+                ram_base = int(str(profile.get("ram_base") or "0"), 0)
+            except (TypeError, ValueError):
+                ram_base = 0
+            for region in profile.get("regions") or ():
+                if not isinstance(region, dict):
+                    continue
+                try:
+                    start = int(str(region.get("start") or "0"), 0)
+                    size = int(str(region.get("size") or "0"), 0)
+                except (TypeError, ValueError):
+                    continue
+                if size <= 0 or start + size > 0x100000000:
+                    continue
+                name = str(region.get("name") or "").lower()
+                looks_like_ram = (
+                    any(token in name for token in ("ram", "sram", "dtcm", "ilm", "dlm"))
+                    or (ram_base != 0 and start == ram_base)
+                    or (
+                        _SRAM_START <= start < _SRAM_END
+                        and "flash" not in name
+                    )
+                )
+                if looks_like_ram:
+                    ranges.append((start, start + size))
+
+        return self._merge_address_ranges(ranges)
+
+    def _target_ram_contains(self, address: int, size: int) -> bool:
+        if address < 0 or size < 0 or address + size > 0x100000000:
+            return False
+        end = address + size
+        return any(
+            start <= address and end <= limit
+            for start, limit in self._target_writable_ram_ranges()
+        )
+
+    def _require_target_ram_range(
+        self, address: int, size: int, *, purpose: str,
+    ) -> None:
+        ranges = self._target_writable_ram_ranges()
+        if not ranges:
+            raise DeviceError(
+                "No trusted target RAM map is available; load an AXF/ELF or "
+                "select a concrete MCU profile before starting RTT/SystemView"
+            )
+        end = address + size
+        if (
+            address < 0
+            or size < 0
+            or end > 0x100000000
+            or not any(start <= address and end <= limit for start, limit in ranges)
+        ):
+            raise DeviceError(
+                f"{purpose} must stay inside known target writable RAM"
+            )
+
+    def validate_rtt_stream_request(
+        self,
+        addr: str | int,
+        *,
+        search_size: int,
+        mode: int,
+    ) -> None:
+        """Validate an RTT/SystemView address window without target I/O."""
+        try:
+            address = int(addr, 0) if isinstance(addr, str) else int(addr)
+        except (TypeError, ValueError) as error:
+            raise ValueError("addr must be a 32-bit integer address") from error
+        if address % 4:
+            raise ValueError("addr must be 4-byte aligned")
+        if mode == 0:
+            span = (search_size or _RTT_DEFAULT_SEARCH_SIZE) + len(_RTT_SIGNATURE) - 1
+            purpose = "RTT scan window"
+        else:
+            span = 24
+            purpose = "RTT control block"
+        self._require_target_ram_range(address, span, purpose=purpose)
+
+    def _find_rtt_control_block(
+        self, start_address: int, search_size: int,
+    ) -> int | None:
+        """Find an aligned RTT signature without entering probe stream mode."""
+        search_size = max(0, int(search_size))
+        if start_address % 4:
+            raise DeviceError("RTT scan address must be 4-byte aligned")
+        scan_span = search_size + len(_RTT_SIGNATURE) - 1
+        self._require_target_ram_range(
+            start_address, scan_span, purpose="RTT scan window",
+        )
+        for offset in range(0, search_size, _RTT_SCAN_CHUNK):
+            candidate_span = min(_RTT_SCAN_CHUNK, search_size - offset)
+            raw = self.read_memory(
+                start_address + offset,
+                candidate_span + len(_RTT_SIGNATURE) - 1,
+            )
+            max_candidate = min(
+                candidate_span,
+                max(0, len(raw) - len(_RTT_SIGNATURE) + 1),
+            )
+            for relative in range(0, max_candidate, 4):
+                if raw[relative:relative + len(_RTT_SIGNATURE)] == _RTT_SIGNATURE:
+                    return start_address + offset + relative
+        return None
+
+    def _parse_rtt_descriptor(
+        self,
+        raw: bytes,
+        *,
+        channel: int,
+        direction: str,
+    ) -> dict[str, Any]:
+        if len(raw) != _RTT_DESCRIPTOR_SIZE:
+            raise DeviceError("RTT descriptor read was truncated")
+        buffer_address = int.from_bytes(raw[4:8], "little")
+        size = int.from_bytes(raw[8:12], "little")
+        write_offset = int.from_bytes(raw[12:16], "little")
+        read_offset = int.from_bytes(raw[16:20], "little")
+        flags = int.from_bytes(raw[20:24], "little")
+        problems: list[str] = []
+        if buffer_address == 0 or size == 0:
+            problems.append("inactive")
+        else:
+            if size > _RTT_MAX_BUFFER_SIZE:
+                problems.append("size exceeds safety limit")
+            if buffer_address + size > 0x100000000:
+                problems.append("buffer address wraps")
+            elif not self._target_ram_contains(buffer_address, size):
+                problems.append("buffer is outside known target writable RAM")
+            if write_offset >= size or read_offset >= size:
+                problems.append("read/write offset is outside the buffer")
+            if flags not in (0, 1, 2):
+                problems.append("unsupported buffer mode")
+        return {
+            "channel": channel,
+            "direction": direction,
+            "buffer_address": buffer_address,
+            "size": size,
+            "write_offset": write_offset,
+            "read_offset": read_offset,
+            "mode": flags,
+            "active": not problems,
+            "name": "",
+            "validation_error": "; ".join(problems),
+        }
+
+    def _read_rtt_control_block(self, control_block_addr: int) -> dict[str, Any]:
+        """Read and validate the standard SEGGER RTT header/descriptors."""
+        if control_block_addr % 4:
+            raise DeviceError("RTT control-block address must be 4-byte aligned")
+        self._require_target_ram_range(
+            control_block_addr, 24, purpose="RTT control block",
+        )
         header = self.read_memory(control_block_addr, 24)
-        if len(header) < 24 or header[:10] != b"SEGGER RTT":
-            return []
+        if len(header) != 24 or header[:10] != _RTT_SIGNATURE:
+            raise DeviceError("RTT control block has an invalid signature")
 
         max_up = int.from_bytes(header[16:20], "little")
         max_down = int.from_bytes(header[20:24], "little")
-        if not 1 <= max_up <= 16 or not 1 <= max_down <= 16:
-            return []
+        if not 1 <= max_up <= _RTT_MAX_TARGET_BUFFERS:
+            raise DeviceError("RTT control block has an invalid UpBuffer count")
+        if not 0 <= max_down <= _RTT_MAX_TARGET_BUFFERS:
+            raise DeviceError("RTT control block has an invalid DownBuffer count")
 
-        down_address = control_block_addr + 24 + max_up * descriptor_size
-        raw = self.read_memory(down_address, max_down * descriptor_size)
-        if len(raw) != max_down * descriptor_size:
-            return []
+        descriptor_count = max_up + max_down
+        descriptor_bytes = descriptor_count * _RTT_DESCRIPTOR_SIZE
+        descriptor_address = control_block_addr + 24
+        self._require_target_ram_range(
+            descriptor_address,
+            descriptor_bytes,
+            purpose="RTT descriptor table",
+        )
+        raw = self.read_memory(descriptor_address, descriptor_bytes)
+        if len(raw) != descriptor_bytes:
+            raise DeviceError("RTT descriptor table read was truncated")
 
-        buffers = []
+        up_buffers = []
+        down_buffers = []
+        for channel in range(max_up):
+            offset = channel * _RTT_DESCRIPTOR_SIZE
+            up_buffers.append(self._parse_rtt_descriptor(
+                raw[offset:offset + _RTT_DESCRIPTOR_SIZE],
+                channel=channel,
+                direction="up",
+            ))
+        down_offset = max_up * _RTT_DESCRIPTOR_SIZE
         for channel in range(max_down):
-            offset = channel * descriptor_size
-            buffer_address = int.from_bytes(raw[offset + 4:offset + 8], "little")
-            size = int.from_bytes(raw[offset + 8:offset + 12], "little")
-            flags = int.from_bytes(raw[offset + 20:offset + 24], "little")
-            buffers.append({
-                "channel": channel,
-                "size": size,
-                "mode": flags,
-                "active": buffer_address != 0 and 0 < size <= 1024 * 1024,
-                "name": "",
-            })
-        return buffers
+            offset = down_offset + channel * _RTT_DESCRIPTOR_SIZE
+            down_buffers.append(self._parse_rtt_descriptor(
+                raw[offset:offset + _RTT_DESCRIPTOR_SIZE],
+                channel=channel,
+                direction="down",
+            ))
+        return {
+            "address": control_block_addr,
+            "max_up_buffers": max_up,
+            "max_down_buffers": max_down,
+            "up_buffers": up_buffers,
+            "down_buffers": down_buffers,
+        }
+
+    @staticmethod
+    def _public_rtt_buffer(descriptor: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "channel": descriptor["channel"],
+            "size": descriptor["size"],
+            "mode": descriptor["mode"],
+            "active": descriptor["active"],
+            "name": descriptor.get("name", ""),
+        }
+
+    def _read_rtt_down_buffers(self, control_block_addr: int) -> list[dict]:
+        info = self._read_rtt_control_block(control_block_addr)
+        return [self._public_rtt_buffer(item) for item in info["down_buffers"]]
+
+    def _validate_rtt_channel(
+        self,
+        info: dict[str, Any],
+        channel: int,
+        *,
+        require_down: bool = False,
+    ) -> dict[str, Any] | None:
+        if info["max_up_buffers"] > _RTT_FIRMWARE_MAX_CHANNELS:
+            raise DeviceError(
+                "Target RTT MaxNumUpBuffers exceeds the V4 probe firmware limit of 3"
+            )
+        if channel >= _RTT_FIRMWARE_MAX_CHANNELS:
+            raise DeviceError(
+                "V4 probe firmware only supports RTT channels 0..2"
+            )
+        up_buffers = info["up_buffers"]
+        if channel >= len(up_buffers):
+            raise DeviceError(
+                f"RTT UpBuffer channel {channel} does not exist in the target"
+            )
+        up = up_buffers[channel]
+        if not up["active"]:
+            reason = up.get("validation_error") or "inactive"
+            raise DeviceError(f"RTT UpBuffer channel {channel} is unsafe: {reason}")
+        if not require_down:
+            return None
+        down_buffers = info["down_buffers"]
+        if channel >= len(down_buffers):
+            raise DeviceError(
+                f"RTT DownBuffer channel {channel} does not exist in the target"
+            )
+        down = down_buffers[channel]
+        if not down["active"]:
+            reason = down.get("validation_error") or "inactive"
+            raise DeviceError(
+                f"RTT DownBuffer channel {channel} is unsafe: {reason}"
+            )
+        return down
 
     def rtt_start(
         self,
-        addr: str | None = None,
+        addr: str | int | None = None,
         *,
         channel: int = 0,
         search_size: int = 1024,
@@ -1085,63 +1642,100 @@ class Device:
             mode: 0=动态搜寻 / 1=静态编译。None 时从 rtt_config.json:rtt_storage_mode 读。
         """
         self._require_connected()
+        addr, channel, search_size, mode = _resolve_rtt_stream_parameters(
+            addr,
+            channel,
+            search_size,
+            mode,
+            self._project_root,
+        )
         if self._rtt_session and self._rtt_session._running:
             self._rtt_session.stop()
+        self._rtt_session = None
+        self._rtt_control_block_info = None
+        self._rtt_write_guard_tail = b""
 
-        # 未显式传入时，从 rtt_config.json 解析
-        rtt_cfg = None
-        if mode is None or not addr:
-            from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
-            rtt_cfg = load_rtt_config(self._project_root)
-        if mode is None:
-            mode = resolve_rtt_storage_mode(rtt_cfg)
-        if mode == 1 and not addr and rtt_cfg:
-            addr = rtt_cfg.get("rtt_addr")
-
-        fallback_down_buffers = []
-        requested_addr = None
-        if addr:
-            try:
-                requested_addr = int(addr, 0)
-                fallback_down_buffers = self._read_rtt_down_buffers(requested_addr)
-            except (TypeError, ValueError, OSError, DeviceError):
-                fallback_down_buffers = []
+        requested_addr = int(addr, 0)
+        self.validate_rtt_stream_request(
+            addr, search_size=search_size, mode=mode,
+        )
+        if mode == 0:
+            host_search_size = search_size or _RTT_DEFAULT_SEARCH_SIZE
+            control_block_addr = self._find_rtt_control_block(
+                requested_addr, host_search_size,
+            )
+            if control_block_addr is None:
+                raise DeviceError("RTT control block was not found in target RAM")
+        else:
+            control_block_addr = requested_addr
+        control_info = self._read_rtt_control_block(control_block_addr)
+        self._validate_rtt_channel(control_info, channel)
+        session_addr = f"0x{control_block_addr:08X}"
+        session_search_size = 4 if mode == 0 else search_size
 
         from mklink.rtt import RTTSession
-        self._rtt_session = RTTSession(self._bridge, channel=channel)
-        result = self._rtt_session.start(
-            addr or "",
-            search_size=search_size,
-            project_root=self._project_root,
-            mode=mode,
-        )
-        if mode == 1 and not result.get("control_block_addr") and fallback_down_buffers:
-            self._rtt_session.reset_failed_start()
-            result = self._rtt_session.start(
-                addr or "",
-                search_size=4,
+        session = RTTSession(self._bridge, channel=channel)
+        self._rtt_session = session
+        try:
+            result = session.start(
+                session_addr,
+                search_size=session_search_size,
                 project_root=self._project_root,
-                mode=0,
+                mode=mode,
             )
-            result["storage_mode"] = 1
-            result["probe_compatibility_mode"] = "bounded-scan"
-        result["down_buffer_probe_count"] = len(fallback_down_buffers)
-        if not result.get("control_block_addr"):
-            raise DeviceError("RTT control block was not found")
-        reported_addr = result.get("control_block_addr")
-        if (
-            fallback_down_buffers
-            and requested_addr is not None
-            and reported_addr
-        ):
+            if (
+                mode == 1
+                and not result.get("control_block_addr")
+            ):
+                session.reset_failed_start()
+                result = session.start(
+                    session_addr,
+                    search_size=4,
+                    project_root=self._project_root,
+                    mode=0,
+                )
+                result["storage_mode"] = 1
+                result["probe_compatibility_mode"] = "bounded-scan"
+            if not result.get("control_block_addr"):
+                raise DeviceError("RTT control block was not found")
             try:
-                reported_matches = int(reported_addr, 0) == requested_addr
-            except (TypeError, ValueError):
-                reported_matches = False
-            if reported_matches:
-                result["down_buffers"] = fallback_down_buffers
-                result["down_buffer_source"] = "target-control-block"
-        return result
+                reported_addr = int(result["control_block_addr"], 0)
+            except (TypeError, ValueError) as error:
+                raise DeviceError("Probe returned an invalid RTT address") from error
+            if reported_addr != control_block_addr:
+                raise DeviceError(
+                    "Probe RTT address does not match the host-validated control block"
+                )
+            result["up_buffers"] = [
+                self._public_rtt_buffer(item)
+                for item in control_info["up_buffers"]
+            ]
+            result["down_buffers"] = [
+                self._public_rtt_buffer(item)
+                for item in control_info["down_buffers"]
+            ]
+            result["up_buffer_probe_count"] = len(control_info["up_buffers"])
+            result["down_buffer_probe_count"] = len(control_info["down_buffers"])
+            result["buffer_source"] = "target-control-block"
+            result["down_buffer_source"] = "target-control-block"
+            self._rtt_control_block_info = control_info
+            self._rtt_write_guard_tail = b""
+            return result
+        except Exception:
+            try:
+                if session._running:
+                    session.stop()
+                else:
+                    session.reset_failed_start()
+            except Exception:
+                # Preserve the original start failure.  reset_failed_start()
+                # already applies a raw-stop fallback before returning.
+                pass
+            if self._rtt_session is session:
+                self._rtt_session = None
+            self._rtt_control_block_info = None
+            self._rtt_write_guard_tail = b""
+            raise
 
     def rtt_read(self, duration: float = 10.0) -> str:
         self._require_connected()
@@ -1161,15 +1755,36 @@ class Device:
             raise DeviceError("RTT not started. Call rtt_start() first.")
         if isinstance(data, str):
             data = data.encode("utf-8")
-        return self._rtt_session.send_input(data)
+        elif not isinstance(data, bytes):
+            raise TypeError("RTT input must be bytes or text")
+        info = self._rtt_control_block_info
+        if not info:
+            raise DeviceError("RTT control-block metadata is unavailable")
+        self._validate_rtt_channel(
+            info, self._rtt_session._channel, require_down=True,
+        )
+        guarded = self._rtt_write_guard_tail + data
+        if _RTT_RESERVED_STOP in guarded:
+            raise DeviceError(
+                "RTT input contains the probe-reserved RTTView.stop() sequence"
+            )
+        keep = max(0, len(_RTT_RESERVED_STOP) - 1)
+        sent = self._rtt_session.send_input(data)
+        self._rtt_write_guard_tail = guarded[-keep:] if keep else b""
+        return sent
 
     def rtt_stop(self) -> str:
-        self._require_connected()
-        if not self._rtt_session:
-            return ""
-        result = self._rtt_session.stop()
-        self._rtt_session = None
-        return result
+        session = self._rtt_session
+        try:
+            self._require_connected()
+            if not session:
+                return ""
+            return session.stop()
+        finally:
+            if self._rtt_session is session:
+                self._rtt_session = None
+            self._rtt_control_block_info = None
+            self._rtt_write_guard_tail = b""
 
     def wait_for_rtt(
         self,
@@ -1181,15 +1796,17 @@ class Device:
         """Wait for RTT output, optionally matching a pattern.
 
         If RTT is not running and ``start_if_needed`` is True, starts it
-        automatically using config or default address.
+        automatically using config or default address. ``pattern`` is a
+        literal substring, not a regular expression.
         """
+        if pattern is not None and type(pattern) is not str:
+            raise ValueError("pattern must be text or None")
         self._require_connected()
         if start_if_needed and (
             not self._rtt_session or not self._rtt_session._running
         ):
             self.rtt_start()
 
-        compiled = re.compile(pattern) if pattern else None
         deadline = time.time() + timeout
         collected = ""
 
@@ -1198,15 +1815,10 @@ class Device:
             chunk = self.rtt_read(min(remaining, 2.0))
             if chunk:
                 collected += chunk
-                if compiled and compiled.search(collected):
-                    return collected
                 if pattern and pattern in collected:
                     return collected
             remaining = deadline - time.time()
 
-        if pattern and pattern not in collected:
-            if compiled and not compiled.search(collected):
-                pass
         return collected
 
     # ------------------------------------------------------------------
@@ -1214,7 +1826,7 @@ class Device:
     # ------------------------------------------------------------------
     def systemview_start(
         self,
-        addr: str | None = None,
+        addr: str | int | None = None,
         *,
         channel: int = 1,
         search_size: int = 1024,
@@ -1229,18 +1841,51 @@ class Device:
             mode: 0=动态搜寻 / 1=静态编译。None 时从 rtt_config.json 读。
         """
         self._require_connected()
-        if self._systemview_session and self._systemview_session._running:
-            self._systemview_session.stop()
-
-        if mode is None:
-            from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
-            rtt_cfg = load_rtt_config(self._project_root)
-            mode = resolve_rtt_storage_mode(rtt_cfg)
+        addr, channel, search_size, mode = _resolve_rtt_stream_parameters(
+            addr,
+            channel,
+            search_size,
+            mode,
+            self._project_root,
+        )
+        old_systemview_session = self._systemview_session
+        if old_systemview_session is not None:
+            try:
+                if old_systemview_session._running:
+                    old_systemview_session.stop()
+            finally:
+                if self._systemview_session is old_systemview_session:
+                    self._systemview_session = None
+                self._systemview_parser = None
 
         # SystemView 与 RTT 共用同一探针 bridge，二者互斥
         if self._rtt_session and self._rtt_session._running:
             self._rtt_session.stop()
             self._rtt_session = None
+        self._rtt_control_block_info = None
+        self._rtt_write_guard_tail = b""
+
+        requested_addr = int(addr, 0)
+        self.validate_rtt_stream_request(
+            addr, search_size=search_size, mode=mode,
+        )
+        if mode == 0:
+            host_search_size = search_size or _RTT_DEFAULT_SEARCH_SIZE
+            control_block_addr = self._find_rtt_control_block(
+                requested_addr, host_search_size,
+            )
+            if control_block_addr is None:
+                raise DeviceError("RTT control block was not found in target RAM")
+        else:
+            control_block_addr = requested_addr
+        control_info = self._read_rtt_control_block(control_block_addr)
+        self._validate_rtt_channel(control_info, channel)
+
+        # SystemView firmware always scans even in static mode.  Passing the
+        # exact host-validated address with the smallest aligned window avoids
+        # probing beyond the trusted target RAM range.
+        session_addr = f"0x{control_block_addr:08X}"
+        session_search_size = 4
 
         sv_defaults = self._systemview_defaults()
         cpu_freq_hint, cpu_freq_source = self._read_cpu_clock_hint()
@@ -1250,31 +1895,73 @@ class Device:
 
         from mklink.systemview import SystemViewSession
         from mklink.systemview_parser import SystemViewParser
-        self._systemview_session = SystemViewSession(self._bridge, channel=channel)
-        result = self._systemview_session.start(
-            addr or "",
-            search_size=search_size,
-            project_root=self._project_root,
-            mode=mode,
-        )
-        # 每次 start 重建解码器，累计时间戳与 name 映射
-        self._systemview_parser = SystemViewParser()
-        # SEGGER ID 还原默认（INIT 包常被 16KB 环形缓冲在高事件率下覆盖）：
-        # STM32 SRAM base 0x20000000 + ID_SHIFT=2（SEGGER 默认，4 字节对齐）。
-        # 这样 task_id 还原成真实 rt_thread 指针，便于直接读线程名。INIT 若抓到
-        # 会覆盖为同值。非 STM32 工程可后续从 MCU profile 取 ram base。
-        self._systemview_parser._ram_base = int(sv_defaults["ram_base"])
-        self._systemview_parser._id_shift = int(sv_defaults["id_shift"])
-        # SystemCoreClock must be read before SystemView switches the bridge
-        # into binary stream mode; command/variable reads are unavailable there.
-        if cpu_freq_hint:
-            self._systemview_parser._cpu_freq = cpu_freq_hint
-            result.setdefault("cpu_freq_hint", cpu_freq_hint)
-            if cpu_freq_source:
-                result.setdefault("cpu_freq_source", cpu_freq_source)
-        result.setdefault("systemview_ram_base", _fmt_hex(int(sv_defaults["ram_base"])))
-        result.setdefault("systemview_id_shift", int(sv_defaults["id_shift"]))
-        return result
+        session = SystemViewSession(self._bridge, channel=channel)
+        self._systemview_session = session
+        self._systemview_parser = None
+        try:
+            result = session.start(
+                session_addr,
+                search_size=session_search_size,
+                project_root=self._project_root,
+                mode=mode,
+            )
+            try:
+                reported_addr = int(result.get("control_block_addr") or "", 0)
+            except (TypeError, ValueError) as error:
+                raise DeviceError("Probe returned an invalid SystemView RTT address") from error
+            if reported_addr != control_block_addr:
+                raise DeviceError(
+                    "Probe SystemView address does not match the host-validated control block"
+                )
+            result["up_buffers"] = [
+                self._public_rtt_buffer(item)
+                for item in control_info["up_buffers"]
+            ]
+            result["down_buffers"] = [
+                self._public_rtt_buffer(item)
+                for item in control_info["down_buffers"]
+            ]
+            result["buffer_source"] = "target-control-block"
+            # 每次 start 重建解码器，累计时间戳与 name 映射
+            self._systemview_parser = SystemViewParser()
+            # SEGGER ID 还原默认（INIT 包常被 16KB 环形缓冲在高事件率下覆盖）：
+            # STM32 SRAM base 0x20000000 + ID_SHIFT=2（SEGGER 默认，4 字节对齐）。
+            # 这样 task_id 还原成真实 rt_thread 指针，便于直接读线程名。INIT 若抓到
+            # 会覆盖为同值。非 STM32 工程可后续从 MCU profile 取 ram base。
+            self._systemview_parser._ram_base = int(sv_defaults["ram_base"])
+            self._systemview_parser._id_shift = int(sv_defaults["id_shift"])
+            # SystemCoreClock must be read before SystemView switches the bridge
+            # into binary stream mode; command/variable reads are unavailable there.
+            if cpu_freq_hint:
+                set_cpu_freq = getattr(self._systemview_parser, "set_cpu_freq", None)
+                if callable(set_cpu_freq):
+                    set_cpu_freq(
+                        cpu_freq_hint,
+                        lock=cpu_freq_source in {"SystemCoreClock", "hpm_core_clock"},
+                    )
+                else:
+                    self._systemview_parser._cpu_freq = cpu_freq_hint
+                result.setdefault("cpu_freq_hint", cpu_freq_hint)
+                if cpu_freq_source:
+                    result.setdefault("cpu_freq_source", cpu_freq_source)
+            result.setdefault(
+                "systemview_ram_base", _fmt_hex(int(sv_defaults["ram_base"])),
+            )
+            result.setdefault("systemview_id_shift", int(sv_defaults["id_shift"]))
+            return result
+        except Exception:
+            try:
+                if session._running:
+                    session.stop()
+                else:
+                    session.reset_failed_start()
+            except Exception:
+                # Cleanup must not replace the actual startup/parser failure.
+                pass
+            if self._systemview_session is session:
+                self._systemview_session = None
+            self._systemview_parser = None
+            raise
 
     def systemview_read_bytes(
         self, duration: float = 2.0, max_bytes: int | None = None
@@ -1315,12 +2002,15 @@ class Device:
 
     def systemview_stop(self) -> None:
         """停止 SystemView 采集。"""
-        self._require_connected()
-        if not self._systemview_session:
-            return
-        self._systemview_session.stop()
-        self._systemview_session = None
-        self._systemview_parser = None
+        session = self._systemview_session
+        try:
+            self._require_connected()
+            if session:
+                session.stop()
+        finally:
+            if self._systemview_session is session:
+                self._systemview_session = None
+            self._systemview_parser = None
 
     def systemview_resolve_task_names(
         self, task_ids: list[int]
@@ -1383,6 +2073,49 @@ class Device:
         cmd = f"cmd.read_ram(0x{address:08X}, {size})"
         raw = self._bridge.send_command(cmd, timeout=10.0)
         return parse_read_ram_response(raw)
+
+    def read_memory_regions(self, regions: list[tuple[int, int]]) -> list[bytes]:
+        """Read several regions while coalescing contiguous target ranges.
+
+        Results preserve input order. Only overlapping or exactly adjacent
+        ranges are merged, so peripheral gaps are never read implicitly.
+        This makes the common 16-scalar snapshot one REPL/SWD transaction when
+        the variables are laid out contiguously instead of sixteen round trips.
+        """
+        self._require_connected()
+        if not regions:
+            return []
+        normalized: list[tuple[int, int, int]] = []
+        for index, pair in enumerate(regions):
+            if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+                raise ValueError(f"regions[{index}] must be an (address, size) pair")
+            address, size = pair
+            if type(address) is not int or not 0 <= address <= 0xFFFFFFFF:
+                raise ValueError(f"regions[{index}] address is outside 32-bit range")
+            if type(size) is not int or size <= 0 or address + size > 0x100000000:
+                raise ValueError(f"regions[{index}] size is invalid")
+            normalized.append((address, address + size, index))
+
+        groups: list[dict[str, Any]] = []
+        for start, end, index in sorted(normalized):
+            if groups and start <= groups[-1]["end"]:
+                groups[-1]["end"] = max(groups[-1]["end"], end)
+                groups[-1]["members"].append((start, end, index))
+            else:
+                groups.append({"start": start, "end": end, "members": [(start, end, index)]})
+
+        results: list[bytes | None] = [None] * len(regions)
+        for group in groups:
+            start = group["start"]
+            payload = self.read_memory(start, group["end"] - start)
+            expected = group["end"] - start
+            if len(payload) != expected:
+                raise DeviceError(
+                    f"memory read returned {len(payload)} bytes, expected {expected}"
+                )
+            for member_start, member_end, index in group["members"]:
+                results[index] = payload[member_start - start:member_end - start]
+        return [value if value is not None else b"" for value in results]
 
     def write_memory(self, address: int, data: bytes) -> None:
         self._require_connected()
@@ -1685,10 +2418,12 @@ class Device:
 def connect(
     *,
     port: str | None = None,
+    preferred_port: str | None = None,
     axf: str | None = None,
     mcu: str | None = None,
     project_root: str = ".",
     elf_backend: str | None = None,
+    initialize_target_now: bool = True,
 ) -> Device:
     """Create and connect a Device.
 
@@ -1698,7 +2433,8 @@ def connect(
             dev.flash("build/out.hex")
 
     Args:
-        port: COM port. Auto-detected if not specified.
+        port: Explicit COM port. Auto-detected if not specified.
+        preferred_port: Soft preference used before automatic discovery.
         axf: Path to AXF/ELF file for symbol resolution.
         mcu: MCU profile hint (e.g. "stm32f4").
         project_root: Project root for .mklink/ config lookup.
@@ -1706,12 +2442,39 @@ def connect(
     """
     dev = Device(
         port=port,
+        preferred_port=preferred_port,
         axf=axf,
         mcu=mcu,
         project_root=project_root,
         elf_backend=elf_backend,
+        initialize_target_now=initialize_target_now,
     )
     dev._connect()
+    # HIL-Infra lockd 协议互操作：connect 成功即持有 transport_usb-serial_<COM>，
+    # close() 释放；与 hil_core.lockd 编排器在同一锁名上互斥（T5 原生对齐）。
+    from mklink.hil_lock import HilFileLock, transport_lock_name
+    hil_lock = HilFileLock(
+        transport_lock_name("usb-serial", dev.port),
+        owner_id=f"mklink-{os.getpid()}",
+    )
+    try:
+        hil_lock.acquire()
+    except Exception:
+        dev.close()
+        raise
+    dev._hil_lock = hil_lock
+    # 长会话自动续租：按 lease/3 心跳防止超时会话的锁被回收；close 停止
+    renew_stop = threading.Event()
+
+    def _hil_renew_loop():
+        while not renew_stop.wait(hil_lock.lease_s / 3):
+            if not hil_lock.renew():
+                return  # 所有权丢失（被回收）——停止续租，断连时如实释放
+
+    dev._hil_renew_stop = renew_stop
+    dev._hil_renew_thread = threading.Thread(target=_hil_renew_loop,
+                                             daemon=True, name="hil-lock-renew")
+    dev._hil_renew_thread.start()
     return dev
 
 
@@ -1721,24 +2484,13 @@ def discover_all() -> list[dict]:
     Returns a list of dicts, each with keys:
         port, description, manufacturer
     """
-    from mklink._types import KNOWN_MKLINK_VID_PIDS
-    from mklink.discovery import list_available_ports, _probe_port
-    ports = list_available_ports()
-    results: list[dict] = []
-    for p in ports:
-        mfr = (p.get("manufacturer") or "").lower()
-        desc = (p.get("description") or "").lower()
-        vid_pid = (p.get("vid"), p.get("pid"))
-        known_identity = (
-            any(kw in mfr for kw in ("microkeen", "microlink", "mklink"))
-            or any(kw in desc for kw in ("microkeen", "microlink", "mklink"))
-            or vid_pid in KNOWN_MKLINK_VID_PIDS
-        )
-        if not known_identity and not _probe_port(p["device"]):
-            continue
-        results.append({
-            "port": p["device"],
-            "description": p.get("description", ""),
-            "manufacturer": p.get("manufacturer", ""),
-        })
-    return results
+    from mklink.discovery import discover_mklink_command_ports
+
+    return [
+        {
+            "port": item.device,
+            "description": str(getattr(item, "description", "") or ""),
+            "manufacturer": str(getattr(item, "manufacturer", "") or ""),
+        }
+        for item in discover_mklink_command_ports()
+    ]

@@ -8,32 +8,16 @@ VPN/局域网站点、独立 Site Agent、工程师侧 remote CLI/SDK/MCP 请改
 
 ## 依赖安装
 
-GUI 与 Tauri 桌面应用依赖安装详见 [references/install.md](install.md) 的「GUI 依赖」章节。
+Python Web GUI 需要运行依赖和已打包的 Web 资源；桌面安装包自带后端。见[安装说明](install.md)，无需编译 MKLink。
 
 
 ## Web GUI（浏览器模式）
 
-### High-rate binary stream data plane
+### 采集与显示
 
-SystemView, VOFA, RTT, and SuperWatch high-rate payloads are delivered through
-`/ws/streams/{name}` as versioned binary frames. REST and SSE remain control or
-legacy low-rate paths; clients must not use their copied event arrays for the
-high-rate render loop. The browser transfers each `ArrayBuffer` to a Worker,
-which owns bounded typed rings and reports transport gaps separately from
-backend-reported drops.
-
-Visible charts are decimated to a min/max pixel envelope and scheduled at no
-more than 30 FPS. Pausing a chart or hiding the document suppresses render work
-without stopping acquisition. Use the short transport gate before release:
-
-```powershell
-python -m pytest _maintainer/testing/tests/test_stream_performance.py -q
-```
-
-This ten-second local gate targets 10,000 aggregate samples/s and is not MKLink
-HIL. For physical rate sweeps, 30-minute zero-drop soaks, packaged-app checks,
-and the required evidence fields, follow
-[`docs/verification/high-throughput-streams.md`](../docs/verification/high-throughput-streams.md).
+RTT、SystemView、VOFA 和 SuperWatch 的图表暂停或页面隐藏只减少绘制，不停止采集。
+要释放探针或串口需明确停止对应会话；传输丢帧与设备端丢样分开报告，不把图表
+抽样显示当作原始数据丢失。
 
 ### serve — 远程调试服务器
 
@@ -49,7 +33,7 @@ python -m mklink serve --host 127.0.0.1 --port 8765
 ### gui — 一键启动 Web GUI
 
 ```powershell
-# 一键启动（自动构建前端、启动后端、打开浏览器）
+# 一键启动（使用已打包前端、启动后端、打开浏览器）
 python -m mklink gui
 
 # 指定端口和设备
@@ -64,7 +48,9 @@ GUI 启动后在浏览器中提供三个主页面：
 - **仪表盘页** (`/dashboard`) — RTT View、烧录、调试控制、串口、Modbus、SuperWatch
 - **在线烧录页** (`/online-flash`) — MKLink-only 探针、目标/Pack、HEX/BIN 检查与预览、烧录任务和 SSE 日志
 
-浏览器版“配置 > 文件来源”可直接选择本机 AXF/ELF/OUT 和 MAP 文件。浏览器
+浏览器版“配置 > 文件来源”可直接选择本机 AXF/ELF/OUT 文件。AXF/ELF/OUT
+已经包含 SuperWatch 符号、类型信息，也可用于 RTT/SystemView 地址搜索，用户不需要
+再手动加载 MAP 文件。浏览器
 不会暴露本机绝对路径，因此前端使用 multipart 将文件上传到本机 Mklink 服务的
 受控 `.mklink/uploads/file-sources` 目录，再把服务端路径用于连接和符号解析。
 单文件上限为 256 MiB；Tauri 桌面版继续使用原生文件对话框，不经过上传。
@@ -88,20 +74,10 @@ sidecar 的所有权。平台安装位置、权限和故障排查见
 
 Tauri v2 将 Vue 3 前端包装为原生桌面应用，内嵌 Python FastAPI sidecar。
 
-### 开发模式
-
-需要两个终端：
-
-```powershell
-# 终端 1：启动 Python 后端
-python -m mklink serve --port 8765
-
-# 终端 2：启动 Tauri 窗口（自动编译 Rust + 启动 Vite dev server）
-cd gui
-npx tauri dev
-```
-
-开发模式下 Tauri 窗口连接 `http://localhost:8765` 上的 Python 后端。前端热重载通过 Vite dev server (port 5173) 实现。
+Windows 标准 NSIS 安装包采用 per-machine 安装，在安装结束后以非阻断方式检查
+当前在线的 MKLink V2/V3/V4，并为完整校验通过的 CDC 接口设置可区分的设备管理器
+名称。安装时没有连接下载器时，可在“配置 > 本地设备”使用“修改端口名称”；
+“恢复名称”会请求 UAC 并恢复 Windows 驱动默认显示。浏览器版不提供注册表操作。
 
 ## 在线烧录 API
 
@@ -117,29 +93,9 @@ npx tauri dev
 | 启动/查询/停止任务 | `POST /jobs`、`GET /jobs/active`、`GET /jobs/{job_id}`、`POST /jobs/{job_id}/stop` |
 | 重放式任务事件 | `GET /jobs/{job_id}/events?after={sequence}` (SSE) |
 
-Pack 索引、已安装 Pack 和临时上传均位于用户数据根目录，Windows 默认为 `%LOCALAPPDATA%\MKLink\pyocd`；可在启动服务前设置 `MKLINK_PYOCD_HOME` 覆盖。这些缓存不是仓库或 Tauri 发布资源，`.pack`、上传文件和测试产物不应进入 Git。更新索引和下载 Pack 继承服务进程的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 环境；断网时可用最后一份有效索引和已安装 Pack。
+Pack 索引、已安装 Pack 和临时上传均位于用户数据根目录，Windows 默认为 `%LOCALAPPDATA%\MKLink\pyocd`；可在启动服务前设置 `MKLINK_PYOCD_HOME` 覆盖。可复用已下载的 Pack 缓存。更新索引和下载 Pack 继承服务进程的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 环境；断网时可用最后一份有效索引和已安装 Pack。
 
 在线烧录会申请 `TARGET_DEBUG` 资源，与 RTT、SystemView、VOFA、SuperWatch 等会话冲突时返回 HTTP 409 及当前 owner/resource；先停止或由用户确认交接冲突会话。`POST /jobs/{job_id}/stop` 只设置协作式取消：运行中的底层操作返回后，任务才进入 `stopped`，执行 disconnect 并释放租约。页面显示“停止中”时不要立即开启新任务或拔除探针。
-
-### 发布构建
-
-```powershell
-cd gui
-
-# 1. 打包 Python 后端为 sidecar
-pip install pyinstaller
-pyinstaller --onefile --name mklink-sidecar --collect-all mklink -p .. ..\mklink\__main__.py
-New-Item -ItemType Directory -Force -Path "src-tauri\binaries" | Out-Null
-Copy-Item dist\mklink-sidecar.exe "src-tauri\binaries\mklink-sidecar-x86_64-pc-windows-msvc.exe" -Force
-
-# 2. 构建 Tauri 安装包
-npx tauri build
-```
-
-产物位于 `gui/src-tauri/target/release/bundle/`：
-- `msi/` — Windows Installer 包
-- `nsis/` — NSIS 安装包
-
 
 ## Dashboard 生命周期
 

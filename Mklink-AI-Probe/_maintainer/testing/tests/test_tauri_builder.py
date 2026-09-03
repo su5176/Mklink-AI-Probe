@@ -33,7 +33,10 @@ def source_tree_digest(source: Path, relative_names: list[str]) -> str:
 
 
 @pytest.fixture
-def builder():
+def builder(monkeypatch, tmp_path):
+    # A test launched through the workspace must never delete the shared cache.
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
+    monkeypatch.setenv("MKLINK_BUILD_WORK_DIR", str(tmp_path / "build-work"))
     spec = importlib.util.spec_from_file_location("mklink_tauri_builder", BUILDER_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -111,7 +114,9 @@ def test_release_bundle_forces_sidecar_rebuild(builder, monkeypatch, tmp_path):
 def test_tauri_build_injects_packaged_api_origin(builder, monkeypatch, tmp_path):
     builder.GUI_DIR = tmp_path
     builder.TAURI_DIR = tmp_path / "src-tauri"
-    executable = builder.TAURI_DIR / "target" / "release" / "mklink-ai-probe.exe"
+    target = tmp_path / "shared-cargo"
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(target))
+    executable = target / "release" / "mklink-ai-probe.exe"
     executable.parent.mkdir(parents=True)
     executable.write_bytes(b"exe")
     calls = []
@@ -124,6 +129,66 @@ def test_tauri_build_injects_packaged_api_origin(builder, monkeypatch, tmp_path)
     builder.build_tauri(bundle=False)
 
     assert calls[0][1]["env"]["VITE_MKLINK_API"] == "http://127.0.0.1:8765"
+    assert calls[0][1]["env"]["CARGO_TARGET_DIR"] == str(target)
+
+
+def test_release_bundle_cleans_sidecar_when_stcp_staging_fails(builder, monkeypatch, tmp_path):
+    builder.TAURI_DIR = tmp_path
+    sidecar = tmp_path / "binaries" / "mklink-sidecar-x86_64-pc-windows-msvc.exe"
+    sidecar.parent.mkdir()
+    sidecar.write_bytes(b"sidecar")
+    monkeypatch.setattr(builder, "load_updater_private_key", lambda: "test-key")
+    monkeypatch.setattr(builder, "build_sidecar", lambda force=False: True)
+
+    def fail_staging():
+        raise RuntimeError("STCP missing")
+
+    monkeypatch.setattr(builder, "stage_stcp_library", fail_staging)
+    with pytest.raises(RuntimeError, match="STCP missing"):
+        builder.build_release_bundle()
+    assert not sidecar.exists()
+
+
+def test_clean_preserves_reusable_cache_and_frontend_runtime(builder, tmp_path, monkeypatch):
+    target = tmp_path / "shared-cargo"
+    target.mkdir()
+    cached = target / "cached.o"
+    cached.write_bytes(b"reusable")
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(target))
+    builder.GUI_DIR = tmp_path / "gui"
+    runtime = builder.GUI_DIR / "dist" / "index.html"
+    runtime.parent.mkdir(parents=True)
+    runtime.write_text("runtime", encoding="utf-8")
+
+    builder.clean()
+
+    assert cached.read_bytes() == b"reusable"
+    assert runtime.read_text(encoding="utf-8") == "runtime"
+
+
+def test_sidecar_uses_managed_pyinstaller_work_paths(builder, tmp_path, monkeypatch):
+    builder.SKILL_DIR = tmp_path / "source"
+    builder.TAURI_DIR = builder.SKILL_DIR / "gui" / "src-tauri"
+    monkeypatch.setattr(builder, "builtin_pack_roots", lambda: [])
+    monkeypatch.setattr(builder, "daplinkutility_executable", lambda: None)
+    calls = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        output = Path(command[command.index("--distpath") + 1])
+        output.mkdir(parents=True)
+        (output / "mklink-sidecar.exe").write_bytes(b"sidecar")
+        return 0
+
+    monkeypatch.setattr(builder, "run", fake_run)
+
+    assert builder.build_sidecar(force=True)
+    for option in ("--distpath", "--workpath", "--specpath"):
+        assert Path(calls[0][calls[0].index(option) + 1]).is_relative_to(
+            tmp_path / "build-work"
+        )
+    assert not (builder.SKILL_DIR / "dist").exists()
+    assert not (builder.SKILL_DIR / "build").exists()
 
 
 def test_release_bundle_removes_stale_bundle_outputs(builder, monkeypatch, tmp_path):
@@ -190,6 +255,7 @@ def test_bundle_config_preserves_product_version_and_builds_only_nsis(builder, t
         assert '"version": "0.1.0-rc.1"' in patched
         assert '"targets": [' in patched
         assert '"nsis"' in patched
+        assert '"useLocalToolsDir": true' in patched
         assert '"msi"' not in patched
         assert '"externalBin"' in patched
         assert '"resources/mklink-stcp.dll": "mklink-stcp.dll"' in patched
@@ -282,6 +348,42 @@ def test_tauri_bundle_includes_complete_third_party_license_texts():
     assert "http://unlicense.org/" in notices
 
 
+def test_tauri_bundle_integrates_mklink_usb_port_naming():
+    tauri_dir = PROJECT_ROOT / "gui" / "src-tauri"
+    config = json.loads((tauri_dir / "tauri.conf.json").read_text(encoding="utf-8"))
+    nsis = config["bundle"]["windows"]["nsis"]
+    hook = (tauri_dir / "installer-hooks.nsh").read_text(encoding="utf-8")
+
+    assert nsis["installMode"] == "perMachine"
+    assert nsis["installerHooks"] == "installer-hooks.nsh"
+    assert "NSIS_HOOK_PREINSTALL" in hook
+    # Never start a second uninstaller around Tauri's native /UPDATE path.
+    preinstall = hook.split("!macro NSIS_HOOK_PREINSTALL", 1)[1].split("!macroend", 1)[0]
+    assert "Exec" not in preinstall
+    assert "UninstallString" not in hook
+    assert "MKLINK_REMOVE_OLD_INSTALL" not in hook
+    assert 'ReadRegStr $MklinkLegacyInstallDir HKCU "${MANUPRODUCTKEY}" ""' in preinstall
+    assert 'MKLINK_RETARGET_LEGACY_SHORTCUT "$DESKTOP\\${PRODUCTNAME}.lnk"' in hook
+    assert 'MKLINK_RETARGET_LEGACY_SHORTCUT "$SMPROGRAMS\\${PRODUCTNAME}.lnk"' in hook
+    assert 'IsShortcutTarget "${SHORTCUT}" "$MklinkLegacyInstallDir\\${MAINBINARYNAME}.exe"' in hook
+    assert "NSIS_HOOK_POSTINSTALL" in hook
+    assert "Initializing MKLink USB serial port naming" in hook
+    assert "the helper still runs successfully" in hook
+    assert "--manage-usb-port-names apply" in hook
+    assert "$INSTDIR\\mklink-ai-probe.exe" in hook
+    assert 'ReadRegStr $0 HKCU "Software\\Classes\\mklink-ai-probe\\shell\\open\\command" ""' in hook
+    assert '"FriendlyTypeName" "MKLink Web GUI"' in hook
+    assert '"ApplicationName" "MKLink Web GUI"' in hook
+    assert "MKLink AI Probe Web GUI Launcher" in hook
+    # The installer only adds friendly metadata and never reroutes the portable
+    # cross-platform Web launcher to the Windows-only desktop executable.
+    protocol_block = hook.split("Keep the portable HTML launcher cross-platform", 1)[1]
+    protocol_block = protocol_block.split("Apply naming immediately", 1)[0]
+    assert "shell\\open\\command\" \"\"" in protocol_block
+    assert "WriteRegStr" in protocol_block
+    assert "$INSTDIR\\${MAINBINARYNAME}.exe" not in protocol_block
+
+
 def test_stable_product_version_and_signed_updater_are_configured():
     pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     cargo = (PROJECT_ROOT / "gui" / "src-tauri" / "Cargo.toml").read_text(
@@ -334,7 +436,7 @@ def test_sidecar_collects_pyocd_plugins_metadata_and_hid_binary(builder, monkeyp
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = tmp_path / "dist" / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0
@@ -355,7 +457,8 @@ def test_skill_defaults_axf_to_builtin_parser():
     text = (PROJECT_ROOT / "SKILL.md").read_text(encoding="utf-8")
 
     assert "默认使用内置 pyelftools" in text
-    assert "仅在用户明确指定" in text
+    assert "明确指定" in text
+    assert "elf_backend=external" in text
 
 
 def test_builtin_pack_builder_keeps_only_descriptor_algorithms_and_licenses(
@@ -833,7 +936,7 @@ def test_sidecar_collects_generated_builtin_pack_bundle(builder, monkeypatch, tm
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = tmp_path / "dist" / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0
@@ -870,7 +973,7 @@ def test_sidecar_collects_generated_daplinkutility_flm_bundle(
 
     def fake_run(command, **_kwargs):
         commands.append(command)
-        output = tmp_path / "dist" / "mklink-sidecar.exe"
+        output = Path(command[command.index("--distpath") + 1]) / "mklink-sidecar.exe"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_bytes(b"sidecar")
         return 0

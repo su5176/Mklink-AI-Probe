@@ -19,6 +19,13 @@ import ModbusTab from './ModbusTab.vue'
 describe('ModbusTab prerequisites', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      running: false,
+      loop: { running: false, completed: 0, errors: 0 },
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    })))
     mocks.listPorts.mockResolvedValue([{
       device: 'SERIAL_PORT', description: 'Virtual serial', manufacturer: 'test', vid: null, pid: null,
     }])
@@ -34,12 +41,12 @@ describe('ModbusTab prerequisites', () => {
   })
 
   it('surfaces the backend serial-port conflict instead of entering running state', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
       detail: { conflict: 'user:dashboard:serial', resource: 'serial_port' },
     }), {
       status: 409,
       headers: { 'Content-Type': 'application/json' },
-    })))
+    }))))
     const wrapper = mount(ModbusTab)
     await flushPromises()
 

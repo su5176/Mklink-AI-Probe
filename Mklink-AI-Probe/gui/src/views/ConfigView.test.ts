@@ -1,5 +1,5 @@
 import { flushPromises, mount } from '@vue/test-utils'
-import { readonly, ref } from 'vue'
+import { nextTick, readonly, ref } from 'vue'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const mocks = vi.hoisted(() => {
@@ -16,24 +16,28 @@ const mocks = vi.hoisted(() => {
     deviceStatus,
     api: {
       listPorts: vi.fn(),
-      discoverPort: vi.fn(),
       getConfig: vi.fn(),
       updateConfig: vi.fn(),
       connectDevice: vi.fn(),
       disconnectDevice: vi.fn(),
       parseAxf: vi.fn(),
+      findRtt: vi.fn(),
       uploadFileSource: vi.fn(),
       probeFirmwareCheck: vi.fn(),
+      upgradeProbeFirmware: vi.fn(),
+      downloadProbeFirmware: vi.fn(),
     },
     wsConnect: vi.fn(),
     wsDisconnect: vi.fn(),
     toastError: vi.fn(),
     toastSuccess: vi.fn(),
+    toastWarn: vi.fn(),
+    invoke: vi.fn(),
     loadDesktopSettings: vi.fn(),
     saveDesktopSettings: vi.fn(),
     pickSymbolFile: vi.fn(),
-    pickMapFile: vi.fn(),
     refreshSymbolCatalog: vi.fn(),
+    saveBlobFile: vi.fn(),
   }
 })
 
@@ -50,8 +54,12 @@ vi.mock('../composables/useMklinkWs', () => ({
 }))
 
 vi.mock('../composables/useToast', () => ({
-  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess }),
+  useToast: () => ({ error: mocks.toastError, success: mocks.toastSuccess, warn: mocks.toastWarn }),
 }))
+
+vi.mock('@tauri-apps/api/core', () => ({ invoke: mocks.invoke }))
+
+vi.mock('../lib/runtimeEndpoint', () => ({ IS_TAURI: true }))
 
 vi.mock('../lib/desktopSettings', async importOriginal => ({
   ...await importOriginal<typeof import('../lib/desktopSettings')>(),
@@ -61,12 +69,21 @@ vi.mock('../lib/desktopSettings', async importOriginal => ({
 
 vi.mock('../lib/filePicker', () => ({
   pickSymbolFile: mocks.pickSymbolFile,
-  pickMapFile: mocks.pickMapFile,
+}))
+
+vi.mock('../lib/downloadTextFile', () => ({
+  saveBlobFile: mocks.saveBlobFile,
 }))
 
 vi.mock('../composables/useSymbolCatalog', () => ({
   useSymbolCatalog: () => ({ ensureLoaded: mocks.refreshSymbolCatalog }),
 }))
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(done => { resolve = done })
+  return { promise, resolve }
+}
 
 async function mountView() {
   const { default: ConfigView } = await import('./ConfigView.vue')
@@ -85,6 +102,7 @@ describe('ConfigView', () => {
   beforeEach(() => {
     vi.clearAllMocks()
     mocks.api.parseAxf.mockReset()
+    mocks.api.findRtt.mockReset()
     Object.assign(mocks.deviceStatus, {
       connected: false,
       state: 'disconnected',
@@ -94,9 +112,9 @@ describe('ConfigView', () => {
       axf: { loaded: false },
     })
     mocks.api.listPorts.mockResolvedValue([
+      { device: 'TEST_PORT_A', description: 'MKLink A', manufacturer: 'MicroLink', vid: 1, pid: 2 },
       { device: 'TEST_PORT_B', description: 'MKLink', manufacturer: 'MicroLink', vid: 1, pid: 2 },
     ])
-    mocks.api.discoverPort.mockResolvedValue({ port: 'TEST_PORT_B' })
     mocks.api.getConfig.mockResolvedValue({ com_port: 'TEST_PORT_A', swd_clock: '2000000' })
     mocks.api.updateConfig.mockResolvedValue({})
     mocks.api.connectDevice.mockResolvedValue({})
@@ -106,27 +124,37 @@ describe('ConfigView', () => {
       axf_path: 'C:\\saved\\app.axf',
       variable_count: 3,
     })
+    mocks.api.findRtt.mockResolvedValue({ found: false, addr: null })
     mocks.api.uploadFileSource.mockResolvedValue({ path: '' })
     mocks.refreshSymbolCatalog.mockResolvedValue(undefined)
     mocks.api.probeFirmwareCheck.mockResolvedValue({ status: 'ok' })
+    mocks.api.upgradeProbeFirmware.mockResolvedValue({ status: 'up_to_date' })
+    mocks.api.downloadProbeFirmware.mockResolvedValue({
+      blob: new Blob(['uf2']),
+      filename: 'MicroLink_V3.3.7.uf2',
+      version: 'V3.3.7',
+      source: 'github',
+    })
+    mocks.invoke.mockResolvedValue({ status: 'completed' })
+    mocks.saveBlobFile.mockResolvedValue(true)
     mocks.loadDesktopSettings.mockReturnValue({
       version: 1,
       symbolPath: 'C:\\saved\\app.axf',
-      mapPath: 'C:\\saved\\app.map',
       rttAddress: '',
       transmitMode: 'text',
       lineEnding: '',
       sendHistory: [],
     })
+    mocks.saveDesktopSettings.mockImplementation((_storage: Storage, next: any) => ({ ...next }))
     mocks.pickSymbolFile.mockResolvedValue(null)
-    mocks.pickMapFile.mockResolvedValue(null)
     vi.spyOn(window, 'open').mockImplementation(() => null)
+    vi.stubGlobal('confirm', vi.fn().mockReturnValue(true))
   })
 
-  it('renders one four-section workspace with Local Device selected by default', async () => {
+  it('renders one five-section workspace with Local Device selected by default', async () => {
     const wrapper = await mountView()
 
-    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(4)
+    expect(wrapper.findAll('[data-testid="config-section"]')).toHaveLength(5)
     expect(wrapper.get('[data-testid="config-section-local"]').attributes('aria-current')).toBe('page')
     expect(wrapper.get('[data-testid="local-device-panel"]').exists()).toBe(true)
 
@@ -136,7 +164,26 @@ describe('ConfigView', () => {
     expect(text).not.toContain('MCU 类型')
     expect(text).not.toContain('MCU 提示')
     expect(text).not.toContain('高级配置 (RTT)')
+    expect(text).not.toContain('探针电源与重启')
+    expect(text).not.toContain('VCC')
+    expect(text).not.toContain('重启 MKLink')
+    expect(wrapper.find('[data-testid="probe-controls"]').exists()).toBe(false)
     expect(wrapper.find('[data-testid="device-status"]').exists()).toBe(false)
+  })
+
+  it('runs elevated USB port rename and restore actions from the local panel', async () => {
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="rename-usb-ports"]').trigger('click')
+    await flushPromises()
+    expect(mocks.invoke).toHaveBeenCalledWith('rename_usb_ports', { action: 'apply' })
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('端口名称处理完成'))
+
+    await wrapper.get('[data-testid="restore-usb-ports"]').trigger('click')
+    await flushPromises()
+    expect(mocks.invoke).toHaveBeenCalledWith('rename_usb_ports', { action: 'restore' })
+    expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('端口名称已恢复'))
+    expect(wrapper.get('[data-testid="usb-port-naming"]').exists()).toBe(true)
   })
 
   it('distinguishes readable variables from DWARF type definitions', async () => {
@@ -173,17 +220,117 @@ describe('ConfigView', () => {
       .toContain('C:\\old\\firmware.axf')
   })
 
-  it('connects locally with the configured port and saved AXF path without an MCU hint', async () => {
+  it('uses the restored port as a soft preference when connecting', async () => {
     const wrapper = await mountView()
 
     await wrapper.get('[data-testid="connect-local"]').trigger('click')
     await flushPromises()
 
     expect(mocks.api.connectDevice).toHaveBeenCalledWith({
-      port: 'TEST_PORT_A',
+      restore_last: true,
       axf: 'C:\\saved\\app.axf',
     })
     expect(mocks.api.connectDevice.mock.calls[0][0]).not.toHaveProperty('mcu')
+  })
+
+  it('shows Auto Search and discovers on connect when no port has been saved', async () => {
+    mocks.api.getConfig.mockResolvedValue({})
+    const wrapper = await mountView()
+
+    const portSelect = wrapper.get<HTMLSelectElement>('[data-testid="local-port"]')
+    expect(portSelect.element.value).toBe('')
+    expect(portSelect.text()).toContain('自动搜索')
+
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.connectDevice).toHaveBeenCalledWith({
+      restore_last: true,
+      axf: 'C:\\saved\\app.axf',
+    })
+  })
+
+  it('falls back to Auto Search after a restored connection fails', async () => {
+    mocks.api.connectDevice
+      .mockRejectedValueOnce(new Error('saved port unavailable'))
+      .mockResolvedValueOnce({ port: 'TEST_PORT_B' })
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('')
+
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.connectDevice).toHaveBeenNthCalledWith(2, {
+      restore_last: true,
+      axf: 'C:\\saved\\app.axf',
+    })
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value)
+      .toBe('TEST_PORT_B')
+  })
+
+  it('shows Auto Search when the restored port is no longer available', async () => {
+    mocks.api.listPorts.mockResolvedValue([
+      { device: 'TEST_PORT_B', description: 'MKLink', manufacturer: 'MicroLink', vid: 1, pid: 2 },
+    ])
+    const wrapper = await mountView()
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('')
+    expect(wrapper.get('[data-testid="local-port"]').text()).toContain('自动搜索')
+  })
+
+  it('keeps a port selected in the current session as a strict connection target', async () => {
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="local-port"]').setValue('TEST_PORT_B')
+    await flushPromises()
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.connectDevice).toHaveBeenCalledWith({
+      port: 'TEST_PORT_B',
+      axf: 'C:\\saved\\app.axf',
+    })
+  })
+
+  it('switches a failed strict connection to Auto Search for the next attempt', async () => {
+    mocks.api.connectDevice
+      .mockRejectedValueOnce(new Error('selected port unavailable'))
+      .mockResolvedValueOnce({ port: 'TEST_PORT_A' })
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="local-port"]').setValue('TEST_PORT_B')
+    await flushPromises()
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.connectDevice).toHaveBeenNthCalledWith(1, {
+      port: 'TEST_PORT_B',
+      axf: 'C:\\saved\\app.axf',
+    })
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="local-port"]').element.value).toBe('')
+
+    await wrapper.get('[data-testid="connect-local"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.connectDevice).toHaveBeenNthCalledWith(2, {
+      restore_last: true,
+      axf: 'C:\\saved\\app.axf',
+    })
+  })
+
+  it('persists Auto Search by clearing the configured port', async () => {
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="local-port"]').setValue('')
+    await flushPromises()
+
+    expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
+      com_port: '',
+    }))
   })
 
   it('fills the detected serial port after an automatic connection succeeds', async () => {
@@ -198,16 +345,15 @@ describe('ConfigView', () => {
       .toBe('TEST_PORT_B')
   })
 
-  it('automatically saves serial discovery and SWD changes without a save button', async () => {
+  it('automatically saves SWD changes without a save button or auto-discover action', async () => {
     const wrapper = await mountView()
 
-    await wrapper.get('[data-testid="auto-port"]').trigger('click')
+    expect(wrapper.find('[data-testid="auto-port"]').exists()).toBe(false)
     await wrapper.get('[data-testid="swd-clock"]').setValue('4000000')
     await flushPromises()
 
-    expect(mocks.api.discoverPort).toHaveBeenCalledOnce()
     expect(mocks.api.updateConfig).toHaveBeenCalledWith(expect.objectContaining({
-      com_port: 'TEST_PORT_B',
+      com_port: 'TEST_PORT_A',
       swd_clock: '4000000',
     }))
     expect(wrapper.find('[data-testid="save-local"]').exists()).toBe(false)
@@ -227,14 +373,28 @@ describe('ConfigView', () => {
     expect(mocks.toastError).toHaveBeenCalledWith(expect.stringContaining('10 MHz'))
   })
 
-  it('restores and automatically saves independently editable AXF/ELF and MAP paths', async () => {
+  it('restores and automatically saves the AXF/ELF path without MAP controls', async () => {
+    const history = [{
+      text: 'help',
+      mode: 'text',
+      lineEnding: '\r',
+      timestamp: 123,
+    }]
+    mocks.loadDesktopSettings.mockReturnValue({
+      version: 1,
+      symbolPath: 'C:\\saved\\app.axf',
+      rttAddress: '0x20000010',
+      transmitMode: 'text',
+      lineEnding: '',
+      sendHistory: history,
+    })
     const wrapper = await mountView()
     await wrapper.get('[data-testid="config-section-files"]').trigger('click')
 
     expect(wrapper.get<HTMLInputElement>('[data-testid="symbol-path"]').element.value)
       .toBe('C:\\saved\\app.axf')
-    expect(wrapper.get<HTMLInputElement>('[data-testid="map-path"]').element.value)
-      .toBe('C:\\saved\\app.map')
+    expect(wrapper.find('[data-testid="map-path"]').exists()).toBe(false)
+    expect(wrapper.find('[data-testid="browse-map"]').exists()).toBe(false)
 
     mocks.pickSymbolFile.mockResolvedValueOnce('D:\\build\\next.elf')
     await wrapper.get('[data-testid="browse-symbol"]').trigger('click')
@@ -242,14 +402,12 @@ describe('ConfigView', () => {
     expect(wrapper.get<HTMLInputElement>('[data-testid="symbol-path"]').element.value)
       .toBe('D:\\build\\next.elf')
 
-    await wrapper.get('[data-testid="map-path"]').setValue('D:\\build\\next.map')
-    await wrapper.get('[data-testid="browse-map"]').trigger('click')
-
     expect(mocks.saveDesktopSettings).toHaveBeenCalledWith(
       window.localStorage,
       expect.objectContaining({
         symbolPath: 'D:\\build\\next.elf',
-        mapPath: 'D:\\build\\next.map',
+        rttAddress: '',
+        sendHistory: history,
       }),
     )
     expect(wrapper.find('[data-testid="save-files"]').exists()).toBe(false)
@@ -268,6 +426,70 @@ describe('ConfigView', () => {
     expect(mocks.api.parseAxf).toHaveBeenCalledWith('C:\\saved\\app.axf')
     expect(mocks.refreshSymbolCatalog).toHaveBeenCalledWith(true)
     expect(mocks.toastSuccess).toHaveBeenCalledWith(expect.stringContaining('3'))
+  })
+
+  it('disables symbol source controls and ignores a parse after the path changes', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, state: 'halted' })
+    const pending = deferred<{
+      loaded: boolean
+      axf_path: string
+      variable_count: number
+    }>()
+    mocks.api.parseAxf.mockReturnValueOnce(pending.promise)
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-files"]').trigger('click')
+
+    await wrapper.get('[data-testid="parse-symbols"]').trigger('click')
+    await nextTick()
+    expect(wrapper.get('[data-testid="symbol-path"]').attributes('disabled')).toBeDefined()
+    expect(wrapper.get('[data-testid="browse-symbol"]').attributes('disabled')).toBeDefined()
+
+    wrapper.findComponent({ name: 'FileSourcesPanel' }).vm.$emit(
+      'update:symbolPath',
+      'D:\\build\\next.axf',
+    )
+    await nextTick()
+    pending.resolve({
+      loaded: true,
+      axf_path: 'C:\\saved\\app.axf',
+      variable_count: 3,
+    })
+    await flushPromises()
+
+    expect(mocks.api.findRtt).not.toHaveBeenCalled()
+    expect(mocks.refreshSymbolCatalog).not.toHaveBeenCalled()
+    expect(mocks.toastSuccess).not.toHaveBeenCalled()
+    expect(mocks.toastError).not.toHaveBeenCalledWith(expect.stringContaining('AXF'))
+    expect(wrapper.get<HTMLInputElement>('[data-testid="symbol-path"]').element.value)
+      .toBe('D:\\build\\next.axf')
+  })
+
+  it('replaces the persisted RTT address when automatic lookup succeeds', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, state: 'halted' })
+    mocks.loadDesktopSettings.mockReturnValue({
+      version: 1,
+      symbolPath: 'C:\\saved\\app.axf',
+      rttAddress: '0x20000010',
+      transmitMode: 'text',
+      lineEnding: '',
+      sendHistory: [],
+    })
+    mocks.api.findRtt.mockResolvedValueOnce({
+      found: true,
+      addr: '0x20001A40',
+      source: 'binary:app.axf',
+    })
+    const wrapper = await mountView()
+    await wrapper.get('[data-testid="config-section-files"]').trigger('click')
+
+    await wrapper.get('[data-testid="parse-symbols"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.findRtt).toHaveBeenCalledWith('C:\\saved\\app.axf')
+    expect(mocks.saveDesktopSettings).toHaveBeenLastCalledWith(
+      window.localStorage,
+      expect.objectContaining({ rttAddress: '0x20001A40' }),
+    )
   })
 
   it('shows the browser-selected AXF name while parsing the backend cache path', async () => {
@@ -352,7 +574,6 @@ describe('ConfigView', () => {
     mocks.loadDesktopSettings.mockReturnValueOnce({
       version: 1,
       symbolPath: 'C:\\saved\\app.txt',
-      mapPath: 'C:\\saved\\app.axf',
       rttAddress: '',
       transmitMode: 'text',
       lineEnding: '',
@@ -363,13 +584,13 @@ describe('ConfigView', () => {
 
     await wrapper.get('[data-testid="connect-local"]').trigger('click')
     expect(mocks.api.connectDevice).toHaveBeenCalledWith({
-      port: 'TEST_PORT_A',
+      restore_last: true,
       axf: undefined,
     })
 
     await wrapper.get('[data-testid="config-section-files"]').trigger('click')
     expect(wrapper.get('[data-testid="symbol-path-validation"]').text()).toContain('.axf')
-    expect(wrapper.get('[data-testid="map-path-validation"]').text()).toContain('.map')
+    expect(wrapper.find('[data-testid="map-path-validation"]').exists()).toBe(false)
     expect(wrapper.get('[data-testid="parse-symbols"]').attributes('disabled')).toBeDefined()
   })
 
@@ -389,7 +610,23 @@ describe('ConfigView', () => {
     expect(window.open).toHaveBeenCalledWith('http://0.0.0.0:9000/docs', '_blank')
   })
 
-  it('preserves the probe firmware upgrade warning', async () => {
+  it('keeps firmware update as a separate sidebar section after Start Service', async () => {
+    const wrapper = await mountView()
+    const sections = wrapper.findAll('[data-testid="config-section"]')
+
+    expect(sections.map(section => section.text())).toEqual([
+      '本地设备', '文件来源', '远程连接', '启动服务', '固件升级',
+    ])
+    await wrapper.get('[data-testid="config-section-serve"]').trigger('click')
+    expect(wrapper.find('[data-testid="firmware-upgrade-panel"]').exists()).toBe(false)
+
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    expect(wrapper.get('[data-testid="config-section-firmware"]').attributes('aria-current')).toBe('page')
+    expect(wrapper.get('[data-testid="firmware-upgrade-panel"]').text()).toContain('固件升级')
+    expect(wrapper.find('[data-testid="launch-server"]').exists()).toBe(false)
+  })
+
+  it('keeps the firmware upgrade in its dedicated section without the legacy warning', async () => {
     mocks.api.probeFirmwareCheck.mockResolvedValue({
       status: 'upgrade_required',
       instructions: 'upgrade',
@@ -400,6 +637,50 @@ describe('ConfigView', () => {
 
     const wrapper = await mountView()
 
-    expect(wrapper.get('[data-testid="firmware-warning"]').text()).toContain('探针固件需要升级')
+    expect(wrapper.find('[data-testid="firmware-warning"]').exists()).toBe(false)
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    expect(wrapper.get('[data-testid="firmware-upgrade-panel"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').exists()).toBe(true)
+    expect(wrapper.get('[data-testid="upgrade-firmware"]').attributes('disabled')).toBeUndefined()
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+    expect(mocks.api.upgradeProbeFirmware).toHaveBeenCalledWith(true)
+  })
+
+  it('shows the latest version and saves firmware after automatic update fails', async () => {
+    Object.assign(mocks.deviceStatus, { connected: true, state: 'running' })
+    mocks.api.upgradeProbeFirmware.mockResolvedValueOnce({
+      status: 'manual_required',
+      current_version: 'V3.3.6',
+      latest_version: 'V3.3.7',
+      firmware: 'MicroLink_V3.3.7.uf2',
+      model: 'V3',
+      family: 'microlink',
+      download_available: true,
+      message: '未检测到 Bootloader U 盘',
+    })
+    const blob = new Blob(['release-uf2'], { type: 'application/octet-stream' })
+    mocks.api.downloadProbeFirmware.mockResolvedValueOnce({
+      blob,
+      filename: 'MicroLink_V3.3.7.uf2',
+      version: 'V3.3.7',
+      source: 'gitee',
+      family: 'microlink',
+    })
+    const wrapper = await mountView()
+
+    await wrapper.get('[data-testid="config-section-firmware"]').trigger('click')
+    await wrapper.get('[data-testid="upgrade-firmware"]').trigger('click')
+    await flushPromises()
+
+    expect(wrapper.get('[data-testid="manual-firmware-download"]').text()).toContain('最新固件：V3.3.7')
+    expect(wrapper.get('[data-testid="firmware-upgrade-status"]').text()).toContain('未检测到 Bootloader U 盘')
+
+    await wrapper.get('[data-testid="download-firmware"]').trigger('click')
+    await flushPromises()
+
+    expect(mocks.api.downloadProbeFirmware).toHaveBeenCalledWith('V3', 'microlink')
+    expect(mocks.saveBlobFile).toHaveBeenCalledWith('MicroLink_V3.3.7.uf2', blob)
+    expect(wrapper.get('[data-testid="firmware-download-status"]').text()).toContain('Gitee')
   })
 })

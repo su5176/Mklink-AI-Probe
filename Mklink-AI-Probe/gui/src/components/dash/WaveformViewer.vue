@@ -16,11 +16,13 @@ import i18nUrl from '../../assets/rtt_i18n.js?url'
 import viewerUrl from '../../assets/rtt_viewer.js?url'
 import { language } from '../../composables/useLanguage'
 import { API_BASE } from '../../lib/runtimeEndpoint'
+import { saveTextFile } from '../../lib/downloadTextFile'
 
 const props = defineProps<{
   mode: 'SuperWatch' | 'VOFA'
   deviceConnected: boolean
   hiddenChannels?: ReadonlySet<string>
+  arraySnapshotPath?: string | null
 }>()
 
 const emit = defineEmits<{
@@ -36,16 +38,22 @@ let vofaChannels: Array<Record<string, unknown>> = []
 let vofaChannelSignature: string | null = null
 let pendingBatch: Extract<WorkerOutput, { type: 'waveform-batch' }> | null = null
 let visibleRequestId = 0
+let historyRequestId = 0
 let visibleRequestInFlight: number | null = null
 let visibleRangePending = false
+let visibleRangePendingInteractive = false
+const interactiveVisibleRequests = new Set<number>()
 let previousTransportPhase = 'stopped'
 let statusPollTimer: ReturnType<typeof setTimeout> | null = null
 let statusPollGeneration = 0
 let latestVofaStatus: Record<string, unknown> | null = null
+let arraySnapshotTimer: ReturnType<typeof setTimeout> | null = null
+let arraySnapshotGeneration = 0
 let disposed = false
-function requestLatestVisibleRange(): void {
+function requestLatestVisibleRange(interactive = false): void {
   if (visibleRequestInFlight !== null) {
     visibleRangePending = true
+    visibleRangePendingInteractive ||= interactive
     return
   }
   const viewer = (window as any).__waveformViewers?.[props.mode]
@@ -54,7 +62,9 @@ function requestLatestVisibleRange(): void {
   const { start, end, pixelWidth } = range
   if (![start, end, pixelWidth].every(Number.isFinite) || pixelWidth < 1) return
   visibleRangePending = false
+  visibleRangePendingInteractive = false
   visibleRequestInFlight = ++visibleRequestId
+  if (interactive) interactiveVisibleRequests.add(visibleRequestInFlight)
   binary.requestVisibleRange(visibleRequestInFlight, start, end, pixelWidth)
 }
 
@@ -62,9 +72,22 @@ function resetVisibleRangeRequests(): void {
   visibleRequestId++
   visibleRequestInFlight = null
   visibleRangePending = false
+  visibleRangePendingInteractive = false
+  interactiveVisibleRequests.clear()
 }
 
-const vofaScheduler = new RenderScheduler(requestLatestVisibleRange)
+const vofaScheduler = new RenderScheduler(() => requestLatestVisibleRange(false))
+
+function attachSuperwatchRequesters(viewer: any): void {
+  if (props.mode !== 'SuperWatch' || !viewer) return
+  viewer.setBinaryHistoryRequester?.(() => {
+    binary.requestHistorySnapshot?.(++historyRequestId)
+  })
+  viewer.setBinaryDetailRequester?.((enabled: boolean) => {
+    binary.setWaveformDetail?.(enabled)
+  })
+  viewer.setBinaryVisibleRangeRequester?.(() => requestLatestVisibleRange(true))
+}
 
 function channelSignature(channels: readonly Record<string, unknown>[]): string {
   return JSON.stringify(channels.map((channel, index) => [
@@ -91,6 +114,45 @@ function applyVofaChannels(channels: readonly Record<string, unknown>[]): void {
 function applyHiddenChannels(): void {
   const names = [...(props.hiddenChannels ?? [])].sort()
   ;(window as any).__waveformViewers?.[props.mode]?.setHiddenChannels?.(names)
+}
+
+function stopArraySnapshotPolling(): void {
+  arraySnapshotGeneration += 1
+  if (arraySnapshotTimer !== null) {
+    clearTimeout(arraySnapshotTimer)
+    arraySnapshotTimer = null
+  }
+}
+
+async function pollArraySnapshot(generation: number): Promise<void> {
+  if (disposed || props.mode !== 'SuperWatch' || !props.arraySnapshotPath || !props.deviceConnected) return
+  try {
+    const response = await fetch(`${API_BASE}/api/dash/superwatch/array-snapshot`)
+    const payload = await response.json().catch(() => ({}))
+    if (response.ok && payload?.snapshot?.name === props.arraySnapshotPath) {
+      ;(window as any).__waveformViewers?.SuperWatch?.setArraySnapshot?.(payload.snapshot)
+    } else {
+      ;(window as any).__waveformViewers?.SuperWatch?.setArraySnapshot?.(null)
+    }
+  } catch {
+    // The binary stream remains independent when the optional snapshot poll fails.
+  }
+  if (!disposed && generation === arraySnapshotGeneration && props.arraySnapshotPath) {
+    arraySnapshotTimer = setTimeout(() => {
+      arraySnapshotTimer = null
+      void pollArraySnapshot(generation)
+    }, 50)
+  }
+}
+
+function startArraySnapshotPolling(): void {
+  stopArraySnapshotPolling()
+  if (props.mode !== 'SuperWatch' || !props.arraySnapshotPath || !props.deviceConnected) {
+    ;(window as any).__waveformViewers?.SuperWatch?.setArraySnapshot?.(null)
+    return
+  }
+  const generation = arraySnapshotGeneration
+  void pollArraySnapshot(generation)
 }
 
 function onVofaChannels(event: Event): void {
@@ -163,35 +225,63 @@ watch(() => binary.waveformBatch.value, batch => {
   pendingBatch = batch
   if (
     props.mode === 'SuperWatch'
+    && !binary.waveformSummary
     && batch.itemCount > 0
     && batch.channelCount === vofaChannels.length
   ) {
     const values = new Float32Array(batch.values)
     const offset = (batch.itemCount - 1) * batch.channelCount
-    if (values.length >= offset + batch.channelCount) {
-      const latest: Record<string, number> = {}
-      for (let channel = 0; channel < batch.channelCount; channel += 1) {
-        const name = String(vofaChannels[channel]?.name ?? '')
-        const value = values[offset + channel]
-        if (name && Number.isFinite(value)) latest[name] = value
-      }
-      emit('latest-values', latest)
+    const latest: Record<string, number> = {}
+    for (let channel = 0; channel < batch.channelCount; channel += 1) {
+      const name = String(vofaChannels[channel]?.name ?? '')
+      const value = values[offset + channel]
+      if (name && Number.isFinite(value)) latest[name] = value
     }
+    emit('latest-values', latest)
   }
   const viewer = (window as any).__waveformViewers?.[props.mode]
   if (viewer?.acceptBinaryBatch) {
     viewer.acceptBinaryBatch(batch, vofaChannels)
     pendingBatch = null
   }
-  vofaScheduler?.recordCollection(batch.itemCount)
+  if (props.mode !== 'SuperWatch') {
+    vofaScheduler?.recordCollection(batch.itemCount)
+    vofaScheduler?.invalidate('data')
+  }
+})
+
+watch(() => binary.waveformSummary?.value, summary => {
+  if (!summary || props.mode !== 'SuperWatch') return
+  const values = new Float32Array(summary.latestValues)
+  if (summary.channelCount === vofaChannels.length && values.length === summary.channelCount) {
+    const latest: Record<string, number> = {}
+    for (let channel = 0; channel < summary.channelCount; channel += 1) {
+      const name = String(vofaChannels[channel]?.name ?? '')
+      if (name && Number.isFinite(values[channel])) latest[name] = values[channel]
+    }
+    emit('latest-values', latest)
+  }
+  ;(window as any).__waveformViewers?.SuperWatch?.acceptBinarySummary?.(summary, vofaChannels)
+  vofaScheduler?.recordCollection(summary.collectedItemCount)
   vofaScheduler?.invalidate('data')
+})
+
+watch(() => binary.historySnapshot?.value, snapshot => {
+  if (!snapshot || props.mode !== 'SuperWatch') return
+  ;(window as any).__waveformViewers?.SuperWatch?.exportBinaryHistorySnapshot?.(snapshot)
 })
 
 watch(() => binary.envelope.value, envelope => {
   if (!envelope || envelope.requestId !== visibleRequestInFlight) return
   visibleRequestInFlight = null
-  ;(window as any).__waveformViewers?.[props.mode]?.renderBinaryEnvelope?.(envelope)
-  if (visibleRangePending) requestLatestVisibleRange()
+  const renderWhilePaused = interactiveVisibleRequests.delete(envelope.requestId)
+  ;(window as any).__waveformViewers?.[props.mode]?.renderBinaryEnvelope?.(
+    envelope, renderWhilePaused,
+  )
+  if (visibleRangePending) {
+    const interactive = visibleRangePendingInteractive
+    requestLatestVisibleRange(interactive)
+  }
 })
 
 watch(() => binary.superwatchMetadata.value, metadata => {
@@ -224,6 +314,9 @@ onMounted(() => {
   if (!container.value) return
   const el = container.value
 
+  const saveViewerFile = (filename: string, text: string) => saveTextFile(filename, text)
+  ;(window as any).__MKLINK_SAVE_FILE__ = saveViewerFile
+
   // 1. Inject HTML template
   el.innerHTML = buildTemplate(props.mode)
 
@@ -236,6 +329,9 @@ onMounted(() => {
     window.addEventListener('mklink:vofa-stream-state', onVofaStreamState)
     vofaScheduler?.start()
     startVofaStatusPolling(true)
+    startArraySnapshotPolling()
+    const viewer = (window as any).__waveformViewers?.[props.mode]
+    attachSuperwatchRequesters(viewer)
   }
 })
 
@@ -245,6 +341,7 @@ watch(() => props.deviceConnected, (val) => {
 })
 
 watch(() => props.hiddenChannels, applyHiddenChannels)
+watch([() => props.arraySnapshotPath, () => props.deviceConnected], startArraySnapshotPolling)
 
 watch(language, value => {
   ;(window as any).setLang?.(value)
@@ -253,6 +350,7 @@ watch(language, value => {
 onUnmounted(() => {
   disposed = true
   stopVofaStatusPolling()
+  stopArraySnapshotPolling()
   binary.stop()
   vofaScheduler?.dispose()
   window.removeEventListener('mklink:vofa-channels', onVofaChannels)
@@ -265,6 +363,7 @@ onUnmounted(() => {
   } catch { /* ignore */ }
   // Clear DOM
   if (container.value) container.value.innerHTML = ''
+  if ((window as any).__MKLINK_SAVE_FILE__) delete (window as any).__MKLINK_SAVE_FILE__
 })
 
 function buildTemplate(mode: string): string {
@@ -535,6 +634,7 @@ function loadViewerScript(el: HTMLDivElement) {
       viewers[props.mode].es = (window as any).es
     }
     if (viewers?.[props.mode]) {
+      attachSuperwatchRequesters(viewers[props.mode])
       viewers[props.mode].configureBinaryChannels?.(vofaChannels)
       applyHiddenChannels()
       if (latestVofaStatus) viewers[props.mode].updateAcquisitionStatus?.(latestVofaStatus)

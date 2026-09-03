@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from 'vitest'
-import { RTT_TERMINAL_UTF8, StreamType } from '../lib/stream/protocol'
+import {
+  RTT_TERMINAL_UTF8,
+  SERIAL_RX_BYTES,
+  SERIAL_TX_BYTES,
+  StreamType,
+} from '../lib/stream/protocol'
 import {
   StreamDecoder,
   type WorkerOutput,
@@ -105,6 +110,75 @@ function setup() {
 }
 
 describe('StreamDecoder worker controller', () => {
+  it('incrementally decodes serial RX in terminal mode without TX echo or log output', () => {
+    const { decoder, messages } = setup()
+    const encoded = new TextEncoder().encode('温度')
+    decoder.handle({
+      type: 'configure', capacity: 8, channelCount: 1, decoderMode: 'serial-terminal',
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        1n, 2, encoded.slice(0, 2), StreamType.SERIAL, 10n, SERIAL_RX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 1,
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        2n, encoded.length - 2, encoded.slice(2), StreamType.SERIAL, 20n, SERIAL_RX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 2,
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        3n, 2, new TextEncoder().encode('TX'), StreamType.SERIAL, 30n, SERIAL_TX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 3,
+    })
+
+    expect(messages.filter(message => message.type === 'serial-terminal'))
+      .toEqual([{ type: 'serial-terminal', sequence: 2n, text: '温度' }])
+    expect(messages.some(message => message.type === 'serial-lines')).toBe(false)
+    expect(messages.at(-1)).toMatchObject({
+      type: 'telemetry', bufferedSamples: 8, acceptedFrames: 3,
+    })
+  })
+
+  it('assembles bounded directional serial rows in log mode', () => {
+    const { decoder, messages } = setup()
+    const encoder = new TextEncoder()
+    decoder.handle({
+      type: 'configure', capacity: 1, channelCount: 1, decoderMode: 'serial-log',
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        1n, 2, encoder.encode('OK'), StreamType.SERIAL, 10n, SERIAL_RX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 1,
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        2n, 2, encoder.encode('\nX'), StreamType.SERIAL, 20n, SERIAL_RX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 2,
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(
+        3n, 2, Uint8Array.of(0xab, 0xcd), StreamType.SERIAL, 30n, SERIAL_TX_BYTES,
+      ), connectionGeneration: 1, frameTicket: 3,
+    })
+
+    const batches = messages.filter(message => message.type === 'serial-lines')
+    expect(batches).toEqual([
+      {
+        type: 'serial-lines', sequence: 2n,
+        lines: [{ timestampNs: 10n, direction: 'RX', rawHex: '4F4B0A', ascii: 'OK\n' }],
+      },
+      {
+        type: 'serial-lines', sequence: 3n,
+        lines: [{ timestampNs: 30n, direction: 'TX', rawHex: 'ABCD', ascii: '��' }],
+      },
+    ])
+    expect(messages.some(message => message.type === 'serial-terminal')).toBe(false)
+    expect(messages.at(-1)).toMatchObject({
+      type: 'telemetry', bufferedSamples: 1, acceptedFrames: 3,
+    })
+  })
+
   it('decodes RTT raw records with UTF-8 line metadata and preserves batch order', () => {
     const { decoder, messages } = setup()
     decoder.handle({ type: 'configure', capacity: 16, channelCount: 1 })
@@ -163,6 +237,33 @@ describe('StreamDecoder worker controller', () => {
     })
   })
 
+  it('uses exact device sample times despite host jitter and preserves real gaps', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 16, channelCount: 1 })
+    const metadata = new TextEncoder().encode(JSON.stringify({ version: 1, channels: [{ name: 'a' }] }))
+    const send = (sequence: bigint, flags: number, payload: Uint8Array, count: number, host: bigint) => decoder.handle({
+      type: 'frame', buffer: frame(sequence, count, payload, StreamType.SUPERWATCH, host, flags),
+      connectionGeneration: 1, frameTicket: Number(sequence),
+    })
+    send(1n, 2, metadata, 0, 1n)
+    const payload = (times: number[]) => {
+      const bytes = new Uint8Array(times.length * 12)
+      bytes.set(new Uint8Array(Float64Array.from(times).buffer))
+      bytes.set(floats(...times), times.length * 8)
+      return bytes
+    }
+    send(2n, 3, payload([0, 0.13]), 2, 20_000_000_000n)
+    send(3n, 3, payload([0.26, 25]), 2, 20_050_000_000n)
+    const batches = messages.filter(message => message.type === 'waveform-batch')
+    expect(batches).toHaveLength(2)
+    expect(batches.flatMap(batch => Array.from(new Float64Array(batch.times)))).toEqual([0, 0.13, 0.26, 25])
+    // Reject invalid time order without poisoning the next valid batch.
+    send(4n, 3, payload([25, 26]), 2, 21_000_000_000n)
+    expect(messages.at(-1)).toMatchObject({ type: 'error', code: 'INVALID_FRAME' })
+    send(4n, 3, payload([26, 27]), 2, 19_000_000_000n)
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(3)
+  })
+
   it('applies versioned SuperWatch metadata independently from sample batches', () => {
     const { decoder, messages, transfers } = setup()
     decoder.handle({ type: 'configure', capacity: 16, channelCount: 1 })
@@ -186,6 +287,47 @@ describe('StreamDecoder worker controller', () => {
     if (batch?.type !== 'waveform-batch') throw new Error('expected batch')
     expect(Array.from(new Float32Array(batch.values))).toEqual([1, 2, 3, 4])
     expect(transfers[messages.indexOf(batch)]).toEqual([batch.values, batch.times])
+  })
+
+  it('keeps full SuperWatch history in the Worker and emits only latest summaries normally', () => {
+    const { decoder, messages, transfers } = setup()
+    decoder.handle({
+      type: 'configure', capacity: 3, channelCount: 1, waveformSummaryOnly: true,
+    })
+    const metadata = new TextEncoder().encode(JSON.stringify({
+      version: 1, channels: [{ name: 'a', type: 'float' }],
+    }))
+    const send = (sequence: bigint, values: number[]) => decoder.handle({
+      type: 'frame',
+      buffer: frame(sequence, values.length, floats(...values), StreamType.SUPERWATCH, sequence * 1_000_000n, 0x01),
+      connectionGeneration: 1,
+      frameTicket: Number(sequence),
+    })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 0, metadata, StreamType.SUPERWATCH, 1n, 0x02),
+      connectionGeneration: 1, frameTicket: 1,
+    })
+    send(2n, [1, 2])
+    send(3n, [3, 4])
+
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(0)
+    const summaries = messages.filter(message => message.type === 'waveform-summary')
+    expect(summaries).toHaveLength(2)
+    const latest = summaries.at(-1)
+    if (latest?.type !== 'waveform-summary') throw new Error('expected waveform summary')
+    expect(latest).toMatchObject({ collectedItemCount: 2, bufferedItemCount: 3, channelCount: 1 })
+    expect(Array.from(new Float32Array(latest.latestValues))).toEqual([4])
+
+    decoder.handle({ type: 'history-snapshot', requestId: 7 })
+    const snapshot = messages.at(-1)
+    if (snapshot?.type !== 'history-snapshot') throw new Error('expected history snapshot')
+    expect(snapshot).toMatchObject({ requestId: 7, itemCount: 3, channelCount: 1 })
+    expect(Array.from(new Float32Array(snapshot.values))).toEqual([2, 3, 4])
+    expect(transfers[messages.indexOf(snapshot)]).toEqual([snapshot.times, snapshot.values])
+
+    decoder.handle({ type: 'waveform-detail', enabled: true })
+    send(4n, [5])
+    expect(messages.filter(message => message.type === 'waveform-batch')).toHaveLength(1)
   })
 
   it('rejects stale metadata, nonfinite samples, bad flags, and reset clears versions', () => {
@@ -771,6 +913,31 @@ describe('StreamDecoder worker controller', () => {
     expect(Array.from(new Float64Array(visible.ends))).toEqual([10, 12, 14, 20, 30])
   })
 
+  it('does not fabricate a long task interval across a target overflow', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 6, systemViewRecords(
+        { kind: 4, taskId: 7, ticks: 10n, timeUs: 10 },
+        { kind: 1, ticks: 20n, timeUs: 20 },
+        { kind: 17, ticks: 30n, timeUs: 30 },
+        { kind: 4, taskId: 8, ticks: 40n, timeUs: 40 },
+        { kind: 5, taskId: 8, ticks: 50n, timeUs: 50 },
+        { kind: 17, ticks: 60n, timeUs: 60 },
+      ), StreamType.SYSTEMVIEW),
+      connectionGeneration: 1,
+      frameTicket: 1,
+    })
+    decoder.handle({ type: 'visible-range', requestId: 1, start: 0, end: 70, pixelWidth: 400 })
+
+    const visible = messages.at(-1)
+    if (visible?.type !== 'systemview-visible') throw new Error('expected SystemView visible data')
+    expect(Array.from(new Uint32Array(visible.taskIds))).toEqual([0, 8])
+    expect(Array.from(new Float64Array(visible.starts))).toEqual([20, 30])
+    expect(Array.from(new Float64Array(visible.ends))).toEqual([30, 40])
+    expect(visible.events.find(event => event.kind === 'overflow')).toBeTruthy()
+  })
+
   it('keeps inactive task metadata and computes exact Task ISR Scheduler Idle statistics', () => {
     const { decoder, messages } = setup()
     decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
@@ -810,6 +977,33 @@ describe('StreamDecoder worker controller', () => {
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ isr_id: 15, duration_ticks: 1 }),
       ]))
+  })
+
+  it('keeps context statistics cumulative when the visible range moves', () => {
+    const { decoder, messages } = setup()
+    decoder.handle({ type: 'configure', capacity: 32, channelCount: 1 })
+    decoder.handle({
+      type: 'frame', buffer: frame(1n, 4, systemViewRecords(
+        { kind: 4, taskId: 1, ticks: 10n, timeUs: 10 },
+        { kind: 5, taskId: 1, ticks: 20n, timeUs: 20 },
+        { kind: 4, taskId: 1, ticks: 30n, timeUs: 30 },
+        { kind: 5, taskId: 1, ticks: 40n, timeUs: 40 },
+      ), StreamType.SYSTEMVIEW),
+      connectionGeneration: 1, frameTicket: 1,
+    })
+
+    decoder.handle({ type: 'visible-range', requestId: 1, start: 0, end: 25, pixelWidth: 200 })
+    const first = messages.at(-1)
+    decoder.handle({ type: 'visible-range', requestId: 2, start: 25, end: 50, pixelWidth: 200 })
+    const second = messages.at(-1)
+    if (first?.type !== 'systemview-visible' || second?.type !== 'systemview-visible') {
+      throw new Error('expected SystemView visible data')
+    }
+
+    const firstTask = first.contexts.find(context => context.type === 1 && context.id === 1)
+    const secondTask = second.contexts.find(context => context.type === 1 && context.id === 1)
+    expect(firstTask).toMatchObject({ count: 2, totalTicks: 20 })
+    expect(secondTask).toMatchObject({ count: 2, totalTicks: 20 })
   })
 
   it('breaks interval pairing across a dropped batch and reset clears pending context', () => {

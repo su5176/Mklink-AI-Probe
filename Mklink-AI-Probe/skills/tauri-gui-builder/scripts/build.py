@@ -7,7 +7,7 @@ Usage:
     python build.py --check      # Check prerequisites only
     python build.py --clean      # Clean build artifacts
 
-The built exe is at: gui/src-tauri/target/release/mklink-ai-probe.exe
+Run through scripts/build_workspace.ps1; outputs use its shared Cargo cache.
 """
 
 import subprocess
@@ -22,6 +22,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+def cargo_target_dir():
+    configured = os.environ.get("CARGO_TARGET_DIR")
+    return Path(configured).resolve() if configured else TAURI_DIR / "target"
 
 
 def find_project_root():
@@ -139,7 +144,9 @@ def build_sidecar(force=False):
     """Build Python sidecar exe with PyInstaller."""
     sidecar_dir = TAURI_DIR / "binaries"
     sidecar_exe = sidecar_dir / "mklink-sidecar-x86_64-pc-windows-msvc.exe"
-    dist_dir = SKILL_DIR / "dist"
+    work_root = Path(os.environ["MKLINK_BUILD_WORK_DIR"]) / "pyinstaller"
+    work_root.mkdir(parents=True, exist_ok=True)
+    dist_dir = work_root / "dist"
     built = dist_dir / "mklink-sidecar.exe"
 
     if force:
@@ -195,6 +202,9 @@ def build_sidecar(force=False):
         run([
             sys.executable, "-m", "PyInstaller",
             "--noconfirm", "--clean", "--onefile", "--name", "mklink-sidecar",
+            "--distpath", str(dist_dir),
+            "--workpath", str(work_root / "work"),
+            "--specpath", str(work_root),
             "--collect-all", "mklink",
             "--collect-all", "elftools",
             "--collect-all", "pyocd",
@@ -277,6 +287,10 @@ def temporary_bundle_config(config_path):
     data = json.loads(original.decode("utf-8"))
     bundle = data.setdefault("bundle", {})
     bundle["targets"] = ["nsis"]
+    bundle["useLocalToolsDir"] = True
+    # LZMA's solid dictionary can fail to mmap on Windows machines with a
+    # constrained system drive; zlib keeps the standard NSIS bundle reliable.
+    bundle.setdefault("windows", {}).setdefault("nsis", {})["compression"] = "zlib"
     bundle["externalBin"] = [
         "binaries/mklink-sidecar"
     ]
@@ -343,11 +357,12 @@ def collect_signed_bundle_outputs(bundle_dir):
 def build_release_bundle():
     """Build a bundle from the current source with a temporary sidecar config."""
     signing_key = load_updater_private_key()
-    if not build_sidecar(force=True):
-        raise SystemExit(1)
-    staged_stcp = stage_stcp_library()
+    staged_stcp = None
     try:
-        bundle_dir = TAURI_DIR / "target" / "release" / "bundle"
+        if not build_sidecar(force=True):
+            raise SystemExit(1)
+        staged_stcp = stage_stcp_library()
+        bundle_dir = cargo_target_dir() / "release" / "bundle"
         if bundle_dir.exists():
             try:
                 shutil.rmtree(bundle_dir)
@@ -362,7 +377,9 @@ def build_release_bundle():
         with temporary_bundle_config(TAURI_DIR / "tauri.conf.json"):
             return build_tauri(bundle=True, signing_key=signing_key)
     finally:
-        staged_stcp.unlink(missing_ok=True)
+        if staged_stcp is not None:
+            staged_stcp.unlink(missing_ok=True)
+        (TAURI_DIR / "binaries" / "mklink-sidecar-x86_64-pc-windows-msvc.exe").unlink(missing_ok=True)
 
 
 def build_tauri(bundle=False, signing_key=None):
@@ -382,7 +399,7 @@ def build_tauri(bundle=False, signing_key=None):
         )
     run(cmd, cwd=str(GUI_DIR), env=env)
 
-    exe = TAURI_DIR / "target" / "release" / "mklink-ai-probe.exe"
+    exe = cargo_target_dir() / "release" / "mklink-ai-probe.exe"
     if exe.exists():
         size_mb = exe.stat().st_size / (1024 * 1024)
         print(f"\n[OK] Built: {exe} ({size_mb:.1f} MB)")
@@ -392,7 +409,7 @@ def build_tauri(bundle=False, signing_key=None):
 
     if bundle:
         outputs = collect_signed_bundle_outputs(
-            TAURI_DIR / "target" / "release" / "bundle"
+            cargo_target_dir() / "release" / "bundle"
         )
         for label, path in outputs.items():
             size_mb = path.stat().st_size / (1024 * 1024)
@@ -402,18 +419,9 @@ def build_tauri(bundle=False, signing_key=None):
 
 
 def clean():
-    """Remove build artifacts."""
-    targets = [
-        TAURI_DIR / "target",
-        GUI_DIR / "dist",
-        SKILL_DIR / "dist",
-        SKILL_DIR / "build",
-    ]
-    for t in targets:
-        if t.exists():
-            print(f"  Removing {t}")
-            shutil.rmtree(t, ignore_errors=True)
-    print("[OK] Clean complete")
+    """Keep shared compiler caches and tracked frontend runtime assets."""
+    print("[INFO] Use scripts/build_workspace.ps1 -Action clean for temporary runs.")
+    print("[OK] Reusable Cargo cache and gui/dist preserved")
 
 
 def main():
@@ -425,6 +433,18 @@ def main():
     parser.add_argument("--clean", action="store_true", help="Remove build artifacts")
     parser.add_argument("--project-dir", type=str, default=None, help="mklink-ai-probe project root directory")
     args = parser.parse_args()
+
+    if IS_WINDOWS and not os.environ.get("MKLINK_BUILD_WORK_DIR"):
+        parser.error("run via scripts/build_workspace.ps1 -Action run; C-drive build storage is not permitted")
+    if IS_WINDOWS:
+        storage_root = Path(os.environ.get("MKLINK_BUILD_ROOT", "")).resolve()
+        system_drive = os.environ.get("SystemDrive", "C:").casefold()
+        if storage_root.drive.casefold() in {"c:", system_drive}:
+            parser.error("build storage must not be on C: or the Windows system drive")
+        for name in ("MKLINK_BUILD_WORK_DIR", "CARGO_TARGET_DIR", "TEMP", "PIP_CACHE_DIR", "PYINSTALLER_CONFIG_DIR"):
+            value = os.environ.get(name)
+            if not value or not Path(value).resolve().is_relative_to(storage_root):
+                parser.error(f"{name} must be inside MKLINK_BUILD_ROOT; use scripts/build_workspace.ps1")
 
     # Resolve project root
     if args.project_dir:

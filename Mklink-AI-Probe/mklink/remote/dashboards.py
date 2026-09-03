@@ -18,6 +18,7 @@ Architecture::
 from __future__ import annotations
 
 import asyncio
+from array import array
 import base64
 import codecs
 from collections import deque
@@ -25,6 +26,7 @@ import json
 import logging
 import math
 import struct
+import sys
 import threading
 import time
 from typing import Any, Generator
@@ -32,8 +34,11 @@ from typing import Any, Generator
 from mklink.remote.stream_protocol import (
     RTT_RAW_UTF8_LINES,
     RTT_TERMINAL_UTF8,
+    SERIAL_RX_BYTES,
+    SERIAL_TX_BYTES,
     SUPERWATCH_METADATA_JSON,
     SUPERWATCH_SAMPLE_MAJOR_FLOAT32,
+    SUPERWATCH_TIMESTAMPED_FLOAT32,
     WAVEFORM_SAMPLE_MAJOR_FLOAT32,
     RttLine,
     StreamType,
@@ -53,6 +58,10 @@ def _sum_counter_snapshots(base: dict[str, int], current: dict[str, int]) -> dic
 
 logger = logging.getLogger(__name__)
 _RTT_DELIVERY_INTERVAL = 1.0 / 50.0
+_SYSTEMVIEW_DELIVERY_INTERVAL = 1.0 / 30.0
+_SYSTEMVIEW_FIRST_START_MAX_RETRIES = 1
+_YMODEM_STOP_TIMEOUT = 3.0
+_RUNTIME_CPU_FREQ_SOURCES = {"SystemCoreClock", "hpm_core_clock"}
 SUPPORTED_RTT_ENCODINGS = ("utf-8", "gb2312", "gbk", "gb18030", "big5")
 
 
@@ -240,6 +249,7 @@ class RttStreamManager:
         self._error: str | None = None
         self._start_failure_callback = None
         self._stream_hub = stream_hub
+        self._terminal_stream_hub = stream_hub
         self._raw_batch_lines = max(1, int(raw_batch_lines))
         self._waveform_batch_samples = max(1, int(waveform_batch_samples))
         self._line_assembler = _RttLineAssembler()
@@ -273,9 +283,16 @@ class RttStreamManager:
     def set_stream_hub(self, stream_hub) -> None:
         self._stream_hub = stream_hub
 
+    def set_terminal_stream_hub(self, stream_hub) -> None:
+        self._terminal_stream_hub = stream_hub
+
     def detach_stream_hub(self, stream_hub) -> None:
         if self._stream_hub is stream_hub:
             self._stream_hub = None
+
+    def detach_terminal_stream_hub(self, stream_hub) -> None:
+        if self._terminal_stream_hub is stream_hub:
+            self._terminal_stream_hub = None
 
     def _clear_active_session(self, generation=None) -> None:
         with self._write_lock:
@@ -362,8 +379,8 @@ class RttStreamManager:
             return
         text = "".join(self._pending_terminal)
         self._pending_terminal = []
-        if self._stream_hub is not None:
-            self._stream_hub.publish(
+        if self._terminal_stream_hub is not None:
+            self._terminal_stream_hub.publish(
                 text.encode("utf-8"), item_count=1,
                 flags=RTT_TERMINAL_UTF8, stream_type=StreamType.RTT_RAW,
             )
@@ -690,6 +707,17 @@ class SystemViewStreamManager:
         self._progress_state = "idle"
         self._progress_error = ""
         self._raw_bytes_without_events = 0
+        # A Device instance represents one physical/logical probe connection.
+        # Keep the first-start workaround scoped to that connection instead of
+        # restarting every later stream that happens to go idle.
+        self._connection_device = None
+        self._connection_generation = 0
+        self._connection_start_seen = False
+        self._session_generation = 0
+        self._first_start_on_connection = False
+        self._auto_retry_count = 0
+        self._auto_retry_reason = ""
+        self._auto_retry_stop_error = ""
 
     @property
     def running(self) -> bool:
@@ -714,6 +742,19 @@ class SystemViewStreamManager:
                 return
             raise RuntimeError("SystemView worker thread is still active")
 
+        if self._connection_device is not device:
+            self._connection_device = device
+            self._connection_generation += 1
+            self._connection_start_seen = False
+        first_start_on_connection = not self._connection_start_seen
+        self._connection_start_seen = True
+        self._session_generation += 1
+        session_generation = self._session_generation
+        self._first_start_on_connection = first_start_on_connection
+        self._auto_retry_count = 0
+        self._auto_retry_reason = ""
+        self._auto_retry_stop_error = ""
+
         stop_event = threading.Event()
         generation = object()
         self._stop_event = stop_event
@@ -724,6 +765,7 @@ class SystemViewStreamManager:
         self._stats = {"events": 0, "bytes": 0}
         self._resolved_task_names.clear()
         self._name_resolution_attempted.clear()
+        self._name_resolution_disabled = False
         self._last_name_resolution = 0.0
         self._cpu_freq_source = ""
         with self._recording_lock:
@@ -753,52 +795,143 @@ class SystemViewStreamManager:
                 )
                 initialized = True
                 self._apply_cpu_freq_hint(device, start_result)
-                start_time = time.time()
-                empty_cycles = 0
+                # 会话总时长与空闲看门狗分离:deadline 只管理 duration,任何
+                # 恢复动作都不延长它;看门狗以"最后一次收到数据"为基准,统一
+                # 裁决空读与读异常——START 突发排空后的亚秒级静默(探针按批
+                # 转发的正常间隙)和单次瞬时读异常都不会误杀健康流,而持续
+                # 无数据会按"从未收到过 / 流中断"如实终止。
+                deadline_mono = time.monotonic() + max(0.0, duration)
+                last_data_mono = time.monotonic()
+                had_data = False
+                attempt_had_data = False
+                retry_count = 0
                 no_event_started = None
-                last_read_error = None
                 while not stop_event.is_set():
-                    if time.time() - start_time > duration:
+                    if time.monotonic() >= deadline_mono:
                         break
                     if not self._paused.is_set():
                         time.sleep(0.05)
                         continue
                     try:
                         raw = device.systemview_read_bytes(
-                            duration=0.1, max_bytes=64 * 1024
+                            duration=_SYSTEMVIEW_DELIVERY_INTERVAL,
+                            max_bytes=64 * 1024,
                         )
                     except Exception as exc:
-                        last_read_error = exc
-                        if time.time() - start_time >= self._startup_no_data_timeout_s:
+                        if time.monotonic() - last_data_mono >= self._startup_no_data_timeout_s:
                             raise RuntimeError(
                                 f"SystemView 读取失败: {exc}"
                             ) from exc
                         time.sleep(0.1)
                         continue
                     if not raw:
-                        empty_cycles += 1
-                        if empty_cycles == 4:
-                            try:
-                                device.systemview_stop()
-                                time.sleep(0.5)
-                                start_result = device.systemview_start(
-                                    addr, channel=channel, mode=mode,
-                                    search_size=search_size,
+                        idle = time.monotonic() - last_data_mono
+                        if idle >= self._startup_no_data_timeout_s:
+                            # 探针固件的首次附着可能复位目标(表现为 START
+                            # 突发排干后流静默,第二次启动即正常)。范围严格限定
+                            # 为每个 Device 连接首会话的一次可见自动重试；达到
+                            # 上限后如实终止并注明。
+                            if (
+                                had_data
+                                and first_start_on_connection
+                                and retry_count < _SYSTEMVIEW_FIRST_START_MAX_RETRIES
+                            ):
+                                retry_count += 1
+                                self._auto_retry_count = retry_count
+                                self._auto_retry_reason = (
+                                    "first_start_data_then_idle"
                                 )
-                                self._apply_cpu_freq_hint(device, start_result)
-                            except Exception as exc:
-                                last_read_error = exc
-                        if time.time() - start_time >= self._startup_no_data_timeout_s:
-                            detail = (
-                                f"：{last_read_error}" if last_read_error is not None else ""
-                            )
+                                logger.warning(
+                                    "SystemView 连接代次 %d 的首次启动疑似触发"
+                                    "探针附着复位,自动重启会话重试 %d/%d",
+                                    self._connection_generation,
+                                    retry_count,
+                                    _SYSTEMVIEW_FIRST_START_MAX_RETRIES,
+                                )
+                                stop_error = None
+                                try:
+                                    device.systemview_stop()
+                                except Exception as exc:
+                                    stop_error = exc
+                                    stop_text = str(exc)
+                                    if self._auto_retry_stop_error:
+                                        self._auto_retry_stop_error += "; " + stop_text
+                                    else:
+                                        self._auto_retry_stop_error = stop_text
+                                    logger.warning(
+                                        "SystemView 首次启动自动重试前停止失败: %s",
+                                        exc,
+                                    )
+                                # The failed burst belongs to the reset trace,
+                                # not the replacement session. Reset all parser-
+                                # generation state so the GUI receives one clean
+                                # timeline after the bounded retry.
+                                self._parser = self._create_parser(device)
+                                self._history.clear()
+                                self._stats = {"events": 0, "bytes": 0}
+                                self._resolved_task_names.clear()
+                                self._name_resolution_attempted.clear()
+                                self._name_resolution_disabled = False
+                                self._last_name_resolution = 0.0
+                                self._target_overflow_events = 0
+                                self._target_drop_count_baseline = None
+                                self._target_drop_count = None
+                                self._raw_bytes_without_events = 0
+                                no_event_started = None
+                                attempt_had_data = False
+                                self._progress_state = "starting"
+                                self._bridge.put({
+                                    "event": "status",
+                                    "stats": dict(self._stats),
+                                    "history_size": 0,
+                                    **self._status_meta(),
+                                })
+                                try:
+                                    retry_result = device.systemview_start(
+                                        addr, channel=channel, mode=mode,
+                                        search_size=search_size,
+                                    )
+                                    self._apply_cpu_freq_hint(
+                                        device, retry_result,
+                                    )
+                                except Exception as exc:
+                                    stop_detail = (
+                                        "; retry stop also failed: %s" % stop_error
+                                        if stop_error is not None else ""
+                                    )
+                                    raise RuntimeError(
+                                        "SystemView 首次启动自动重试失败: %s%s"
+                                        % (exc, stop_detail)
+                                    ) from exc
+                                last_data_mono = time.monotonic()
+                                continue
+                            if had_data:
+                                if retry_count and not attempt_had_data:
+                                    raise RuntimeError(
+                                        "SystemView 首次启动自动重试 "
+                                        f"{retry_count} 次后仍未收到数据"
+                                        + (
+                                            "(重试前 stop 失败: %s)"
+                                            % self._auto_retry_stop_error
+                                            if self._auto_retry_stop_error else ""
+                                        )
+                                    )
+                                raise RuntimeError(
+                                    "SystemView 数据流已中断(距最后数据 "
+                                    f"{idle:.1f}s 无新事件)"
+                                    + (
+                                        f"(已自动重试首次启动 {retry_count} 次)"
+                                        if retry_count else ""
+                                    )
+                                )
                             raise RuntimeError(
                                 "SystemView 启动后未收到数据，请检查 RTT 地址、"
-                                f"通道和下位机 SystemView 配置{detail}"
+                                "通道和下位机 SystemView 配置"
                             )
                         continue
-                    empty_cycles = 0
-                    last_read_error = None
+                    last_data_mono = time.monotonic()
+                    had_data = True
+                    attempt_had_data = True
                     self._stats["bytes"] += len(raw)
                     now = time.time()
                     evs = self._parser.feed(raw)
@@ -823,17 +956,25 @@ class SystemViewStreamManager:
                             )
                     self._note_init_cpu_freq(evs)
                     self._ensure_event_time_fields(evs)
-                    self._maybe_resolve_task_names(
+                    if self._maybe_resolve_task_names(
                         device, evs, addr=addr, channel=channel,
                         mode=mode, search_size=search_size,
-                    )
+                    ):
+                        # 解析内部 stop/start 耗时 ~5-12s 且期间无数据可读,
+                        # 必须重置空闲看门狗基准,否则解析后的首个空读会被
+                        # 误判为流中断。
+                        last_data_mono = time.monotonic()
                     self._apply_task_names(evs)
                     self._process_events(evs, now=now)
             except Exception as e:
                 logger.error("SystemView stream error: %s", e)
                 self._progress_state = "error"
                 self._progress_error = str(e)
-                self._bridge.put({"event": "error", "message": str(e)})
+                self._bridge.put({
+                    "event": "error",
+                    "message": str(e),
+                    "session_generation": session_generation,
+                })
                 start_failure = e
             finally:
                 try:
@@ -851,7 +992,10 @@ class SystemViewStreamManager:
                         if self._progress_state != "error":
                             self._progress_state = "stopped"
                         try:
-                            self._bridge.put({"event": "stopped"})
+                            self._bridge.put({
+                                "event": "stopped",
+                                "session_generation": session_generation,
+                            })
                         finally:
                             self._bridge.stop()
                 finally:
@@ -925,19 +1069,39 @@ class SystemViewStreamManager:
 
     def _apply_cpu_freq_hint(self, device, start_result: dict | None = None) -> int:
         p = self._parser
-        if not p or p.cpu_freq:
-            if p and p.cpu_freq and not self._cpu_freq_source:
-                self._cpu_freq_source = "parser_default"
-            return p.cpu_freq if p else 0
+        if not p:
+            return 0
 
+        result = start_result or {}
         freq = 0
         source = ""
-        result = start_result or {}
         for key in ("cpu_freq", "cpu_freq_hint"):
             freq = _positive_int(result.get(key))
             if freq:
                 source = str(result.get("cpu_freq_source") or "systemview_start")
                 break
+
+        # A runtime symbol read is authoritative even when the parser was
+        # seeded from a project default such as a stale RT_SYSVIEW_CPU_FREQ.
+        # Explicit hints without a source retain the historical behavior too.
+        runtime_hint = bool(freq) and (
+            source in _RUNTIME_CPU_FREQ_SOURCES
+            or ("cpu_freq_hint" in result and not result.get("cpu_freq_source"))
+        )
+        if runtime_hint:
+            set_cpu_freq = getattr(p, "set_cpu_freq", None)
+            if callable(set_cpu_freq):
+                set_cpu_freq(freq, lock=True)
+            else:
+                p._cpu_freq = freq
+            self._cpu_freq_source = source
+            self._ensure_event_time_fields(self._history)
+            return freq
+
+        if p.cpu_freq:
+            if p and p.cpu_freq and not self._cpu_freq_source:
+                self._cpu_freq_source = "parser_default"
+            return p.cpu_freq
 
         if not freq:
             device_parser = getattr(device, "_systemview_parser", None)
@@ -959,7 +1123,11 @@ class SystemViewStreamManager:
                 source = "mcu_profile_default"
 
         if freq:
-            p._cpu_freq = freq
+            set_cpu_freq = getattr(p, "set_cpu_freq", None)
+            if callable(set_cpu_freq):
+                set_cpu_freq(freq)
+            else:
+                p._cpu_freq = freq
             self._cpu_freq_source = source
             self._ensure_event_time_fields(self._history)
         return freq
@@ -990,6 +1158,8 @@ class SystemViewStreamManager:
         return 0
 
     def _note_init_cpu_freq(self, events: list[dict]) -> None:
+        if self._cpu_freq_source in _RUNTIME_CPU_FREQ_SOURCES:
+            return
         for ev in events:
             if ev.get("kind") == "init" and _positive_int(ev.get("cpu_freq")):
                 self._cpu_freq_source = "INIT"
@@ -1114,6 +1284,14 @@ class SystemViewStreamManager:
 
     def _status_meta(self) -> dict:
         p = self._parser
+        session_status = {
+            "connection_generation": self._connection_generation,
+            "session_generation": self._session_generation,
+            "first_start_on_connection": self._first_start_on_connection,
+            "auto_retry_count": self._auto_retry_count,
+            "auto_retry_reason": self._auto_retry_reason,
+            "auto_retry_stop_error": self._auto_retry_stop_error,
+        }
         if not p:
             return {
                 "synced": False,
@@ -1127,6 +1305,7 @@ class SystemViewStreamManager:
                 "progress_state": self._progress_state,
                 "progress_error": self._progress_error,
                 "raw_bytes_without_events": self._raw_bytes_without_events,
+                **session_status,
                 **self._target_overflow_status(),
                 "task_names": {},
                 "isr_names": {},
@@ -1147,6 +1326,7 @@ class SystemViewStreamManager:
             "progress_state": self._progress_state,
             "progress_error": self._progress_error,
             "raw_bytes_without_events": self._raw_bytes_without_events,
+            **session_status,
             **self._target_overflow_status(),
             "task_names": dict(p._task_names),
             "isr_names": dict(p._isr_names),
@@ -1217,27 +1397,61 @@ class SystemViewStreamManager:
         channel: int,
         mode: int,
         search_size: int,
-    ) -> None:
+    ) -> bool:
+        # 任务名在线解析需要 stop/start 整个 SystemView 流,代价高昂且有两
+        # 个陷阱:(1) 非 RT-Thread 目标(FreeRTOS 等)解析注定空手而归,若不
+        # 禁用会每 3 秒拆一次流;(2) 拆流后 stop/start 失败必须如实上抛,
+        # 否则会话被留在死态,外层看门狗随后误报"启动后未收到数据"。因此:
+        # 解析一次空结果即永久禁用;失败上抛真实根因。返回 True 表示内部
+        # 执行过 stop/start(调用方需重置空闲看门狗基准)。
+        if getattr(self, "_name_resolution_disabled", False):
+            return False
         ids = self._unknown_task_ids(events)
         if not ids:
-            return
+            return False
         now = time.time()
         if now - self._last_name_resolution < 3.0:
-            return
+            return False
         self._last_name_resolution = now
         self._name_resolution_attempted.update(ids)
 
         try:
             device.systemview_stop()
-            try:
-                self._resolve_task_names(device, ids)
-            finally:
-                start_result = device.systemview_start(
-                    addr, channel=channel, mode=mode, search_size=search_size,
-                )
-                self._apply_cpu_freq_hint(device, start_result)
         except Exception as e:
-            logger.debug("SystemView task-name resolution failed: %s", e)
+            # stop 失败时设备侧会话已被拆除(device.systemview_stop 的 finally
+            # 总会清引用),继续轮询只会得到派生错误——如实上抛真实根因。
+            self._name_resolution_disabled = True
+            raise RuntimeError(
+                "SystemView 流在任务名解析时停止失败: %s" % e
+            ) from e
+        resolved: dict | None
+        try:
+            resolved = self._resolve_task_names(device, ids)
+        except Exception as e:
+            resolved = None
+            logger.warning("SystemView task-name resolution failed: %s", e)
+        try:
+            start_result = device.systemview_start(
+                addr, channel=channel, mode=mode, search_size=search_size,
+            )
+            self._apply_cpu_freq_hint(device, start_result)
+        except Exception as e:
+            # 会话已被 stop 拆除且重启失败——如实终止并保留真实根因,
+            # 不让轮询空转到看门狗误报。
+            self._name_resolution_disabled = True
+            raise RuntimeError(
+                "SystemView 流在任务名解析后重启失败: %s" % e
+            ) from e
+        if not resolved:
+            # RT-Thread 之外的解析路径拿不到线程对象名;这类目标的任务名
+            # 由 START 突发中的 TASK_INFO 事件携带。一次空结果后不再为
+            # 解析牺牲数据流。
+            self._name_resolution_disabled = True
+            logger.info(
+                "SystemView 任务名在线解析无结果,已禁用(任务名改由 "
+                "TASK_INFO 事件提供)"
+            )
+        return True
 
     def stop(self, timeout: float = 5.0) -> bool:
         thread = self._thread
@@ -1341,7 +1555,9 @@ class SuperWatchStreamManager:
     """
 
     def __init__(
-        self, stream_hub=None, *, batch_samples: int = 32,
+        self, stream_hub=None, *, batch_samples: int = 512,
+        batch_bytes: int = 64 * 1024,
+        batch_max_latency: float = 0.020,
         clock=time.perf_counter,
     ):
         self._bridge = AsyncBridge()
@@ -1359,8 +1575,14 @@ class SuperWatchStreamManager:
         self._origin_us: int | None = None
         self._stream_hub = stream_hub
         self._batch_samples = max(1, int(batch_samples))
+        self._batch_bytes = max(1024, int(batch_bytes))
+        self._batch_max_latency = max(0.001, float(batch_max_latency))
         self._clock = clock
-        self._pending_samples: list[tuple[float, ...]] = []
+        self._pending_values = array("f")
+        self._pending_sample_times = array("d")
+        self._pending_sample_count = 0
+        self._pending_channel_count = 0
+        self._pending_started_at: float | None = None
         # Empty layout version 1 is the immutable bootstrap replay for clients
         # that subscribe before a runtime is prepared.  Cache replacement is
         # one reference assignment, so readers never observe payload/snapshot
@@ -1386,6 +1608,7 @@ class SuperWatchStreamManager:
         self._acquisition_mode = "idle"
         self._stream_integrity: dict[str, int] = {}
         self._dump_restart = threading.Event()
+        self._array_snapshot: dict[str, Any] | None = None
         self.set_stream_hub(stream_hub)
 
     def set_stream_hub(self, stream_hub) -> None:
@@ -1446,6 +1669,7 @@ class SuperWatchStreamManager:
                         for path in selected_paths:
                             rebound.add(path)
                     self._runtime = rebound
+                    self._rebind_array_snapshot_locked(new_catalog)
                     self._origin_us = None
                     self._flush_binary_batch_locked()
                     self._rebuild_metadata_cache_locked(publish=True)
@@ -1474,6 +1698,84 @@ class SuperWatchStreamManager:
             )
             self._rebuild_metadata_cache_locked(publish=True)
 
+    def _build_array_snapshot_locked(
+        self,
+        catalog,
+        name: str,
+        start_index: int,
+        count: int,
+    ) -> dict[str, Any]:
+        from mklink.superwatch import WatchItem
+
+        descriptors = catalog.array_descriptors(
+            name,
+            start_index=start_index,
+            count=count,
+        )
+        items = tuple(
+            WatchItem(
+                descriptor.path,
+                descriptor.address,
+                descriptor.type_name,
+                descriptor.size,
+                enum_values={
+                    value: label for label, value in descriptor.enum_values.items()
+                },
+                scalar_kind=(
+                    "signed"
+                    if descriptor.scalar_kind == "enum" and descriptor.enum_signed
+                    else descriptor.scalar_kind
+                ),
+            )
+            for descriptor in descriptors
+        )
+        return {
+            "name": name,
+            "type_name": descriptors[0].type_name,
+            "address": descriptors[0].address,
+            "element_size": descriptors[0].size,
+            "start_index": start_index,
+            "count": len(descriptors),
+            "items": items,
+            "sequence": 0,
+            "timestamp_us": None,
+            "values": [],
+        }
+
+    def _rebind_array_snapshot_locked(self, catalog) -> None:
+        if self._array_snapshot is None:
+            return
+        snapshot = self._array_snapshot
+        try:
+            self._array_snapshot = self._build_array_snapshot_locked(
+                catalog,
+                snapshot["name"],
+                snapshot["start_index"],
+                snapshot["count"],
+            )
+        except Exception:
+            self._array_snapshot = None
+
+    def _sampling_layout_locked(self):
+        from mklink.superwatch import (
+            SUPERWATCH_DUMP_MERGE_GAP,
+            build_read_blocks,
+        )
+
+        scalar_items = tuple(self._runtime.items) if self._runtime is not None else ()
+        if self._array_snapshot is None:
+            blocks = tuple(self._runtime.blocks) if self._runtime is not None else ()
+            return scalar_items, scalar_items, blocks
+        items_by_name = {item.name: item for item in scalar_items}
+        for item in self._array_snapshot["items"]:
+            items_by_name.setdefault(item.name, item)
+        items = tuple(items_by_name.values())
+        return (
+            scalar_items,
+            items,
+            tuple(build_read_blocks(items, max_gap=SUPERWATCH_DUMP_MERGE_GAP)),
+        )
+
     def start(self, device) -> None:
         if self._thread is not None and self._thread.is_alive():
             if self.running:
@@ -1500,11 +1802,10 @@ class SuperWatchStreamManager:
                         if (
                             self._collecting.is_set()
                             and self._runtime is not None
-                            and bool(self._runtime.items)
+                            and bool(self._runtime.items or self._array_snapshot)
                         ):
                             runtime = self._runtime
-                            blocks = tuple(runtime.blocks)
-                            items = tuple(runtime.items)
+                            scalar_items, items, dump_blocks = self._sampling_layout_locked()
                             config_generation = self._config_generation
                             origin_us = self._origin_us
                         else:
@@ -1520,32 +1821,29 @@ class SuperWatchStreamManager:
                             "drain_stream_bytes", "_exit_stream",
                         )
                     )
-                    if supports_dump and 0 < len(blocks) <= 16:
+                    from mklink.dump_memory import MAX_SAFE_REPL_REGIONS
+                    if not supports_dump:
+                        raise RuntimeError(
+                            "SuperWatch requires dump_memory binary streaming; "
+                            "read_ram fallback is disabled"
+                        )
+                    if len(dump_blocks) > MAX_SAFE_REPL_REGIONS:
+                        raise RuntimeError(
+                            "SuperWatch needs more than 15 dump_memory regions; "
+                            "select fewer or closer variables"
+                        )
+                    if dump_blocks:
                         from mklink.dump_memory import (
                             DumpMemoryStreamSession,
-                            decode_frame_to_points,
                         )
+                        from mklink.superwatch import compile_frame_decoder
 
                         self._acquisition_mode = "dump-memory"
-                        region_pairs = [(block.address, block.size) for block in blocks]
-                        block_addresses = [
-                            (
-                                block.address,
-                                block.size,
-                                [
-                                    (
-                                        item.name,
-                                        item.type_name,
-                                        item.address - block.address,
-                                        item.size,
-                                        getattr(item, "scalar_kind", None),
-                                        item.enum_values,
-                                    )
-                                    for item in block.items
-                                ],
-                            )
-                            for block in blocks
+                        region_pairs = [
+                            (block.address, block.size) for block in dump_blocks
                         ]
+                        decoder = compile_frame_decoder(items, dump_blocks)
+                        scalar_count = len(scalar_items)
                         session = DumpMemoryStreamSession(
                             bridge, region_pairs, self._interval,
                         )
@@ -1562,23 +1860,36 @@ class SuperWatchStreamManager:
                                     completed_integrity, session.stats,
                                 )
                                 if not frames:
+                                    self._flush_binary_batch_if_due()
                                     stop_event.wait(0.0005)
                                     continue
                                 if not self._collecting.is_set():
                                     continue
                                 for frame in frames:
-                                    points, origin_us = decode_frame_to_points(
-                                        frame, block_addresses, origin_us,
-                                    )
+                                    row = decoder.decode(frame)
+                                    timestamp_us = int(frame["timestamp_us"])
+                                    if origin_us is None:
+                                        origin_us = timestamp_us
+                                    sample_time_ms = (timestamp_us - origin_us) / 1000.0
                                     with self._read_lock:
                                         if config_generation != self._config_generation:
                                             self._dropped_read_cycles += 1
                                             break
+                                        if row is None:
+                                            self._dropped_read_cycles += 1
+                                            continue
                                         self._origin_us = origin_us
-                                        if self._publish_sample_points_locked(
-                                            points,
-                                            names=tuple(item.name for item in items),
-                                        ):
+                                        published = self._publish_sample_values_locked(
+                                            row,
+                                            channel_count=scalar_count,
+                                            sample_time=sample_time_ms,
+                                        )
+                                        snapshot_updated = self._update_array_snapshot_values_locked(
+                                            row, decoder.channel_index, timestamp_us,
+                                        )
+                                        if snapshot_updated and not published:
+                                            self._record_sample_rate_locked()
+                                        if published or snapshot_updated:
                                             self._completed_read_cycles += 1
                         finally:
                             session.stop()
@@ -1587,36 +1898,6 @@ class SuperWatchStreamManager:
                             )
                             self._dump_restart.clear()
                         continue
-                    self._acquisition_mode = "read-memory"
-                    t0 = time.monotonic()
-                    try:
-                        from mklink.superwatch import sample_blocks
-                        result = sample_blocks(
-                            blocks,
-                            origin_us=origin_us,
-                            bridge=device._bridge,
-                        )
-                        with self._read_lock:
-                            if (
-                                runtime is not self._runtime
-                                or config_generation != self._config_generation
-                            ):
-                                self._dropped_read_cycles += 1
-                            else:
-                                self._origin_us = result.origin_us
-                                self._publish_sample_points_locked(
-                                    result.points,
-                                    names=tuple(item.name for item in items),
-                                )
-                                self._completed_read_cycles += 1
-                    except Exception as e:
-                        with self._read_lock:
-                            self._read_errors += 1
-                        logger.debug("SuperWatch poll error: %s", e)
-                        self._bridge.put({"event": "error", "message": str(e)})
-                    elapsed = time.monotonic() - t0
-                    remaining = max(0.0, self._interval - elapsed)
-                    stop_event.wait(timeout=remaining)
             except Exception as e:
                 logger.error("SuperWatch stream error: %s", e)
                 self._bridge.put({"event": "error", "message": str(e)})
@@ -1818,6 +2099,7 @@ class SuperWatchStreamManager:
                     raise SuperWatchTransactionError("rebind", exc) from exc
                 with self._read_lock:
                     self._runtime = new_runtime
+                    self._rebind_array_snapshot_locked(new_catalog)
                     self._origin_us = None
                     self._flush_binary_batch_locked()
                     self._rebuild_metadata_cache_locked(publish=True)
@@ -1848,6 +2130,104 @@ class SuperWatchStreamManager:
             result = self._runtime.remove(name)
             self._rebuild_metadata_cache_locked(publish=True)
             return {"item": result}
+
+    def select_array_snapshot(
+        self,
+        name: str,
+        *,
+        start_index: int,
+        count: int,
+    ) -> dict:
+        with self._read_lock:
+            if self._runtime is None or self._runtime.symbol_catalog is None:
+                return {"error": "SuperWatch symbol catalog is unavailable"}
+            snapshot = self._build_array_snapshot_locked(
+                self._runtime.symbol_catalog,
+                name,
+                start_index,
+                count,
+            )
+            self._array_snapshot = snapshot
+            self._config_generation += 1
+            self._origin_us = None
+            self._dump_restart.set()
+            return {"snapshot": self._array_snapshot_payload_locked()}
+
+    def clear_array_snapshot(self) -> dict:
+        with self._read_lock:
+            if self._array_snapshot is not None:
+                self._array_snapshot = None
+                self._config_generation += 1
+                self._origin_us = None
+                self._dump_restart.set()
+            return {"snapshot": None}
+
+    def get_array_snapshot(self) -> dict:
+        with self._read_lock:
+            return {"snapshot": self._array_snapshot_payload_locked()}
+
+    def _array_snapshot_payload_locked(self) -> dict | None:
+        if self._array_snapshot is None:
+            return None
+        return {
+            key: value
+            for key, value in self._array_snapshot.items()
+            if key != "items"
+        }
+
+    def _update_array_snapshot_locked(self, points) -> bool:
+        if self._array_snapshot is None:
+            return False
+        names = tuple(item.name for item in self._array_snapshot["items"])
+        merged: dict[str, Any] = {}
+        timestamp_us = None
+        for point in points:
+            for name in names:
+                if name in point:
+                    merged[name] = point[name]
+            if point.get("timestamp_us") is not None:
+                timestamp_us = point["timestamp_us"]
+        if any(name not in merged for name in names):
+            return False
+        try:
+            values = [float(merged[name]) for name in names]
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in values):
+            return False
+        self._array_snapshot = {
+            **self._array_snapshot,
+            "sequence": self._array_snapshot["sequence"] + 1,
+            "timestamp_us": timestamp_us,
+            "values": values,
+        }
+        return True
+
+    def _update_array_snapshot_values_locked(
+        self,
+        row,
+        channel_index: dict[str, int],
+        timestamp_us: int,
+    ) -> bool:
+        """Update the optional array view from an already decoded numeric row."""
+        if self._array_snapshot is None:
+            return False
+        try:
+            values = [
+                float(row[channel_index[item.name]])
+                for item in self._array_snapshot["items"]
+            ]
+        except (KeyError, IndexError, TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in values):
+            return False
+        self._array_snapshot = {
+            **self._array_snapshot,
+            "sequence": self._array_snapshot["sequence"] + 1,
+            "timestamp_us": timestamp_us,
+            "values": values,
+        }
+        return True
 
     def publish_metadata(self, *, force: bool = False) -> int:
         with self._read_lock:
@@ -1917,8 +2297,78 @@ class SuperWatchStreamManager:
             return False
         if not all(math.isfinite(value) for value in row):
             return False
+        sample_times = [point.get("_t") for point in points if point.get("_t") is not None]
+        try:
+            sample_time = max(float(value) for value in sample_times) * 1000.0 if sample_times else None
+        except (TypeError, ValueError):
+            return False
+        if sample_time is not None and (not math.isfinite(sample_time) or sample_time < 0):
+            return False
+        return self._publish_sample_values_locked(
+            row, channel_count=len(row), sample_time=sample_time,
+        )
+
+    def _publish_sample_values_locked(
+        self,
+        values,
+        *,
+        channel_count: int,
+        sample_time: float | None,
+    ) -> bool:
+        """Append one numeric row to typed batch buffers without row objects."""
+        if channel_count <= 0 or len(values) < channel_count:
+            return False
+        if sample_time is not None and (
+            not math.isfinite(sample_time) or sample_time < 0
+        ):
+            return False
+        try:
+            if any(not math.isfinite(float(values[index])) for index in range(channel_count)):
+                return False
+            if self._pending_sample_count and self._pending_channel_count != channel_count:
+                self._flush_binary_batch_locked()
+            if self._pending_sample_count == 0:
+                self._pending_channel_count = channel_count
+                self._pending_started_at = self._clock()
+            for index in range(channel_count):
+                self._pending_values.append(float(values[index]))
+            self._pending_sample_times.append(
+                float(sample_time) if sample_time is not None else math.nan
+            )
+        except (OverflowError, TypeError, ValueError):
+            return False
+        self._pending_sample_count += 1
         if time.monotonic() - self._last_metadata_publish_monotonic >= 1.0:
             self._publish_cached_metadata()
+        self._record_sample_rate_locked()
+        if self._binary_batch_due_locked():
+            self._flush_binary_batch_locked()
+        return True
+
+    def _binary_batch_due_locked(self) -> bool:
+        if self._pending_sample_count <= 0:
+            return False
+        estimated_bytes = self._pending_sample_count * (
+            self._pending_channel_count * 4 + 8
+        )
+        elapsed = (
+            self._clock() - self._pending_started_at
+            if self._pending_started_at is not None else 0.0
+        )
+        return (
+            self._pending_sample_count >= self._batch_samples
+            or estimated_bytes >= self._batch_bytes
+            or elapsed >= self._batch_max_latency
+            or self._interval >= self._batch_max_latency
+        )
+
+    def _flush_binary_batch_if_due(self) -> bool:
+        with self._read_lock:
+            if not self._binary_batch_due_locked():
+                return True
+            return self._flush_binary_batch_locked()
+
+    def _record_sample_rate_locked(self) -> None:
         completed_at = self._clock()
         self._rate_timestamps.append(completed_at)
         cutoff = completed_at - 1.0
@@ -1931,31 +2381,40 @@ class SuperWatchStreamManager:
             )
         else:
             self._actual_rate = 0.0
-        self._pending_samples.append(row)
-        if len(self._pending_samples) >= self._batch_samples:
-            self._flush_binary_batch_locked()
-        return True
 
     def _flush_binary_batch(self) -> bool:
         with self._read_lock:
             return self._flush_binary_batch_locked()
 
     def _flush_binary_batch_locked(self) -> bool:
-        if not self._pending_samples:
+        if self._pending_sample_count <= 0:
             return True
-        pending = self._pending_samples
-        self._pending_samples = []
+        values = self._pending_values
+        self._pending_values = array("f")
+        times = self._pending_sample_times
+        self._pending_sample_times = array("d")
+        sample_count = self._pending_sample_count
+        self._pending_sample_count = 0
+        self._pending_channel_count = 0
+        self._pending_started_at = None
         try:
             if self._stream_hub is None:
                 raise RuntimeError("SuperWatch binary stream hub is unavailable")
+            if sys.byteorder != "little":
+                values.byteswap()
+                times.byteswap()
+            payload = values.tobytes()
+            flags = SUPERWATCH_SAMPLE_MAJOR_FLOAT32
+            if len(times) == sample_count and all(math.isfinite(value) for value in times):
+                payload = times.tobytes() + payload
+                flags = SUPERWATCH_TIMESTAMPED_FLOAT32
             self._stream_hub.publish(
-                encode_waveform_samples(pending), item_count=len(pending),
-                flags=SUPERWATCH_SAMPLE_MAJOR_FLOAT32,
+                payload, item_count=sample_count, flags=flags,
                 stream_type=StreamType.SUPERWATCH,
             )
         except Exception as exc:
             self._binary_dropped_batches += 1
-            self._binary_dropped_items += len(pending)
+            self._binary_dropped_items += sample_count
             logger.warning("SuperWatch binary batch dropped: %s", exc)
             return False
         return True
@@ -1968,6 +2427,7 @@ class SuperWatchStreamManager:
     def pause(self) -> None:
         self._collecting.clear()
         with self._read_lock:
+            self._flush_binary_batch_locked()
             self._rate_timestamps.clear()
             self._actual_rate = 0.0
 
@@ -2009,6 +2469,11 @@ class SuperWatchStreamManager:
             "binary_drops": {
                 "batches": self._binary_dropped_batches,
                 "items": self._binary_dropped_items,
+            },
+            "binary_batch_policy": {
+                "max_samples": self._batch_samples,
+                "max_bytes": self._batch_bytes,
+                "max_latency_ms": round(self._batch_max_latency * 1000.0, 3),
             },
             "acquisition_mode": self._acquisition_mode,
             "stream_integrity": dict(self._stream_integrity),
@@ -2072,7 +2537,7 @@ class SuperWatchStreamManager:
 class SerialStreamManager:
     """Manages serial port monitoring with SSE output."""
 
-    def __init__(self):
+    def __init__(self, stream_hub=None):
         self._bridge = AsyncBridge()
         self._monitor = None
         self._running = False
@@ -2084,6 +2549,41 @@ class SerialStreamManager:
         self._rx_bytes = 0
         self._tx_bytes = 0
         self._start_time = 0.0
+        self._stream_hub = stream_hub
+        self._ymodem_lock = threading.Lock()
+        self._lifecycle_lock = threading.RLock()
+        self._ymodem_thread: threading.Thread | None = None
+        self._ymodem_cancel: threading.Event | None = None
+        self._ymodem_generation = 0
+        self._ymodem_status: dict[str, Any] = self._idle_ymodem_status()
+        self._ymodem_trace_lock = threading.Lock()
+        self._ymodem_trace: deque[dict[str, Any]] = deque(maxlen=512)
+        self._ymodem_trace_seq = 0
+        self._ymodem_trace_transfer_id = 0
+
+    @staticmethod
+    def _idle_ymodem_status() -> dict[str, Any]:
+        return {
+            "transfer_id": 0,
+            "state": "idle",
+            "active": False,
+            "phase": "idle",
+            "port": "",
+            "filename": "",
+            "sent_bytes": 0,
+            "total_bytes": 0,
+            "percent": 0,
+            "block": 0,
+            "retries": 0,
+            "error": "",
+        }
+
+    def set_stream_hub(self, stream_hub) -> None:
+        self._stream_hub = stream_hub
+
+    def detach_stream_hub(self, stream_hub) -> None:
+        if self._stream_hub is stream_hub:
+            self._stream_hub = None
 
     @property
     def running(self) -> bool:
@@ -2091,8 +2591,21 @@ class SerialStreamManager:
 
     def start(self, ports: list[dict], profile: dict | None = None,
               auto_reply_rules: list[dict] | None = None) -> None:
+        with self._lifecycle_lock:
+            self._start_locked(ports, profile, auto_reply_rules)
+
+    def _start_locked(self, ports: list[dict], profile: dict | None = None,
+                      auto_reply_rules: list[dict] | None = None) -> None:
         if self._running:
             return
+        with self._ymodem_lock:
+            if self._ymodem_status["active"]:
+                raise RuntimeError("previous YMODEM transfer is still active")
+            if self._ymodem_thread is not None and self._ymodem_thread.is_alive():
+                raise RuntimeError("previous YMODEM worker thread is still active")
+            self._ymodem_status = self._idle_ymodem_status()
+            self._ymodem_thread = None
+            self._ymodem_cancel = None
 
         from mklink.serial._monitor import SerialMonitor
 
@@ -2106,6 +2619,12 @@ class SerialStreamManager:
         self._start_time = time.time()
 
         def _event_callback(event):
+            if event.direction == "RX":
+                self._rx_count += 1
+            else:
+                self._tx_count += 1
+            if self._bridge.client_count == 0:
+                return
             ts = time.strftime("%H:%M:%S", time.localtime(event.timestamp))
             ms = int((event.timestamp % 1) * 1000)
             raw_hex = event.raw.hex().upper()
@@ -2124,11 +2643,6 @@ class SerialStreamManager:
                             fields[k] = {"value": v.get("value", ""), "unit": v.get("unit", "")}
                         else:
                             fields[k] = {"value": str(v), "unit": ""}
-
-            if event.direction == "RX":
-                self._rx_count += 1
-            else:
-                self._tx_count += 1
 
             self._bridge.put({
                 "event": "data",
@@ -2151,6 +2665,15 @@ class SerialStreamManager:
                 self._rx_bytes += len(data)
             else:
                 self._tx_bytes += len(data)
+            if self._stream_hub is not None:
+                self._stream_hub.publish(
+                    data,
+                    item_count=len(data),
+                    flags=(SERIAL_RX_BYTES if direction == "RX" else SERIAL_TX_BYTES),
+                    stream_type=StreamType.SERIAL,
+                )
+            if self._bridge.client_count == 0:
+                return
             self._bridge.put({
                 "event": "terminal",
                 "timestamp": timestamp,
@@ -2159,33 +2682,251 @@ class SerialStreamManager:
                 "data_base64": base64.b64encode(data).decode("ascii"),
             })
 
+        def _protocol_callback(
+            port: str,
+            direction: str,
+            data: bytes,
+            timestamp: float,
+        ):
+            if direction == "RX":
+                self._rx_count += 1
+                self._rx_bytes += len(data)
+            else:
+                self._tx_count += 1
+                self._tx_bytes += len(data)
+            with self._ymodem_trace_lock:
+                self._ymodem_trace_seq += 1
+                self._ymodem_trace.append({
+                    "seq": self._ymodem_trace_seq,
+                    "transfer_id": self._ymodem_trace_transfer_id,
+                    "timestamp": timestamp,
+                    "port": port,
+                    "direction": direction,
+                    "size": len(data),
+                    "hex": data.hex(" ").upper(),
+                })
+
         self._monitor = SerialMonitor(
             ports=ports,
             profile=profile,
             auto_reply_rules=auto_reply_rules,
             event_callback=_event_callback,
             chunk_callback=_chunk_callback,
+            protocol_callback=_protocol_callback,
         )
         self._monitor.start()
         self._running = True
         self._bridge.put({"event": "status", **self.get_status()})
 
     def stop(self) -> None:
-        if self._monitor:
-            self._monitor.stop()
+        with self._lifecycle_lock:
+            self._cancel_ymodem_locked(wait=False)
+            monitor = self._monitor
+            if monitor is not None:
+                monitor.stop()
+            with self._ymodem_lock:
+                transfer_thread = self._ymodem_thread
+            if (
+                transfer_thread is not None
+                and transfer_thread is not threading.current_thread()
+                and transfer_thread.is_alive()
+            ):
+                transfer_thread.join(timeout=_YMODEM_STOP_TIMEOUT)
+            if transfer_thread is not None and transfer_thread.is_alive():
+                raise TimeoutError(
+                    "YMODEM transfer did not stop within the shutdown timeout"
+                )
             self._monitor = None
-        self._running = False
-        self._bridge.put({"event": "stopped"})
-        self._bridge.stop()
+            self._running = False
+            self._bridge.put({"event": "stopped"})
+            self._bridge.stop()
 
     def send(self, port: str, data: bytes) -> bool:
-        if not self._monitor:
-            return False
-        return self._monitor.send(port, data)
+        with self._lifecycle_lock:
+            monitor = self._monitor
+            if monitor is None or not self._running:
+                return False
+            with self._ymodem_lock:
+                if self._ymodem_status["active"]:
+                    return False
+                return monitor.send(port, data)
 
     def send_all(self, data: bytes) -> None:
-        if self._monitor:
-            self._monitor.send_all(data)
+        with self._lifecycle_lock:
+            monitor = self._monitor
+            if monitor is None or not self._running:
+                return
+            with self._ymodem_lock:
+                if self._ymodem_status["active"]:
+                    return
+                monitor.send_all(data)
+
+    def start_ymodem(self, port: str, data: bytes, filename: str) -> dict[str, Any]:
+        """Start one asynchronous YMODEM transfer on the monitored port."""
+        with self._lifecycle_lock:
+            return self._start_ymodem_locked(port, data, filename)
+
+    def _start_ymodem_locked(
+        self,
+        port: str,
+        data: bytes,
+        filename: str,
+    ) -> dict[str, Any]:
+        monitor = self._monitor
+        if monitor is None or not self._running:
+            raise RuntimeError("serial monitor not running")
+        if not data:
+            raise ValueError("YMODEM file is empty")
+        if monitor.port_status.get(port) != "open":
+            raise RuntimeError(f"serial port {port} is not open")
+
+        with self._ymodem_lock:
+            if self._ymodem_status["active"]:
+                raise RuntimeError("a YMODEM transfer is already active")
+            self._ymodem_generation += 1
+            transfer_id = self._ymodem_generation
+            with self._ymodem_trace_lock:
+                self._ymodem_trace.clear()
+                self._ymodem_trace_seq = 0
+                self._ymodem_trace_transfer_id = transfer_id
+            cancel_event = threading.Event()
+            self._ymodem_cancel = cancel_event
+            self._ymodem_status = {
+                "transfer_id": transfer_id,
+                "state": "running",
+                "active": True,
+                "phase": "waiting",
+                "port": port,
+                "filename": filename,
+                "sent_bytes": 0,
+                "total_bytes": len(data),
+                "percent": 0,
+                "block": 0,
+                "retries": 0,
+                "error": "",
+            }
+
+            def progress(snapshot) -> None:
+                with self._ymodem_lock:
+                    if (
+                        self._ymodem_status["transfer_id"] != transfer_id
+                        or not self._ymodem_status["active"]
+                        or cancel_event.is_set()
+                    ):
+                        return
+                    self._ymodem_status.update({
+                        "phase": snapshot.phase,
+                        "sent_bytes": snapshot.sent_bytes,
+                        "total_bytes": snapshot.total_bytes,
+                        "percent": snapshot.percent,
+                        "block": snapshot.block,
+                        "retries": snapshot.retries,
+                    })
+                    payload = dict(self._ymodem_status)
+                self._bridge.put({"event": "ymodem", **payload})
+
+            def transfer() -> None:
+                from mklink.serial._ymodem import YModemCancelled
+
+                try:
+                    monitor.send_ymodem(
+                        port,
+                        data,
+                        filename,
+                        cancel_event=cancel_event,
+                        progress_callback=progress,
+                    )
+                except YModemCancelled as error:
+                    state = "cancelled"
+                    failure = str(error)
+                except Exception as error:
+                    logger.warning("YMODEM transfer failed on %s: %s", port, error)
+                    state = "failed"
+                    failure = str(error)
+                else:
+                    state = "completed"
+                    failure = ""
+                with self._ymodem_lock:
+                    if self._ymodem_status["transfer_id"] != transfer_id:
+                        return
+                    self._ymodem_status.update({
+                        "state": state,
+                        "active": False,
+                        "phase": state,
+                        "error": failure,
+                    })
+                    if state == "completed":
+                        self._ymodem_status["sent_bytes"] = len(data)
+                        self._ymodem_status["percent"] = 100
+                    payload = dict(self._ymodem_status)
+                self._bridge.put({"event": "ymodem", **payload})
+
+            self._ymodem_thread = threading.Thread(
+                target=transfer,
+                daemon=True,
+                name=f"serial-ymodem-{port}",
+            )
+            thread = self._ymodem_thread
+            initial = dict(self._ymodem_status)
+        self._bridge.put({"event": "ymodem", **initial})
+        try:
+            thread.start()
+        except Exception as error:
+            with self._ymodem_lock:
+                if self._ymodem_status["transfer_id"] == transfer_id:
+                    self._ymodem_status.update({
+                        "state": "failed",
+                        "active": False,
+                        "phase": "failed",
+                        "error": str(error),
+                    })
+                    failed = dict(self._ymodem_status)
+                else:
+                    failed = None
+            if failed is not None:
+                self._bridge.put({"event": "ymodem", **failed})
+            raise RuntimeError(f"failed to start YMODEM worker: {error}") from error
+        return initial
+
+    def cancel_ymodem(self, *, wait: bool = False) -> dict[str, Any]:
+        with self._lifecycle_lock:
+            return self._cancel_ymodem_locked(wait=wait)
+
+    def _cancel_ymodem_locked(self, *, wait: bool = False) -> dict[str, Any]:
+        with self._ymodem_lock:
+            if not self._ymodem_status["active"]:
+                return dict(self._ymodem_status)
+            self._ymodem_status["phase"] = "cancelling"
+            cancel_event = self._ymodem_cancel
+            thread = self._ymodem_thread
+            payload = dict(self._ymodem_status)
+        if cancel_event is not None:
+            cancel_event.set()
+        self._bridge.put({"event": "ymodem", **payload})
+        if wait and thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=_YMODEM_STOP_TIMEOUT)
+        return self.get_ymodem_status()
+
+    def get_ymodem_status(self) -> dict[str, Any]:
+        with self._ymodem_lock:
+            return dict(self._ymodem_status)
+
+    def get_ymodem_trace(self, after: int = 0, limit: int = 128) -> dict[str, Any]:
+        """Return a bounded page of raw protocol traffic after *after*."""
+        after = max(0, int(after))
+        limit = max(1, min(int(limit), 256))
+        with self._ymodem_trace_lock:
+            retained = list(self._ymodem_trace)
+            oldest = retained[0]["seq"] if retained else self._ymodem_trace_seq + 1
+            entries = [item.copy() for item in retained if item["seq"] > after][:limit]
+            next_seq = entries[-1]["seq"] if entries else after
+            dropped = max(0, oldest - after - 1)
+            return {
+                "transfer_id": self._ymodem_trace_transfer_id,
+                "entries": entries,
+                "next_seq": next_seq,
+                "dropped": dropped,
+            }
 
     def get_status(self) -> dict:
         elapsed = max(time.time() - self._start_time, 1.0)
@@ -2203,6 +2944,8 @@ class SerialStreamManager:
                 "tx_bytes": self._tx_bytes,
                 "bytes_per_sec": round((self._rx_bytes + self._tx_bytes) / elapsed, 1),
             },
+            "stream": self._stream_hub.stats().__dict__ if self._stream_hub else None,
+            "ymodem": self.get_ymodem_status(),
         }
 
     async def sse_generator(self):
@@ -2229,13 +2972,14 @@ class SerialStreamManager:
 # ---------------------------------------------------------------------------
 
 class ModbusStreamManager:
-    """Manages Modbus register polling with SSE output."""
+    """Own one serialized Modbus session and publish workbench events."""
 
     def __init__(self):
         self._bridge = AsyncBridge()
         self._thread: threading.Thread | None = None
         self._running = False
         self._client = None
+        self._worker = None
         self._slave: int = 1
         self._specs: list = []
         self._interval: float = 1.0
@@ -2243,13 +2987,30 @@ class ModbusStreamManager:
         self._history: list[dict] = []
         self._max_history = 500
         self._latest: dict = {}
+        self._connection: dict[str, Any] = {}
+        self._transaction_id = 0
+        self._event_lock = threading.Lock()
+        self._loop_thread: threading.Thread | None = None
+        self._loop_stop = threading.Event()
+        self._loop_status: dict[str, Any] = {
+            "running": False,
+            "completed": 0,
+            "requested": 0,
+            "errors": 0,
+        }
 
     @property
     def running(self) -> bool:
         return self._running
 
-    def start(self, client, slave: int, registers: list[dict] | None = None,
-              interval: float = 1.0) -> None:
+    def start(
+        self,
+        client,
+        slave: int,
+        registers: list[dict] | None = None,
+        interval: float = 1.0,
+        connection: dict[str, Any] | None = None,
+    ) -> None:
         """Start Modbus register polling.
 
         Args:
@@ -2261,13 +3022,26 @@ class ModbusStreamManager:
         if self._running:
             return
 
+        from mklink.modbus._session import ModbusWorker
+
+        self._bridge = AsyncBridge()
         self._client = client
+        self._worker = ModbusWorker(client, slave)
         self._slave = slave
         self._interval = interval
         self._stop_event.clear()
+        self._loop_stop.clear()
         self._latest = {}
+        self._history = []
+        self._connection = dict(connection or {})
+        self._loop_status = {
+            "running": False,
+            "completed": 0,
+            "requested": 0,
+            "errors": 0,
+        }
 
-        if registers:
+        if registers is not None:
             from mklink.modbus._format import RegisterSpec
             self._specs = [
                 RegisterSpec(
@@ -2281,7 +3055,11 @@ class ModbusStreamManager:
             self._specs = [RegisterSpec(addr=i, type="uint16", name=f"R{i}")
                            for i in range(10)]
 
+        self._worker.start()
         self._running = True
+
+        if not self._specs:
+            return
 
         def _poll():
             from mklink.modbus._format import registers_to_values
@@ -2296,8 +3074,8 @@ class ModbusStreamManager:
                             start_addr = group[0].addr
                             count = sum(s.reg_count for s in group)
                             n = min(count, 125)
-                            regs = self._client.read_holding_registers(
-                                start_addr, n, self._slave
+                            regs = self._worker.execute(
+                                3, start_addr, quantity=n
                             )
                             for spec in group:
                                 offset = spec.addr - start_addr
@@ -2331,34 +3109,170 @@ class ModbusStreamManager:
         self._thread.start()
 
     def stop(self) -> None:
+        self.stop_loop()
         self._stop_event.set()
         if self._thread:
             self._thread.join(timeout=5)
+        if self._worker:
+            self._worker.stop()
         self._running = False
         if self._client:
             try:
                 self._client.close()
             except Exception:
                 pass
+        self._worker = None
+        self._client = None
+        self._bridge.put({"event": "stopped"})
+        self._bridge.stop()
+
+    def trace_packet(self, sending: bool, data: bytes) -> bytes:
+        """pymodbus trace callback; publish complete TX/RX RTU frames."""
+        from mklink.modbus._session import frame_crc_ok, rtu_frame_length
+
+        payload = bytes(data)
+        expected_length = rtu_frame_length(sending, payload)
+        # The pymodbus receive trace can report an accumulating partial
+        # buffer before it reports the complete RTU frame.  Do not turn that
+        # normal transport behavior into a false CRC error in the workbench.
+        if expected_length is not None and len(payload) < expected_length:
+            return data
+        complete = expected_length is not None and len(payload) == expected_length
+        event = {
+            "event": "frame",
+            "direction": "tx" if sending else "rx",
+            "timestamp": time.time(),
+            "size": len(payload),
+            "hex": payload.hex(" ").upper(),
+            "complete": complete,
+            "crc_ok": frame_crc_ok(payload) if complete else None,
+        }
+        self._record_event(event)
+        return data
+
+    def _record_event(self, event: dict[str, Any]) -> None:
+        with self._event_lock:
+            self._history.append(event)
+            if len(self._history) > self._max_history:
+                del self._history[: len(self._history) - self._max_history]
+        self._bridge.put(event)
+
+    def transaction(
+        self,
+        fc: int,
+        start: int,
+        *,
+        quantity: int | None = None,
+        values: list[int | bool] | None = None,
+    ) -> dict[str, Any]:
+        if not self._worker or not self._running:
+            raise RuntimeError("Modbus not connected")
+        started = time.perf_counter()
+        result_values = self._worker.execute(
+            fc, start, quantity=quantity, values=values
+        )
+        with self._event_lock:
+            self._transaction_id += 1
+            transaction_id = self._transaction_id
+        result = {
+            "event": "transaction",
+            "id": transaction_id,
+            "timestamp": time.time(),
+            "slave": self._slave,
+            "fc": fc,
+            "start": start,
+            "quantity": quantity if quantity is not None else len(result_values),
+            "values": result_values,
+            "duration_ms": round((time.perf_counter() - started) * 1000, 3),
+            "ok": True,
+        }
+        self._latest = result
+        self._record_event(result)
+        return result
+
+    def start_loop(
+        self,
+        fc: int,
+        start: int,
+        *,
+        quantity: int | None = None,
+        values: list[int | bool] | None = None,
+        interval: float = 1.0,
+        count: int = 0,
+    ) -> dict[str, Any]:
+        if not self._running:
+            raise RuntimeError("Modbus not connected")
+        if self._loop_status.get("running"):
+            raise RuntimeError("A Modbus loop is already running")
+        if not 0.02 <= float(interval) <= 3600.0:
+            raise ValueError("Loop interval must be in the range 0.02..3600 seconds")
+        if isinstance(count, bool) or not 0 <= int(count) <= 100000:
+            raise ValueError("Loop count must be in the range 0..100000")
+
+        self._loop_stop.clear()
+        self._loop_status = {
+            "running": True,
+            "completed": 0,
+            "requested": int(count),
+            "errors": 0,
+            "interval": float(interval),
+            "fc": int(fc),
+            "start": int(start),
+        }
+
+        def run_loop() -> None:
+            next_due = time.monotonic()
+            try:
+                while not self._loop_stop.is_set():
+                    if count and self._loop_status["completed"] >= count:
+                        break
+                    try:
+                        self.transaction(
+                            fc, start, quantity=quantity, values=values
+                        )
+                    except Exception as error:
+                        self._loop_status["errors"] += 1
+                        self._record_event(
+                            {
+                                "event": "error",
+                                "scope": "loop",
+                                "timestamp": time.time(),
+                                "message": str(error),
+                            }
+                        )
+                    finally:
+                        self._loop_status["completed"] += 1
+                    next_due += float(interval)
+                    wait_time = max(0.0, next_due - time.monotonic())
+                    if self._loop_stop.wait(wait_time):
+                        break
+            finally:
+                self._loop_status["running"] = False
+                self._record_event(
+                    {"event": "loop", "status": "stopped", **self._loop_status}
+                )
+
+        self._loop_thread = threading.Thread(
+            target=run_loop, name="mklink-modbus-loop", daemon=True
+        )
+        self._loop_thread.start()
+        self._record_event({"event": "loop", "status": "started", **self._loop_status})
+        return dict(self._loop_status)
+
+    def stop_loop(self) -> dict[str, Any]:
+        self._loop_stop.set()
+        thread = self._loop_thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=3.0)
+        self._loop_status["running"] = False
+        self._loop_thread = None
+        return dict(self._loop_status)
 
     def write_register(self, addr: int, value: int) -> dict:
-        if not self._client:
-            raise RuntimeError("Modbus not connected")
-        self._client.write_register(addr, value, self._slave)
-        return {"addr": addr, "value": value, "ok": True}
+        return self.transaction(6, addr, values=[value])
 
     def read_debug(self, fc: int, start: int, quantity: int) -> list:
-        if not self._client:
-            raise RuntimeError("Modbus not connected")
-        if fc == 3:
-            return self._client.read_holding_registers(start, quantity, self._slave)
-        elif fc == 4:
-            return self._client.read_input_registers(start, quantity, self._slave)
-        elif fc == 1:
-            return self._client.read_coils(start, quantity, self._slave)
-        elif fc == 2:
-            return self._client.read_discrete_inputs(start, quantity, self._slave)
-        raise ValueError(f"Unsupported FC: {fc}")
+        return self.transaction(fc, start, quantity=quantity)["values"]
 
     def get_status(self) -> dict:
         return {
@@ -2368,6 +3282,8 @@ class ModbusStreamManager:
             "register_count": len(self._specs),
             "clients": self._bridge.client_count,
             "latest": self._latest,
+            "connection": self._connection,
+            "loop": dict(self._loop_status),
         }
 
     async def sse_generator(self):
@@ -2619,8 +3535,14 @@ class VofaStreamManager:
         def _poll():
             try:
                 bridge = getattr(device, "_bridge", None)
-                if bridge is not None and 0 < len(self._read_groups) <= 16:
-                    from mklink.dump_memory import DumpMemoryStreamSession
+                from mklink.dump_memory import (
+                    DumpMemoryStreamSession,
+                    MAX_SAFE_REPL_REGIONS,
+                )
+                if (
+                    bridge is not None
+                    and 0 < len(self._read_groups) <= MAX_SAFE_REPL_REGIONS
+                ):
 
                     self._acquisition_mode = "dump-memory"
                     region_pairs = [
@@ -2781,7 +3703,15 @@ def stop_bridge_dashboards(
         if name == exclude:
             continue
         mgr = managers.get(name)
-        if mgr and mgr.running:
+        thread = getattr(mgr, "_thread", None) if mgr is not None else None
+        worker_alive = bool(
+            mgr is not None
+            and (
+                getattr(mgr, "running", False)
+                or (thread is not None and thread.is_alive())
+            )
+        )
+        if worker_alive:
             error = None
             try:
                 mgr.stop()

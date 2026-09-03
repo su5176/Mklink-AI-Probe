@@ -43,6 +43,7 @@ from mklink.remote.online_flash_api import shutdown_online_flash_services
 class Catalog:
     def __init__(self):
         self.calls = []
+        self.refresh_count = 0
 
     def search(self, query, vendor=None, installed=None, limit=100):
         self.calls.append((query, vendor, installed, limit))
@@ -56,6 +57,7 @@ class Catalog:
         return {"index_available": True, "target_count": 2, "last_error": None}
 
     def refresh(self):
+        self.refresh_count += 1
         return self.status()
 
 
@@ -202,6 +204,20 @@ class Jobs:
         self.started.append(request)
         return "job-1"
 
+    def read_memory(self, request, address, size):
+        self.read_request = request
+        self.read_range = (address, size)
+        return bytes((address + index) & 0xFF for index in range(size))
+
+    def iter_memory(self, request, address, chunk_sizes):
+        self.read_request = request
+        self.read_range = (address, sum(chunk_sizes))
+        self.read_chunks = tuple(chunk_sizes)
+        offset = 0
+        for size in chunk_sizes:
+            yield bytes((address + offset + index) & 0xFF for index in range(size))
+            offset += size
+
     def get(self, job_id):
         if job_id != "job-1":
             raise KeyError(job_id)
@@ -263,6 +279,144 @@ def test_probe_target_and_pack_status_routes_use_injected_services(app, services
     assert services.catalog.calls[-1] == ("device", "Vendor", True, 7)
     status = request(app, "GET", "/api/online-flash/packs/status")
     assert status.json()["index_available"] is True
+
+
+@pytest.mark.parametrize("query", ["acme", "control family", "value series"])
+def test_target_search_route_matches_vendor_family_and_series(
+    app, services, tmp_path, query,
+):
+    paths = PackPaths(tmp_path / "catalog")
+    paths.index_dir.mkdir(parents=True)
+    paths.index_file.write_text(json.dumps({
+        "PART-A": {
+            "vendor": "Acme Semiconductor",
+            "family": "Control Family",
+            "sub_family": "Value Series",
+            "from_pack": {
+                "vendor": "Acme Semiconductor",
+                "pack": "Part_DFP",
+                "version": "1.0.0",
+            },
+        },
+    }), encoding="utf-8")
+    services.catalog = PackCatalog(paths, builtin_provider=lambda: [])
+
+    response = request(app, "GET", "/api/online-flash/targets", params={"q": query})
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "part_number": "PART-A",
+        "vendor": "Acme Semiconductor",
+        "pack_id": "Acme Semiconductor.Part_DFP",
+        "pack_version": "1.0.0",
+        "installed": False,
+        "source": "index",
+        "family": "Control Family",
+        "series": "Value Series",
+    }]
+
+
+def test_target_search_route_keeps_limit_validation(app):
+    response = request(app, "GET", "/api/online-flash/targets?limit=1001")
+
+    assert response.status_code == 422
+
+
+def test_target_memory_map_route_returns_flash_sector_geometry(app):
+    response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/memory-map")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "name": "flash",
+        "start": 0x1000,
+        "length": 0x1000,
+        "sector_size": 0x100,
+    }]
+
+
+def test_target_memory_map_route_omits_hpm_without_read_geometry(app, services):
+    services.catalog.search = lambda *args, **kwargs: []
+
+    response = request(app, "GET", "/api/online-flash/targets/HPM5300/memory-map")
+
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_read_memory_route_returns_bin_for_non_hpm_target(app, services):
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/memory/read",
+        json={
+            "address": "0x1000",
+            "size": 4,
+            "probe_id": "mk",
+            "target_part": "DEVICE_A",
+        },
+    )
+    assert response.status_code == 200
+    assert response.content == bytes([0x00, 0x01, 0x02, 0x03])
+    assert response.headers["content-type"] == "application/octet-stream"
+    assert "read-0x00001000-4.bin" in response.headers["content-disposition"]
+    assert services.job_manager.read_range == (0x1000, 4)
+
+
+def test_read_memory_stream_keeps_sector_chunks_in_one_response(app, services):
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/memory/read-stream",
+        json={
+            "address": "0x1000",
+            "size": 8,
+            "chunk_sizes": [4, 4],
+            "probe_id": "mk",
+            "target_part": "DEVICE_A",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.content == bytes(range(8))
+    assert response.headers["content-length"] == "8"
+    assert services.job_manager.read_range == (0x1000, 8)
+    assert services.job_manager.read_chunks == (4, 4)
+
+
+def test_read_memory_stream_rejects_inconsistent_chunk_plan(app):
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/memory/read-stream",
+        json={
+            "address": "0x1000",
+            "size": 8,
+            "chunk_sizes": [4, 2],
+            "probe_id": "mk",
+            "target_part": "DEVICE_A",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "add up to size" in response.json()["detail"]
+
+
+def test_read_memory_route_supports_hpm_target(app, services):
+    services.catalog.search = lambda *args, **kwargs: []
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/memory/read",
+        json={
+            "address": "0x80000000",
+            "size": 4,
+            "probe_id": "mk",
+            "target_part": "HPM5300",
+        },
+    )
+    assert response.status_code == 200
+    assert response.content == bytes([0x00, 0x01, 0x02, 0x03])
+    assert services.job_manager.read_range == (0x80000000, 4)
 
 
 def test_hpm_image_and_job_use_rom_api_without_pack_or_sector_geometry(app, services):
@@ -337,6 +491,7 @@ def test_hpm_image_rejects_hex_without_pack_lookup(app, services):
 
 def test_hpm_algorithm_api_never_accepts_flm(app, services):
     listed = request(app, "GET", "/api/online-flash/algorithms?part_number=HPM5300")
+    available = request(app, "GET", "/api/online-flash/targets/HPM5300/algorithms")
     added = request(
         app,
         "POST",
@@ -346,9 +501,87 @@ def test_hpm_algorithm_api_never_accepts_flm(app, services):
     )
 
     assert listed.json() == []
+    assert available.json() == [{
+        "algorithm_id": "hpm-rom-api",
+        "target_part": "HPM5300",
+        "file_name": "HPM ROM API",
+        "flash_start": 0x80000000,
+        "flash_size": 0x10000000,
+        "default": True,
+        "source_kind": "hpm-rom-api",
+        "source_name": "HPM ROM API",
+    }]
     assert added.status_code == 422
     assert added.json()["detail"]["code"] == "TARGET_NOT_SUPPORTED"
     assert services.custom_flms.records == []
+
+
+def test_target_algorithm_route_lists_pack_source_without_paths(app, services, monkeypatch):
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda part_number, paths: [FlashAlgorithm(
+            algorithm_id="pack-algorithm",
+            target_part=part_number,
+            file_name="Internal.FLM",
+            flash_start=0x08000000,
+            flash_size=0x80000,
+            ram_start=0x20000000,
+            ram_size=0x4000,
+            default=True,
+            source_kind="installed-pack",
+            source_name="Vendor.Pack@1.0",
+            source_token="secret-token",
+            pack_path="C:/secret/Vendor.Pack.1.0.pack",
+        )],
+    )
+
+    response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/algorithms")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "algorithm_id": "pack-algorithm",
+        "target_part": "DEVICE_A",
+        "file_name": "Internal.FLM",
+        "flash_start": 0x08000000,
+        "flash_size": 0x80000,
+        "default": True,
+        "source_kind": "installed-pack",
+        "source_name": "Vendor.Pack@1.0",
+    }]
+    assert "secret" not in response.text.casefold()
+
+
+def test_target_algorithm_route_describes_pyocd_builtin_regions(app, services, monkeypatch):
+    builtin = TargetRecord(
+        "DEVICE_A", "Vendor", installed=True, source="builtin",
+    )
+    monkeypatch.setattr(
+        services.catalog,
+        "search",
+        lambda query, **_kwargs: [builtin]
+        if query.casefold() in builtin.part_number.casefold() else [],
+    )
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda *_args, **_kwargs: [],
+    )
+    services.target_memory_provider = lambda _part: (
+        MemoryRegion("flash", 0x08000000, 0x80000, True, True, 0x800),
+    )
+
+    response = request(app, "GET", "/api/online-flash/targets/DEVICE_A/algorithms")
+
+    assert response.status_code == 200
+    assert response.json() == [{
+        "algorithm_id": "pyocd-builtin:device_a:08000000",
+        "target_part": "DEVICE_A",
+        "file_name": "DEVICE_A · flash",
+        "flash_start": 0x08000000,
+        "flash_size": 0x80000,
+        "default": True,
+        "source_kind": "pyocd-builtin",
+        "source_name": "pyOCD",
+    }]
 
 
 def test_custom_flm_routes_store_list_and_remove_without_exposing_paths(app, services):
@@ -828,8 +1061,10 @@ def test_probe_enumeration_failure_is_actionable_and_does_not_expose_raw_details
 
 
 def test_pack_operations_collect_events_cancel_remove_and_map_errors(app, services):
+    refresh_count = services.catalog.refresh_count
     installed = request(app, "POST", "/api/online-flash/packs/install", json={"part_number": "Other"})
     assert installed.json()["events"][0]["progress"] == 0.5
+    assert services.catalog.refresh_count == refresh_count + 1
     missing = request(app, "POST", "/api/online-flash/packs/install", json={"part_number": "missing"})
     assert missing.status_code == 404
     updated = request(app, "POST", "/api/online-flash/packs/index/update")
@@ -860,7 +1095,8 @@ def test_hpm_pack_install_is_satisfied_without_network_download(app, services):
     }
 
 
-def test_pack_install_can_stream_progress_and_terminal_result(app):
+def test_pack_install_can_stream_progress_and_terminal_result(app, services):
+    refresh_count = services.catalog.refresh_count
     response = request(
         app,
         "POST",
@@ -886,6 +1122,28 @@ def test_pack_install_can_stream_progress_and_terminal_result(app):
         "type": "result",
         "result": {"status": "installed", "part_number": "Other"},
     }
+    assert services.catalog.refresh_count == refresh_count + 1
+
+
+def test_pack_import_can_stream_result_after_catalog_refresh(app, services):
+    refresh_count = services.catalog.refresh_count
+    response = request(
+        app,
+        "POST",
+        "/api/online-flash/packs/import",
+        files={"file": ("a.pack", b"pack")},
+        headers={"Accept": "application/x-ndjson"},
+    )
+
+    messages = [json.loads(line) for line in response.text.splitlines() if line]
+    assert response.status_code == 200
+    assert any(message.get("event", {}).get("phase") == "refreshing" for message in messages)
+    assert messages[-1] == {
+        "type": "result",
+        "result": {"status": "installed", "pack_id": "V.P", "version": "1"},
+    }
+    assert services.catalog.refresh_count == refresh_count + 1
+    assert not services.pack_manager.imported_path.exists()
 
 
 def test_pack_stream_bounds_bursty_progress_without_losing_result(app, services):
@@ -1105,10 +1363,12 @@ def test_successful_index_update_immediately_refreshes_pack_status(app, services
 
 
 def test_import_and_inspect_stream_uploads_then_delete_temporary_files(app, services):
+    refresh_count = services.catalog.refresh_count
     imported = request(
         app, "POST", "/api/online-flash/packs/import", files={"file": ("a.pack", b"pack")}
     )
     assert imported.status_code == 200
+    assert services.catalog.refresh_count == refresh_count + 1
     assert not services.pack_manager.imported_path.exists()
     inspected = request(
         app,
@@ -1123,6 +1383,61 @@ def test_import_and_inspect_stream_uploads_then_delete_temporary_files(app, serv
     assert body["sectors"] == [{"address": 0x1000, "size": 0x100}]
     assert "file_path" not in body
     assert not services.image_inspector.seen_path.exists()
+
+
+def test_captured_image_can_use_same_pack_flm_range_for_programming(
+    app, services, monkeypatch
+):
+    algorithm = FlashAlgorithm(
+        algorithm_id="pack-algorithm",
+        target_part="DEVICE_A",
+        file_name="device.flm",
+        flash_start=0x1000,
+        flash_size=0x2000,
+        ram_start=0x20000000,
+        ram_size=0x1000,
+        default=True,
+        source_kind="installed-pack",
+        source_name="Vendor.Pack@1.0",
+        source_token="catalog:installed:test",
+        pack_path="safe.pack",
+    )
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.algorithm_catalog.discover_flash_algorithms",
+        lambda *_args, **_kwargs: [algorithm],
+    )
+
+    inspected = request(
+        app,
+        "POST",
+        "/api/online-flash/images/inspect",
+        data={
+            "part_number": "DEVICE_A",
+            "base_address": "0x1000",
+            "captured_from_target": "true",
+        },
+        files={"file": ("captured.bin", b"abcd")},
+    )
+
+    assert inspected.status_code == 200, inspected.text
+    assert services.image_inspector.seen_regions[0].length == 0x2000
+    assert services.image_flash_overrides["image-1"][1] == ((0x1000, 0x2000),)
+
+    started = request(
+        app,
+        "POST",
+        "/api/online-flash/jobs",
+        json={
+            "actions": ["connect", "erase", "program", "disconnect"],
+            "probe_id": "mk",
+            "target_part": "DEVICE_A",
+            "image_id": "image-1",
+            "sector_addresses": [0x1000],
+        },
+    )
+
+    assert started.status_code == 200, started.text
+    assert services.job_manager.started[0].pack_flm_regions == ((0x1000, 0x2000),)
 
 
 def test_local_firmware_path_status_and_inspection_track_recompiled_files(app, services):
@@ -1658,6 +1973,47 @@ def test_installed_pack_memory_map_uses_pyocd_flm_geometry(tmp_path, monkeypatch
     assert _pack_memory_regions("device", pack_path) == [
         MemoryRegion("flash", 0x08000000, 0x10000, True, True, 0x800),
         MemoryRegion("flash-1", 0x08010000, 0x30000, True, True, 0x1000),
+    ]
+
+
+def test_installed_pack_relocates_relative_flm_geometry(tmp_path, monkeypatch):
+    pack_path = tmp_path / "Vendor.Device.pack"
+    pack_path.write_bytes(b"pack")
+
+    class FlashRegion:
+        name = "IROM1"
+        start = 0x00400000
+        length = 0x00100000
+        is_flash = True
+        is_writable = True
+        sector_size = 0
+        blocksize = 0
+
+        class flm:
+            flash_start = 0
+            flash_size = 0x00100000
+
+            @staticmethod
+            def iter_sector_size_ranges():
+                sector_range = type("Range", (), {
+                    "start": 0,
+                    "end": 0x000FFFFF,
+                })()
+                yield sector_range, 0x1000
+
+    class Device:
+        part_number = "CST92F41KxVxxx"
+        memory_map = [FlashRegion()]
+
+    class Pack:
+        devices = [Device()]
+
+    monkeypatch.setattr(
+        "pyocd.target.pack.cmsis_pack.CmsisPack", lambda _path: Pack()
+    )
+
+    assert _pack_memory_regions("CST92F41KxVxxx", pack_path) == [
+        MemoryRegion("IROM1", 0x00400000, 0x00100000, True, True, 0x1000),
     ]
 
 

@@ -296,6 +296,110 @@ class JustFloatParser:
 # Convenience runner — used by cli.py
 # ---------------------------------------------------------------------------
 
+VOFA_MAX_FAST_CHANNELS = 16
+VOFA_MAX_PRECISE_CHANNELS = 15
+VOFA_MAX_REPL_COMMAND_BYTES = 511
+
+
+def _vofa_address_literal(token: str, channel_index: int) -> str:
+    """Validate and canonicalize one 32-bit address before building code."""
+    value = str(token).strip()
+    try:
+        address = int(value, 0)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"VOFA channel {channel_index} has an invalid 32-bit address"
+        ) from None
+    if not 0 <= address <= 0xFFFFFFFF:
+        raise ValueError(
+            f"VOFA channel {channel_index} has an invalid 32-bit address"
+        )
+    return f"0x{address:08X}"
+
+
+def validate_vofa_repl_command(command: str) -> None:
+    """Reject a VOFA command that cannot fit in the Pika REPL line buffer."""
+    command_bytes = len(command.encode("utf-8"))
+    if command_bytes > VOFA_MAX_REPL_COMMAND_BYTES:
+        raise ValueError(
+            f"VOFA command is {command_bytes} UTF-8 bytes; the safe Pika REPL "
+            f"limit is {VOFA_MAX_REPL_COMMAND_BYTES} bytes"
+        )
+
+
+def build_vofa_command(
+    variables: list[str],
+    period: float | int,
+) -> tuple[str, str, int, str]:
+    """Validate and build one ``vofa.send`` command without touching hardware.
+
+    Fast mode uses three Pika arguments regardless of channel count, but the
+    firmware layout is independently limited to 16 contiguous float channels.
+    Precise mode uses two Pika arguments per channel plus ``period``; keep it at
+    15 channels so the known-unsafe 33-argument boundary is never reached.
+    """
+    import json
+
+    values = [str(value).strip() for value in variables]
+    if not values or any(not value for value in values):
+        raise ValueError("VOFA variables must not be empty")
+
+    try:
+        numeric_second = int(values[1], 10) if len(values) == 2 else None
+    except ValueError:
+        numeric_second = None
+
+    fast_mode = numeric_second is not None
+    if fast_mode:
+        channel_count = numeric_second
+        if not 1 <= channel_count <= VOFA_MAX_FAST_CHANNELS:
+            raise ValueError(
+                "VOFA fast-mode channel count must be between 1 and "
+                f"{VOFA_MAX_FAST_CHANNELS}"
+            )
+        address_literals = [_vofa_address_literal(values[0], 0)]
+        argument_literals = [address_literals[0], str(channel_count)]
+        mode = "fast"
+    else:
+        if len(values) % 2:
+            raise ValueError(
+                "VOFA precise mode requires complete address/type pairs"
+            )
+        channel_count = len(values) // 2
+        if not 1 <= channel_count <= VOFA_MAX_PRECISE_CHANNELS:
+            raise ValueError(
+                "VOFA precise mode supports at most "
+                f"{VOFA_MAX_PRECISE_CHANNELS} address/type pairs; 16 pairs "
+                "reach the unsafe Pika argument boundary"
+            )
+        argument_literals = []
+        for channel_index in range(channel_count):
+            address_token = values[channel_index * 2]
+            type_token = values[channel_index * 2 + 1]
+            type_info = normalize_vofa_type(type_token)
+            if type_info is None:
+                raise ValueError(
+                    f"VOFA channel {channel_index} uses unsupported type "
+                    f"{type_token!r}"
+                )
+            argument_literals.extend((
+                _vofa_address_literal(address_token, channel_index),
+                json.dumps(str(type_info["type"])),
+            ))
+        mode = "precise"
+
+    try:
+        normalized_period = float(period)
+    except (TypeError, ValueError):
+        raise ValueError("VOFA period must be a finite non-negative number") from None
+    if not math.isfinite(normalized_period) or normalized_period < 0:
+        raise ValueError("VOFA period must be a finite non-negative number")
+
+    var_args = ", ".join(argument_literals)
+    command = f"vofa.send({var_args}, {period})"
+    validate_vofa_repl_command(command)
+    return command, var_args, channel_count, mode
+
 def _infer_channel_count(variables: list[str]) -> int:
     """Infer channel count from CLI variable arguments.
 
@@ -556,8 +660,11 @@ def run_vofa_visualizer(
     """Run the full VOFA+ visualization pipeline."""
     from mklink.rtt_viewer import VisualizationServer
 
+    _command, var_args, validated_channel_count, _mode = build_vofa_command(
+        variables, period,
+    )
     if channel_count is None:
-        channel_count = _infer_channel_count(variables)
+        channel_count = validated_channel_count
 
     if channel_count <= 0:
         print("[FAIL] 无法推断通道数，请检查变量参数")
@@ -639,6 +746,8 @@ def run_vofa_visualizer(
     from mklink._types import DeviceState
 
     def _handle_interval_change(new_period: float):
+        restart_command = f"vofa.send({var_args}, {new_period})"
+        validate_vofa_repl_command(restart_command)
         was_collecting = server.collecting.is_set()
         server.collecting.clear()
         _reconfiguring.set()
@@ -658,7 +767,7 @@ def run_vofa_visualizer(
             bridge._write_raw(f'vofa.send({var_args}, 0)\n'.encode("utf-8"))
             time.sleep(0.1)
             bridge._enter_stream(DeviceState.VOFA_STREAM)
-            bridge._write_raw(f'vofa.send({var_args}, {new_period})\n'.encode("utf-8"))
+            bridge._write_raw((restart_command + "\n").encode("utf-8"))
             print(f"[OK] VOFA interval changed to {new_period}s")
         except Exception as e:
             print(f"[WARN] Failed to change interval: {e}")

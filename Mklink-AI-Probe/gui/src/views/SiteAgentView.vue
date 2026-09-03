@@ -118,7 +118,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
-import { API_BASE } from '../lib/runtimeEndpoint'
+import { API_BASE, restartRuntimeBackend } from '../lib/runtimeEndpoint'
 import { tr } from '../composables/useLanguage'
 import { useToast } from '../composables/useToast'
 
@@ -213,7 +213,7 @@ async function refreshStatus() {
 }
 
 async function restartUnifiedSidecar() {
-  await invoke('restart_sidecar')
+  await restartRuntimeBackend()
   window.setTimeout(() => void refreshStatus(), 700)
 }
 

@@ -27,11 +27,26 @@ except ImportError:  # pragma: no cover
 
 
 DEFAULT_MANIFEST_URLS = (
-    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
     "https://raw.githubusercontent.com/Aladdin-Wang/Mklink-AI-Probe/updates/latest.json",
+    "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json",
 )
 USER_AGENT = "Mklink-AI-Probe-Skill-Updater"
-MANAGED_CONTENT_ROOTS = (PurePosixPath("gui/dist"),)
+MANAGED_CONTENT_ROOTS = (
+    PurePosixPath("_maintainer"),
+    PurePosixPath(".pytest_cache"),
+    PurePosixPath("commands"),
+    PurePosixPath("docs/ai"),
+    PurePosixPath("gui/dist"),
+    PurePosixPath("MK-Firmware"),
+    PurePosixPath("mklink.egg-info"),
+    PurePosixPath("native"),
+    PurePosixPath("skills"),
+)
+MANAGED_CONTENT_FILES = {
+    PurePosixPath("AGENTS.md"),
+    PurePosixPath("CLAUDE.md"),
+    PurePosixPath("GEMINI.md"),
+}
 
 
 def utc_now() -> str:
@@ -52,7 +67,11 @@ def current_version(root: Path) -> str:
 
 
 def default_cache_file() -> Path:
-    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+    if os.environ.get("MKLINK_CACHE_DIR"):
+        base = Path(os.environ["MKLINK_CACHE_DIR"])
+    elif os.environ.get("MKLINK_BUILD_ROOT"):
+        base = Path(os.environ["MKLINK_BUILD_ROOT"]) / "cache"
+    elif os.name == "nt" and os.environ.get("LOCALAPPDATA"):
         base = Path(os.environ["LOCALAPPDATA"])
     else:
         base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
@@ -238,6 +257,10 @@ def _remove_obsolete_installed_files(
 def _remove_unlisted_managed_files(
     root: Path, installed_files: set[PurePosixPath],
 ) -> None:
+    for relative in MANAGED_CONTENT_FILES - installed_files:
+        path = root.joinpath(*relative.parts)
+        if path.is_file() or path.is_symlink():
+            path.unlink()
     for managed_root in MANAGED_CONTENT_ROOTS:
         directory = root.joinpath(*managed_root.parts)
         if not directory.is_dir():
@@ -334,12 +357,10 @@ def install_desktop(installer: Path) -> dict[str, object]:
     if _port_in_use(8765):
         raise RuntimeError("close Mklink AI Probe and its local service before installing the update")
     arguments = ["/S"]
-    location, _version = _installed_app()
-    if location is not None:
-        arguments.append(f"/D={location}")
     completed = subprocess.run([str(installer), *arguments], check=False)
     if completed.returncode != 0:
         raise RuntimeError(f"desktop installer exited with code {completed.returncode}")
+    location, _version = _installed_app()
     return {"installed": True, "install_location": str(location) if location else None}
 
 

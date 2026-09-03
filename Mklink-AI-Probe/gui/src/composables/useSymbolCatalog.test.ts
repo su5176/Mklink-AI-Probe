@@ -113,6 +113,43 @@ describe('useSymbolCatalog', () => {
     expect(symbols.browseChildren.value.get('controller')?.[0].path).toBe('controller.target')
   })
 
+  it('refreshes and retries a lazy branch after the catalog is rebound', async () => {
+    const reboundPage = {
+      ...firstPage,
+      generation: 2,
+      items: firstPage.items,
+      browse_roots: firstPage.browse_roots,
+    }
+    const reboundChildPage = {
+      ...firstPage,
+      generation: 2,
+      parent: 'controller',
+      nodes: [{
+        key: 'controller.target', path: 'controller.target', label: 'target', kind: 'leaf',
+        type_name: 'float', size: 4, address: 0x20000024,
+        descriptor: firstPage.items[0], container: null, child_count: null,
+        range_start: null, range_end: null,
+      }],
+    }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(firstPage))
+      .mockResolvedValueOnce(jsonResponse({
+        ...reboundChildPage,
+        generation: 2,
+      }))
+      .mockResolvedValueOnce(jsonResponse(reboundPage))
+      .mockResolvedValueOnce(jsonResponse(reboundChildPage))
+    vi.stubGlobal('fetch', fetchMock)
+    const symbols = await freshCatalog()
+
+    await symbols.ensureLoaded()
+    await symbols.loadBrowseChildren(firstPage.browse_roots[0] as any)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(symbols.generation.value).toBe(2)
+    expect(symbols.browseChildren.value.get('controller')?.[0].path).toBe('controller.target')
+  })
+
   it('queues a forced refresh behind an in-flight catalog load', async () => {
     let resolveInitial!: (response: Response) => void
     const initial = new Promise<Response>(resolve => { resolveInitial = resolve })

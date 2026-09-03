@@ -63,6 +63,67 @@ describe('RTT API contracts', () => {
     }))
   })
 
+  it('forwards the guarded probe voltage request exactly', async () => {
+    const api = useMklinkApi()
+    await api.setPowerOn(5000, true)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/device/power', expect.objectContaining({
+      method: 'POST',
+      body: JSON.stringify({ voltage_mv: 5000, confirm_5v: true }),
+    }))
+  })
+
+  it('sends firmware upgrade confirmation as a scalar boolean body', async () => {
+    const api = useMklinkApi()
+    await api.upgradeProbeFirmware(true)
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/probe/firmware-upgrade', expect.objectContaining({
+      method: 'POST',
+      body: 'true',
+    }))
+  })
+
+  it('downloads the selected probe firmware as a named binary', async () => {
+    const blob = new Blob(['uf2'], { type: 'application/octet-stream' })
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      headers: new Headers({
+        'X-MKLink-Firmware-Name': 'MicroLink_V3.3.7.uf2',
+        'X-MKLink-Firmware-Version': 'V3.3.7',
+        'X-MKLink-Firmware-Source': 'gitee',
+        'X-MKLink-Firmware-Family': 'microlink',
+      }),
+      blob: async () => blob,
+    })
+
+    await expect(useMklinkApi().downloadProbeFirmware('V3')).resolves.toEqual({
+      blob,
+      filename: 'MicroLink_V3.3.7.uf2',
+      version: 'V3.3.7',
+      source: 'gitee',
+      family: 'microlink',
+    })
+    expect(fetchMock).toHaveBeenCalledWith('/api/probe/firmware-download?model=V3&family=microlink')
+
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      headers: new Headers(),
+      blob: async () => blob,
+    })
+    await useMklinkApi().downloadProbeFirmware('V4', 'hpmlink')
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/probe/firmware-download?model=V4&family=hpmlink')
+  })
+
+  it('refreshes connection state after rebooting the probe', async () => {
+    const api = useMklinkApi()
+    await api.rebootProbe()
+
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/device/reboot', expect.objectContaining({
+      method: 'POST',
+    }))
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/device/status', expect.any(Object))
+  })
+
   it('surfaces structured backend symbol-source errors', async () => {
     fetchMock.mockResolvedValueOnce({
       ok: false,

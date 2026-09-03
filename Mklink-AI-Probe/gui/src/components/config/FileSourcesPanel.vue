@@ -1,15 +1,13 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { FolderOpen, ScanSearch } from '@lucide/vue'
-import { isMapFilePath, isSameFileSourcePath, isSymbolFilePath } from '../../lib/desktopSettings'
+import { isSameFileSourcePath, isSymbolFilePath } from '../../lib/desktopSettings'
 import type { AxlStatus } from '../../types/mklink'
 import { tr } from '../../composables/useLanguage'
 
 const props = defineProps<{
   symbolPath: string
   symbolDisplayPath?: string
-  mapPath: string
-  mapDisplayPath?: string
   connected: boolean
   symbolStatus: AxlStatus
   browsing?: boolean
@@ -18,9 +16,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   (event: 'update:symbolPath', value: string): void
-  (event: 'update:mapPath', value: string): void
   (event: 'browse-symbol'): void
-  (event: 'browse-map'): void
   (event: 'parse'): void
 }>()
 
@@ -38,14 +34,9 @@ const sourcePending = computed(() => (
   && !sourceMatches.value
 ))
 const displayedSymbolPath = computed(() => props.symbolDisplayPath?.trim() || props.symbolPath)
-const displayedMapPath = computed(() => props.mapDisplayPath?.trim() || props.mapPath)
 const browserSymbolUpload = computed(() => Boolean(
   props.symbolDisplayPath?.trim()
   && !isSameFileSourcePath(props.symbolDisplayPath, props.symbolPath),
-))
-const browserMapUpload = computed(() => Boolean(
-  props.mapDisplayPath?.trim()
-  && !isSameFileSourcePath(props.mapDisplayPath, props.mapPath),
 ))
 const activeSymbolPath = computed(() => (
   sourceMatches.value && browserSymbolUpload.value
@@ -96,6 +87,7 @@ const parserBackend = computed(() => {
           data-testid="symbol-path"
           :value="displayedSymbolPath"
           :placeholder="tr('.axf 或 .elf 文件路径', '.axf or .elf file path')"
+          :disabled="browsing || parsing"
           @input="emit('update:symbolPath', inputValue($event))"
         />
         <button
@@ -103,7 +95,7 @@ const parserBackend = computed(() => {
           type="button"
           :title="tr('浏览 AXF 或 ELF 文件', 'Browse for AXF or ELF file')"
           data-testid="browse-symbol"
-          :disabled="browsing"
+          :disabled="browsing || parsing"
           @click="emit('browse-symbol')"
         >
           <FolderOpen :size="15" aria-hidden="true" />
@@ -118,41 +110,10 @@ const parserBackend = computed(() => {
       {{ !symbolPath.trim() ? tr('未配置 AXF / ELF 文件', 'No AXF / ELF file configured') : browserSymbolUpload ? tr(`浏览器上传 · ${displayedSymbolPath}（解析文件已缓存到本机服务）`, `Browser upload · ${displayedSymbolPath} (cached by local service)`) : isSymbolFilePath(symbolPath) ? tr('路径格式有效', 'Valid path') : tr('仅支持 .axf、.elf 或 .out 文件', 'Only .axf, .elf, or .out files are supported') }}
     </div>
 
-    <div class="source-row">
-      <label for="map-path">MAP</label>
-      <div class="path-control">
-        <input
-          id="map-path"
-          class="form-input path-input"
-          data-testid="map-path"
-          :value="displayedMapPath"
-          :placeholder="tr('.map 文件路径', '.map file path')"
-          @input="emit('update:mapPath', inputValue($event))"
-        />
-        <button
-          class="btn icon-command"
-          type="button"
-          :title="tr('浏览 MAP 文件', 'Browse for MAP file')"
-          data-testid="browse-map"
-          :disabled="browsing"
-          @click="emit('browse-map')"
-        >
-          <FolderOpen :size="15" aria-hidden="true" />
-          {{ tr('浏览', 'Browse') }}
-        </button>
-      </div>
-    </div>
-    <div
-      data-testid="map-path-validation"
-      :class="['path-validation', { invalid: mapPath.trim() && !isMapFilePath(mapPath) }]"
-    >
-      {{ !mapPath.trim() ? tr('未配置 MAP 文件', 'No MAP file configured') : browserMapUpload ? tr(`浏览器上传 · ${displayedMapPath}（文件已缓存到本机服务）`, `Browser upload · ${displayedMapPath} (cached by local service)`) : isMapFilePath(mapPath) ? tr('路径格式有效', 'Valid path') : tr('仅支持 .map 文件', 'Only .map files are supported') }}
-    </div>
-
     <div v-if="symbolStatus.error" class="alert alert-error">{{ symbolStatus.error }}</div>
 
     <footer class="panel-actions">
-      <span class="action-state" data-testid="files-auto-save">{{ tr('路径修改后自动保存', 'Paths are saved automatically') }}</span>
+      <span class="action-state" data-testid="files-auto-save">{{ tr('路径修改后自动保存', 'Path is saved automatically') }}</span>
       <button
         class="btn btn-primary"
         type="button"

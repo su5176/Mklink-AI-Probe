@@ -1,5 +1,6 @@
 import type {
   CustomFlmRecord,
+  FlashAlgorithmRecord,
   FirmwareSourceStatus,
   ImageInspection,
   JobEvent,
@@ -17,7 +18,9 @@ import type {
   PreviewPage,
   ProbeRecord,
   TargetRecord,
+  TargetMemoryRegion,
   TargetSearchOptions,
+  ReadMemoryRequest,
 } from '../types/onlineFlash'
 import { tr } from './useLanguage'
 import { API_BASE } from '../lib/runtimeEndpoint'
@@ -113,6 +116,46 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>
 }
 
+async function binaryRequest(path: string, options: RequestInit = {}): Promise<Blob> {
+  const headers = new Headers(options.headers)
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  const response = await fetch(`${API_BASE}${ONLINE_FLASH_BASE}${path}`, { ...options, headers })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null)
+    throw new OnlineFlashApiError(response.status, response.statusText, payload)
+  }
+  return response.blob()
+}
+
+async function binaryStreamRequest(
+  path: string,
+  options: RequestInit,
+  onProgress: (received: number) => void,
+): Promise<Blob> {
+  const headers = new Headers(options.headers)
+  if (!headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  const response = await fetch(`${API_BASE}${ONLINE_FLASH_BASE}${path}`, { ...options, headers })
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null)
+    throw new OnlineFlashApiError(response.status, response.statusText, payload)
+  }
+  if (!response.body) return response.blob()
+  const reader = response.body.getReader()
+  const chunks: Uint8Array[] = []
+  let received = 0
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+    received += value.byteLength
+    onProgress(received)
+  }
+  return new Blob(
+    chunks.map(chunk => chunk.slice().buffer as ArrayBuffer),
+    { type: response.headers.get('Content-Type') || 'application/octet-stream' },
+  )
+}
+
 async function packOperationRequest(
   path: string,
   options: RequestInit,
@@ -200,6 +243,14 @@ export function useOnlineFlashApi() {
     return request(`/targets?${params.toString()}`, { signal })
   }
 
+  function getTargetMemoryMap(partNumber: string): Promise<TargetMemoryRegion[]> {
+    return request(`/targets/${encoded(partNumber)}/memory-map`)
+  }
+
+  function listTargetAlgorithms(partNumber: string): Promise<FlashAlgorithmRecord[]> {
+    return request(`/targets/${encoded(partNumber)}/algorithms`)
+  }
+
   function getPackStatus(): Promise<PackStatus> {
     return request('/packs/status')
   }
@@ -251,6 +302,7 @@ export function useOnlineFlashApi() {
     partNumber: string,
     baseAddress?: number | string | null,
     signal?: AbortSignal,
+    capturedFromTarget = false,
   ): Promise<ImageInspection> {
     const body = new FormData()
     body.append('file', file)
@@ -258,6 +310,7 @@ export function useOnlineFlashApi() {
     if (baseAddress !== undefined && baseAddress !== null) {
       body.append('base_address', String(baseAddress))
     }
+    if (capturedFromTarget) body.append('captured_from_target', 'true')
     return request('/images/inspect', { method: 'POST', body, signal })
   }
 
@@ -290,6 +343,20 @@ export function useOnlineFlashApi() {
   ): Promise<PreviewPage> {
     const params = new URLSearchParams({ offset: String(offset), length: String(length) })
     return request(`/images/${encoded(imageId)}/preview?${params.toString()}`, { signal })
+  }
+
+  function readMemory(payload: ReadMemoryRequest): Promise<Blob> {
+    return binaryRequest('/memory/read', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    })
+  }
+
+  function readMemoryStream(payload: ReadMemoryRequest, onProgress: (received: number) => void): Promise<Blob> {
+    return binaryStreamRequest('/memory/read-stream', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }, onProgress)
   }
 
   function createJob(job: JobRequest): Promise<JobCreateResult> {
@@ -382,6 +449,8 @@ export function useOnlineFlashApi() {
   return {
     listProbes,
     searchTargets,
+    listTargetAlgorithms,
+    getTargetMemoryMap,
     getPackStatus,
     updatePackIndex,
     installPack,
@@ -395,6 +464,8 @@ export function useOnlineFlashApi() {
     inspectImagePath,
     getImageSourceStatus,
     previewImage,
+    readMemory,
+    readMemoryStream,
     createJob,
     getActiveJob,
     getJob,

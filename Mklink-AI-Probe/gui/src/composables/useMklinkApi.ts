@@ -12,6 +12,8 @@ import type {
   FlashRequest,
   ProjectHistory,
   ProbeFirmwareCheck,
+  ProbeFirmwareDownload,
+  ProbeFirmwareUpgrade,
   RttFindResponse,
   RttWriteResponse,
   FileSourceKind,
@@ -116,6 +118,35 @@ export function useMklinkApi() {
     return api<ProbeFirmwareCheck>('/api/probe/firmware-check')
   }
 
+  async function upgradeProbeFirmware(confirm = false): Promise<ProbeFirmwareUpgrade> {
+    return api<ProbeFirmwareUpgrade>('/api/probe/firmware-upgrade', {
+      method: 'POST',
+      // The FastAPI endpoint declares a scalar bool body, so the wire format
+      // must be JSON true/false rather than an object wrapper.
+      body: JSON.stringify(confirm),
+    })
+  }
+
+  async function downloadProbeFirmware(
+    model: 'V3' | 'V4',
+    family: 'microlink' | 'hpmlink' = 'microlink',
+  ): Promise<ProbeFirmwareDownload> {
+    const query = new URLSearchParams({ model, family })
+    const res = await fetch(`${API_BASE}/api/probe/firmware-download?${query.toString()}`)
+    if (!res.ok) {
+      const error = await res.json().catch(() => null)
+      throw new Error(typeof error?.detail === 'string' ? error.detail : res.statusText)
+    }
+    return {
+      blob: await res.blob(),
+      filename: res.headers.get('X-MKLink-Firmware-Name')
+        || `${family === 'hpmlink' ? 'HPMLink' : 'MicroLink'}_${model}.uf2`,
+      version: res.headers.get('X-MKLink-Firmware-Version') || '',
+      source: (res.headers.get('X-MKLink-Firmware-Source') || 'github') as ProbeFirmwareDownload['source'],
+      family: (res.headers.get('X-MKLink-Firmware-Family') || family) as ProbeFirmwareDownload['family'],
+    }
+  }
+
   async function connectDevice(req: ConnectRequest): Promise<DeviceStatus> {
     const result = await api<DeviceStatus>('/api/device/connect', {
       method: 'POST',
@@ -169,6 +200,22 @@ export function useMklinkApi() {
 
   async function resetDevice() {
     return api('/api/device/reset', { method: 'POST' })
+  }
+
+  async function setPowerOn(voltageMv: 1800 | 3300 | 5000, confirm5v = false) {
+    return api('/api/device/power', {
+      method: 'POST',
+      body: JSON.stringify({
+        voltage_mv: voltageMv,
+        confirm_5v: confirm5v,
+      }),
+    })
+  }
+
+  async function rebootProbe() {
+    const result = await api('/api/device/reboot', { method: 'POST' })
+    await refreshStatus()
+    return result
   }
 
   async function eraseDevice() {
@@ -272,11 +319,15 @@ export function useMklinkApi() {
     updateRttConfig,
     getMicrokeenInfo,
     probeFirmwareCheck,
+    upgradeProbeFirmware,
+    downloadProbeFirmware,
     connectDevice,
     disconnectDevice,
     refreshStatus,
     flashDevice,
     resetDevice,
+    setPowerOn,
+    rebootProbe,
     eraseDevice,
     haltDevice,
     resumeDevice,

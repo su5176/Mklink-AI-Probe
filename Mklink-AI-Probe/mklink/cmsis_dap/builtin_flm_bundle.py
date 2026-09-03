@@ -35,6 +35,13 @@ def _text(value: object, description: str) -> str:
     return value.strip()
 
 
+def _optional_text(*values: object) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _integer(value: object, description: str) -> int:
     if isinstance(value, bool):
         raise BuiltinFlmBundleError("{} must be an integer".format(description))
@@ -106,6 +113,12 @@ def load_builtin_flm_targets(root: Optional[Path] = None) -> List[TargetRecord]:
             vendor=_text(raw.get("manufacturer"), "builtin FLM manufacturer"),
             installed=True,
             source="daplink-builtin",
+            family=_optional_text(raw.get("family")),
+            series=_optional_text(
+                raw.get("series"),
+                raw.get("sub_family"),
+                raw.get("subfamily"),
+            ),
         ))
     return records
 

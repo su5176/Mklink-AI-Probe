@@ -1,4 +1,4 @@
-import type { WorkerInput, WorkerOutput } from '../../workers/streamDecoder.worker'
+import type { DecoderMode, WorkerInput, WorkerOutput } from '../../workers/streamDecoder.worker'
 
 export type StreamClientPhase = 'stopped' | 'connecting' | 'connected' | 'reconnecting' | 'error'
 
@@ -13,6 +13,10 @@ export interface StreamClientOptions {
   readonly token?: string
   readonly capacity: number
   readonly channelCount: number
+  readonly decoderMode?: DecoderMode
+  readonly waveformSummaryOnly?: boolean
+  /** Serialize frame delivery so control/range requests can interleave. */
+  readonly serializeWorkerFrames?: boolean
   readonly reconnectBaseMs?: number
   readonly reconnectMaxMs?: number
   readonly createWebSocket?: (url: string) => WebSocket
@@ -50,6 +54,7 @@ export class StreamClient {
   private readonly createWebSocket: (url: string) => WebSocket
   private readonly reconnectBaseMs: number
   private readonly reconnectMaxMs: number
+  private readonly serializeWorkerFrames: boolean
   private socket: WebSocket | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private reconnectAttempt = 0
@@ -60,6 +65,12 @@ export class StreamClient {
   private currentGeneration = 0
   private nextFrameTicket = 0
   private readonly pendingReadyTickets = new Set<number>()
+  private readonly workerFrameQueue: Array<{
+    buffer: ArrayBuffer
+    connectionGeneration: number
+    frameTicket: number
+  }> = []
+  private workerFrameInFlight: number | null = null
 
   constructor(options: StreamClientOptions) {
     validateOptions(options)
@@ -71,6 +82,7 @@ export class StreamClient {
     this.createWebSocket = options.createWebSocket ?? (url => new WebSocket(url))
     this.reconnectBaseMs = options.reconnectBaseMs ?? DEFAULT_RECONNECT_BASE_MS
     this.reconnectMaxMs = options.reconnectMaxMs ?? DEFAULT_RECONNECT_MAX_MS
+    this.serializeWorkerFrames = options.serializeWorkerFrames === true
     this.worker.onmessage = event => {
       const message = event.data as WorkerOutput
       if (message.type === 'telemetry') {
@@ -83,12 +95,20 @@ export class StreamClient {
           this.awaitingReadyFrame = false
           this.pendingReadyTickets.clear()
         }
+        if (this.serializeWorkerFrames && message.acceptedFrameTicket === this.workerFrameInFlight) {
+          this.workerFrameInFlight = null
+          this.flushWorkerFrame()
+        }
       } else if (
         message.type === 'error'
         && message.connectionGeneration === this.currentGeneration
         && message.frameTicket !== undefined
       ) {
         this.pendingReadyTickets.delete(message.frameTicket)
+        if (this.serializeWorkerFrames && message.frameTicket === this.workerFrameInFlight) {
+          this.workerFrameInFlight = null
+          this.flushWorkerFrame()
+        }
       }
       options.onWorkerMessage?.(message)
     }
@@ -96,6 +116,8 @@ export class StreamClient {
       type: 'configure',
       capacity: options.capacity,
       channelCount: options.channelCount,
+      decoderMode: options.decoderMode,
+      waveformSummaryOnly: options.waveformSummaryOnly,
     } satisfies WorkerInput)
   }
 
@@ -113,6 +135,7 @@ export class StreamClient {
     this.awaitingReadyFrame = false
     this.currentGeneration = 0
     this.pendingReadyTickets.clear()
+    this.clearWorkerFrames()
     this.clearReconnectTimer()
     const socket = this.socket
     this.socket = null
@@ -134,6 +157,8 @@ export class StreamClient {
     requirePositiveInteger('channelCount', channelCount)
     this.worker.postMessage({
       type: 'configure', capacity, channelCount,
+      decoderMode: this.options.decoderMode,
+      waveformSummaryOnly: this.options.waveformSummaryOnly,
     } satisfies WorkerInput)
   }
 
@@ -142,6 +167,16 @@ export class StreamClient {
     this.worker.postMessage({
       type: 'visible-range', requestId, start, end, pixelWidth,
     } satisfies WorkerInput)
+  }
+
+  setWaveformDetail(enabled: boolean): void {
+    if (this.disposed) return
+    this.worker.postMessage({ type: 'waveform-detail', enabled } satisfies WorkerInput)
+  }
+
+  requestHistorySnapshot(requestId: number): void {
+    if (this.disposed) return
+    this.worker.postMessage({ type: 'history-snapshot', requestId } satisfies WorkerInput)
   }
 
   dispose(): void {
@@ -170,6 +205,7 @@ export class StreamClient {
     this.currentGeneration = generation
     this.nextFrameTicket = 0
     this.pendingReadyTickets.clear()
+    this.clearWorkerFrames()
     this.socket = socket
     socket.binaryType = 'arraybuffer'
     socket.onopen = () => {
@@ -191,12 +227,16 @@ export class StreamClient {
       const buffer = event.data
       const frameTicket = ++this.nextFrameTicket
       this.pendingReadyTickets.add(frameTicket)
-      this.worker.postMessage({
-        type: 'frame',
-        buffer,
-        connectionGeneration: generation,
-        frameTicket,
-      } satisfies WorkerInput, [buffer])
+      const frame = { buffer, connectionGeneration: generation, frameTicket }
+      if (this.serializeWorkerFrames) {
+        this.workerFrameQueue.push(frame)
+        this.flushWorkerFrame()
+      } else {
+        this.worker.postMessage({
+          type: 'frame',
+          ...frame,
+        } satisfies WorkerInput, [buffer])
+      }
     }
     socket.onerror = () => {
       if (socket === this.socket && this.shouldRun) {
@@ -208,6 +248,7 @@ export class StreamClient {
       this.socket = null
       this.awaitingReadyFrame = false
       this.pendingReadyTickets.clear()
+      this.clearWorkerFrames()
       if (this.shouldRun) this.scheduleReconnect()
     }
   }
@@ -238,6 +279,22 @@ export class StreamClient {
     socket.onmessage = null
     socket.onerror = null
     socket.onclose = null
+  }
+
+  private flushWorkerFrame(): void {
+    if (!this.serializeWorkerFrames || this.workerFrameInFlight !== null) return
+    const frame = this.workerFrameQueue.shift()
+    if (!frame) return
+    this.workerFrameInFlight = frame.frameTicket
+    this.worker.postMessage({
+      type: 'frame',
+      ...frame,
+    } satisfies WorkerInput, [frame.buffer])
+  }
+
+  private clearWorkerFrames(): void {
+    this.workerFrameQueue.length = 0
+    this.workerFrameInFlight = null
   }
 
   private emitState(state: StreamClientState): void {

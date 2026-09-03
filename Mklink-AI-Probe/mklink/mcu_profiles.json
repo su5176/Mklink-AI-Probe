@@ -19,8 +19,16 @@
         "channel": 0
       },
       "regions": [
-        { "name": "flash", "start": "0x08000000", "size": "0x100000" },
-        { "name": "ram", "start": "0x20000000", "size": "0x10000" }
+        {
+          "name": "flash",
+          "start": "0x08000000",
+          "size": "0x100000"
+        },
+        {
+          "name": "ram",
+          "start": "0x20000000",
+          "size": "0x10000"
+        }
       ]
     },
     "stm32f4": {
@@ -41,9 +49,21 @@
         "channel": 0
       },
       "regions": [
-        { "name": "flash", "start": "0x08000000", "size": "0x100000" },
-        { "name": "ccm", "start": "0x10000000", "size": "0x10000" },
-        { "name": "ram", "start": "0x20000000", "size": "0x20000" }
+        {
+          "name": "flash",
+          "start": "0x08000000",
+          "size": "0x100000"
+        },
+        {
+          "name": "ccm",
+          "start": "0x10000000",
+          "size": "0x10000"
+        },
+        {
+          "name": "ram",
+          "start": "0x20000000",
+          "size": "0x20000"
+        }
       ]
     },
     "n32g435": {
@@ -63,8 +83,16 @@
         "channel": 0
       },
       "regions": [
-        { "name": "flash", "start": "0x08000000", "size": "0x80000" },
-        { "name": "ram", "start": "0x20000000", "size": "0x8000" }
+        {
+          "name": "flash",
+          "start": "0x08000000",
+          "size": "0x80000"
+        },
+        {
+          "name": "ram",
+          "start": "0x20000000",
+          "size": "0x8000"
+        }
       ]
     },
     "hc32f4a0": {
@@ -84,8 +112,16 @@
         "channel": 0
       },
       "regions": [
-        { "name": "flash", "start": "0x00000000", "size": "0x200000" },
-        { "name": "ram", "start": "0x1FFE0000", "size": "0x80000" }
+        {
+          "name": "flash",
+          "start": "0x00000000",
+          "size": "0x200000"
+        },
+        {
+          "name": "ram",
+          "start": "0x1FFE0000",
+          "size": "0x80000"
+        }
       ]
     },
     "hpm5301": {
@@ -107,8 +143,16 @@
         "channel": 0
       },
       "regions": [
-        { "name": "flash", "start": "0x80000000", "size": "0x200000" },
-        { "name": "ram", "start": "0x00080000", "size": "0x40000" }
+        {
+          "name": "flash",
+          "start": "0x80000000",
+          "size": "0x200000"
+        },
+        {
+          "name": "ram",
+          "start": "0x00080000",
+          "size": "0x40000"
+        }
       ]
     },
     "at32f422": {
@@ -150,6 +194,36 @@
         "channel": 0
       },
       "regions": []
+    },
+    "stm32f411": {
+      "name": "STM32F411",
+      "idcode_pattern": "",
+      "device_prefix": "STM32F411",
+      "flm_path": "FLM/STM32F4xx_512.FLM",
+      "flash_base": "0x08000000",
+      "ram_base": "0x20000000",
+      "page_size": 128,
+      "sector_size": 2048,
+      "flash_size": "512KB",
+      "swd_clock_default": 10000000,
+      "rtt_default": {
+        "addr": "0x20000000",
+        "search_size": 1024,
+        "channel": 0
+      },
+      "regions": [
+        {
+          "name": "memory",
+          "start": "0x08000000",
+          "size": "0x00080000"
+        },
+        {
+          "name": "memory",
+          "start": "0x20000000",
+          "size": "0x00020000"
+        }
+      ],
+      "cpu_freq_default": 100000000
     }
   }
 }

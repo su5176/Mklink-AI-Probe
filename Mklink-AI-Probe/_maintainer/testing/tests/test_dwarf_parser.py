@@ -1,10 +1,120 @@
 from mklink.dwarf_parser import (
     DwarfCache,
     DwarfInfo,
+    _default_dwarf_cache_dir,
     _info_from_json,
     _info_to_json,
+    load_dwarf_info,
     parse_dwarf_info_output,
 )
+
+
+def test_default_dwarf_cache_follows_project_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("MKLINK_CACHE_DIR", raising=False)
+
+    assert _default_dwarf_cache_dir(str(tmp_path)) == (
+        tmp_path / ".mklink" / "cache" / "dwarf"
+    )
+
+
+def test_explicit_cache_root_overrides_project_root(tmp_path, monkeypatch):
+    cache_root = tmp_path / "task-cache"
+    monkeypatch.setenv("MKLINK_CACHE_DIR", str(cache_root))
+
+    assert _default_dwarf_cache_dir(str(tmp_path / "project")) == (
+        cache_root / "dwarf"
+    )
+
+
+def test_build_workspace_cache_is_used_without_project_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("MKLINK_CACHE_DIR", raising=False)
+    monkeypatch.setenv("MKLINK_BUILD_ROOT", str(tmp_path / "build"))
+
+    assert _default_dwarf_cache_dir() == tmp_path / "build" / "cache" / "dwarf"
+
+
+def test_load_dwarf_info_caches_under_project_root(tmp_path, monkeypatch):
+    class Backend:
+        name = "fixture"
+        parser_version = "fixture-v1"
+
+        def __init__(self):
+            self.calls = 0
+
+        def dwarf_info(self, _source):
+            self.calls += 1
+            return DwarfInfo()
+
+    backend = Backend()
+    source = tmp_path / "firmware.axf"
+    source.write_bytes(b"fixture")
+    project_root = tmp_path / "project"
+    monkeypatch.delenv("MKLINK_CACHE_DIR", raising=False)
+    monkeypatch.delenv("MKLINK_BUILD_ROOT", raising=False)
+    monkeypatch.setattr(
+        "mklink.elf_backend.get_elf_backend",
+        lambda *_args, **_kwargs: backend,
+    )
+
+    load_dwarf_info(str(source), project_root=str(project_root))
+    load_dwarf_info(str(source), project_root=str(project_root))
+
+    cache_files = list(
+        (project_root / ".mklink" / "cache" / "dwarf").glob("*.json")
+    )
+    assert len(cache_files) == 1
+    assert backend.calls == 1
+
+
+def test_load_dwarf_info_without_cache_creates_no_directory(tmp_path, monkeypatch):
+    class Backend:
+        name = "fixture"
+        parser_version = "fixture-v1"
+
+        @staticmethod
+        def dwarf_info(_source):
+            return DwarfInfo()
+
+    source = tmp_path / "firmware.axf"
+    source.write_bytes(b"fixture")
+    project_root = tmp_path / "project"
+    monkeypatch.delenv("MKLINK_CACHE_DIR", raising=False)
+    monkeypatch.setattr(
+        "mklink.elf_backend.get_elf_backend",
+        lambda *_args, **_kwargs: Backend(),
+    )
+
+    load_dwarf_info(str(source), use_cache=False, project_root=str(project_root))
+
+    assert not (project_root / ".mklink").exists()
+
+
+def test_unwritable_cache_does_not_fall_back_or_break_parsing(tmp_path, monkeypatch):
+    class Backend:
+        name = "fixture"
+        parser_version = "fixture-v1"
+
+        @staticmethod
+        def dwarf_info(_source):
+            return DwarfInfo()
+
+    source = tmp_path / "firmware.axf"
+    source.write_bytes(b"fixture")
+    monkeypatch.setattr(
+        "mklink.elf_backend.get_elf_backend",
+        lambda *_args, **_kwargs: Backend(),
+    )
+    monkeypatch.setattr(
+        "mklink.dwarf_parser.DwarfCache",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            PermissionError("read-only")
+        ),
+    )
+
+    assert isinstance(
+        load_dwarf_info(str(source), project_root=str(tmp_path / "project")),
+        DwarfInfo,
+    )
 
 
 def test_variable_type_resolves_through_volatile_and_typedefs():

@@ -38,12 +38,14 @@ def test_create_app_has_an_independent_typed_stream_registry():
 
     assert first.state.stream_registry is not second.state.stream_registry
     assert set(first.state.stream_registry) == {
-        "systemview", "vofa", "rtt", "superwatch",
+        "systemview", "vofa", "rtt", "rtt-terminal", "serial", "superwatch",
     }
     assert first.state.stream_types == {
         "systemview": StreamType.SYSTEMVIEW,
         "vofa": StreamType.WAVEFORM,
         "rtt": StreamType.RTT_RAW,
+        "rtt-terminal": StreamType.RTT_RAW,
+        "serial": StreamType.SERIAL,
         "superwatch": StreamType.SUPERWATCH,
     }
     assert all(
@@ -60,6 +62,8 @@ def test_create_app_has_an_independent_typed_stream_registry():
         ("systemview", StreamType.SYSTEMVIEW),
         ("vofa", StreamType.WAVEFORM),
         ("rtt", StreamType.RTT_RAW),
+        ("rtt-terminal", StreamType.RTT_RAW),
+        ("serial", StreamType.SERIAL),
         ("superwatch", StreamType.SUPERWATCH),
     ],
 )
@@ -77,7 +81,7 @@ def test_websocket_sends_binary_batch_with_hub_metadata(
             assert metadata.stream_type is StreamType.SUPERWATCH
             assert metadata.flags == 0x02
         expected_sequence = hub.publish(b"payload", item_count=7)
-        frame = decode_frame(websocket.receive_bytes())
+        frame = _receive_data_frame(websocket)
 
     assert frame.stream_type is stream_type
     assert frame.stream_id == int(stream_type)
@@ -119,7 +123,24 @@ def test_websocket_accepts_existing_server_auth_token(monkeypatch):
             websocket.send_json({"token": "secret"})
             assert decode_frame(websocket.receive_bytes()).stream_type is StreamType.CONTROL
             app.state.stream_registry["rtt"].publish(b"ok", item_count=1)
-            assert decode_frame(websocket.receive_bytes()).payload == b"ok"
+            assert _receive_data_frame(websocket).payload == b"ok"
+
+
+def test_websocket_accepts_private_authorization_header(monkeypatch):
+    from mklink.remote import stream_api
+
+    monkeypatch.setattr(stream_api, "HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    app = create_app(auth_token="secret", project_root=".")
+    with (
+        TestClient(app) as client,
+        client.websocket_connect(
+            "/ws/streams/rtt",
+            headers={"Authorization": "Bearer secret"},
+        ) as websocket,
+    ):
+        assert decode_frame(websocket.receive_bytes()).stream_type is StreamType.CONTROL
+        app.state.stream_registry["rtt"].publish(b"ok", item_count=1)
+        assert _receive_data_frame(websocket).payload == b"ok"
 
 
 @pytest.mark.parametrize(
@@ -218,7 +239,7 @@ def test_publish_from_external_thread_wakes_websocket(client, app, monkeypatch):
         assert metadata.stream_type is StreamType.SUPERWATCH
         assert metadata.flags == 0x02
         publisher.start()
-        frame = decode_frame(websocket.receive_bytes())
+        frame = _receive_data_frame(websocket)
         publisher.join(timeout=1)
 
     assert not publisher.is_alive()
@@ -232,6 +253,19 @@ def test_publish_from_external_thread_wakes_websocket(client, app, monkeypatch):
         ("post", "/api/dash/superwatch/add", {"json": {"name": "a"}}, "add_watch"),
         ("post", "/api/dash/superwatch/remove", {"json": {"name": "a"}}, "remove_watch"),
         ("get", "/api/dash/superwatch/status", {}, "get_status"),
+        (
+            "post", "/api/dash/superwatch/array-snapshot/select",
+            {"json": {"name": "a", "start_index": 0, "count": 1}},
+            "select_array_snapshot",
+        ),
+        (
+            "post", "/api/dash/superwatch/array-snapshot/clear",
+            {"json": {}}, "clear_array_snapshot",
+        ),
+        (
+            "get", "/api/dash/superwatch/array-snapshot",
+            {}, "get_array_snapshot",
+        ),
     ],
 )
 def test_superwatch_locking_api_work_does_not_block_health(

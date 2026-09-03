@@ -7,7 +7,9 @@
     </span>
     <span class="status-item" v-else-if="backendState === 'alive'">
       <span class="status-dot dot-ok"></span>
-      <span class="status-label">{{ tr('后端正常', 'Backend online') }}</span>
+      <span class="status-label">
+        {{ tr('后端正常', 'Backend online') }}<template v-if="backendPort"> · {{ backendPort }}</template>
+      </span>
     </span>
     <span class="status-item" v-else>
       <span class="status-dot dot-err"></span>
@@ -25,7 +27,6 @@
     <span :class="['badge', deviceStatus.connected ? 'badge-ok' : 'badge-err']">
       {{ deviceStatus.connected ? tr('已连接', 'Connected') : tr('未连接', 'Disconnected') }}
     </span>
-    <span v-if="deviceStatus.mcu" class="badge badge-accent">{{ deviceStatus.mcu }}</span>
     <span v-if="deviceStatus.idcode" class="badge badge-info">{{ deviceStatus.idcode }}</span>
     <span v-if="wsConnected" class="badge badge-warn">WS</span>
   </div>
@@ -39,7 +40,7 @@ import { tr } from '../composables/useLanguage'
 
 const { deviceStatus } = useMklinkApi()
 const { wsConnected } = useMklinkWs()
-const { backendState, isTauri, restart } = useBackendHealth()
+const { backendState, backendPort, isTauri, restart } = useBackendHealth()
 
 async function handleRestart() {
   try {

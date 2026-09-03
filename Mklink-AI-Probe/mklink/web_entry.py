@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from contextlib import contextmanager
 import hashlib
+import importlib.util
 import json
 import os
 import plistlib
@@ -33,6 +34,20 @@ LOCK_FILE_NAME = "operation.lock"
 WINDOWS_OWNER_VALUE = "Mklink Web Entry Owner"
 WINDOWS_HANDLER_VALUE = "Mklink Web Entry Handler"
 WINDOWS_OWNER_ID = "com.microkeen.mklink-ai-probe.web-entry"
+WINDOWS_FRIENDLY_NAME = "MKLink Web GUI"
+WINDOWS_DESCRIPTION = "MKLink AI Probe Web GUI Launcher"
+QUICK_LAUNCH_FILE_NAME = "MKLink Web GUI.html"
+AUTO_LAUNCH_DELAY_SECONDS = 3
+WEB_START_TIMEOUT_SECONDS = 45
+LAUNCH_PAGE_TIMEOUT_SECONDS = 50
+
+REQUIREMENT_MODULES: dict[str, tuple[str, ...]] = {
+    "core": ("serial", "pymodbus", "elftools", "pycparser", "websockets"),
+    "gui": (
+        "fastapi", "starlette", "uvicorn", "pyocd", "intelhex", "multipart",
+    ),
+    "mcp": ("fastmcp", "pydantic"),
+}
 
 
 class WebEntryError(RuntimeError):
@@ -188,6 +203,31 @@ def _icon_data_uri() -> str:
     return "data:image/png;base64," + base64.b64encode(icon.read_bytes()).decode("ascii")
 
 
+def _module_available(name: str) -> bool:
+    try:
+        return importlib.util.find_spec(name) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def check_web_entry_requirements(
+    *,
+    root: Path | None = None,
+    module_available: Callable[[str], bool] = _module_available,
+) -> dict[str, Any]:
+    """Check the complete runtime required by Web GUI and MCP entry points."""
+    root = Path(root or repository_root())
+    missing = [
+        f"{group}:{module}"
+        for group, modules in REQUIREMENT_MODULES.items()
+        for module in modules
+        if not module_available(module)
+    ]
+    if not (root / "gui" / "dist" / "index.html").is_file():
+        missing.append("gui:built-web-assets")
+    return {"ready": not missing, "missing": missing}
+
+
 def render_launcher_html(*, icon_data_uri: str | None = None) -> str:
     icon_data_uri = _icon_data_uri() if icon_data_uri is None else icon_data_uri
     icon = (
@@ -226,21 +266,26 @@ a:hover {{ border-color:#278075; }}
   <header>{icon}<div><h1>Mklink AI Probe</h1><div class="sub">Windows / macOS / Linux 通用 Web 启动入口</div></div></header>
   <div class="content">
     <div class="actions">
-      <a class="primary" href="{SCHEME}://web/start" data-action="start">启动 Web 客户端</a>
+      <a class="primary" href="{SCHEME}://web/start" data-action="start">立即启动 Web GUI</a>
       <a href="{SCHEME}://web/stop" data-action="stop">停止服务</a>
     </div>
-    <div id="status" role="status">点击启动后，浏览器会请求打开已安装的 Mklink 启动器。</div>
-    <div class="note">首次使用时请允许浏览器打开 Mklink AI Probe。更新 Skill 或改变安装位置后，请重新注册一次快速启动器。此文件不包含程序，也不会从 U 盘执行脚本。</div>
+    <div id="status" role="status">即将自动启动 Web GUI...</div>
+    <div class="note">首次使用时请允许浏览器打开 Mklink AI Probe。此文件不包含程序，也不会从 U 盘执行脚本。</div>
   </div>
 </main>
 <script>
 var launchInterval = null;
 var launchTimeout = null;
-var launchTimeoutSeconds = 25;
+var autoLaunchTimer = null;
+var autoLaunchDelaySeconds = {AUTO_LAUNCH_DELAY_SECONDS};
+var launchTimeoutSeconds = {LAUNCH_PAGE_TIMEOUT_SECONDS};
+var startUri = '{SCHEME}://web/start';
 
 function clearLaunchTimers() {{
+  if (autoLaunchTimer !== null) window.clearTimeout(autoLaunchTimer);
   if (launchInterval !== null) window.clearInterval(launchInterval);
   if (launchTimeout !== null) window.clearTimeout(launchTimeout);
+  autoLaunchTimer = null;
   launchInterval = null;
   launchTimeout = null;
 }}
@@ -260,8 +305,25 @@ function startLaunchCountdown() {{
   launchTimeout = window.setTimeout(function() {{
     clearLaunchTimers();
     status.className = 'error';
-    status.textContent = '启动超时：请确认浏览器已允许打开 Mklink 启动器，并检查完整 Skill 是否已安装。如果刚更新或移动了 Skill，请重新注册快速启动器后再试。';
+    status.textContent = '启动超时：请确认浏览器已允许打开 Mklink 启动器。仍无法启动时，请让 AI 从官方仓库安装或更新完整 MKLink AI Probe Skill，并检查 Web GUI 与 MCP 依赖。';
   }}, launchTimeoutSeconds * 1000);
+}}
+
+function requestLaunch() {{
+  startLaunchCountdown();
+  window.location.href = startUri;
+}}
+
+function scheduleAutomaticLaunch() {{
+  var remaining = autoLaunchDelaySeconds;
+  var status = document.getElementById('status');
+  status.textContent = remaining + ' 秒后自动启动 Web GUI...';
+  var countdown = window.setInterval(function() {{
+    remaining -= 1;
+    if (remaining > 0) status.textContent = remaining + ' 秒后自动启动 Web GUI...';
+    else window.clearInterval(countdown);
+  }}, 1000);
+  autoLaunchTimer = window.setTimeout(requestLaunch, autoLaunchDelaySeconds * 1000);
 }}
 
 document.querySelectorAll('[data-action]').forEach(function(link) {{
@@ -273,9 +335,11 @@ document.querySelectorAll('[data-action]').forEach(function(link) {{
       status.textContent = '已请求停止由此入口启动的 Web 服务。';
       return;
     }}
+    clearLaunchTimers();
     startLaunchCountdown();
   }});
 }});
+window.addEventListener('DOMContentLoaded', scheduleAutomaticLaunch);
 </script>
 </body>
 </html>
@@ -289,11 +353,99 @@ def write_launcher_html(
 ) -> Path:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(
-        render_launcher_html(icon_data_uri=icon_data_uri),
-        encoding="utf-8",
-    )
+    output.write_bytes(render_launcher_html(icon_data_uri=icon_data_uri).encode("utf-8"))
     return output
+
+
+def desktop_directory(
+    *,
+    system: str | None = None,
+    environment: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    import platform
+
+    system = system or platform.system()
+    environment = environment if environment is not None else os.environ
+    home = home or Path.home()
+    if system == "Windows":
+        try:
+            import winreg
+
+            key_path = r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path) as key:
+                value = str(winreg.QueryValueEx(key, "Desktop")[0])
+            return Path(os.path.expandvars(value))
+        except OSError:
+            return Path(environment.get("USERPROFILE", str(home))) / "Desktop"
+    if system == "Linux":
+        configured = environment.get("XDG_DESKTOP_DIR", "").strip()
+        if configured:
+            return Path(os.path.expandvars(configured.replace("$HOME", str(home))))
+    return home / "Desktop"
+
+
+def find_microkeen_disks(
+    *,
+    system: str | None = None,
+    environment: dict[str, str] | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    """Find writable probe volumes without accepting unrelated removable disks."""
+    import platform
+
+    system = system or platform.system()
+    environment = environment if environment is not None else os.environ
+    home = home or Path.home()
+    candidates: list[Path] = []
+    if system == "Windows":
+        import string
+
+        from mklink.discovery import _windows_volume_label
+
+        configured = environment.get("MKLINK_MICROKEEN_DISK", "").strip()
+        roots = ([configured.rstrip("\\/") + "\\"] if configured else []) + [
+            f"{letter}:\\" for letter in string.ascii_uppercase
+        ]
+        for root in roots:
+            if (
+                root not in {str(path) for path in candidates}
+                and Path(root).is_dir()
+                and (_windows_volume_label(root) or "").casefold() == "microkeen"
+            ):
+                candidates.append(Path(root))
+    elif system == "Darwin":
+        candidates = [Path("/Volumes/MICROKEEN")]
+    elif system == "Linux":
+        candidates = [
+            Path("/media") / home.name / "MICROKEEN",
+            Path("/run/media") / home.name / "MICROKEEN",
+        ]
+    return [path for path in candidates if path.is_dir() and os.access(path, os.W_OK)]
+
+
+def write_quick_launchers(
+    *,
+    find_probe_disks: Callable[[], list[Path]] = find_microkeen_disks,
+    desktop: Path | None = None,
+    icon_data_uri: str | None = None,
+) -> list[Path]:
+    destinations = [Path(path) for path in find_probe_disks()]
+    if not destinations:
+        destinations = [Path(desktop or desktop_directory())]
+    written = []
+    for destination in destinations:
+        try:
+            written.append(write_launcher_html(
+                destination / QUICK_LAUNCH_FILE_NAME,
+                icon_data_uri=icon_data_uri,
+            ).resolve())
+        except OSError:
+            continue
+    if written:
+        return written
+    fallback = Path(desktop or desktop_directory()) / QUICK_LAUNCH_FILE_NAME
+    return [write_launcher_html(fallback, icon_data_uri=icon_data_uri).resolve()]
 
 
 def gui_server_command(
@@ -314,6 +466,7 @@ def gui_server_command(
         "--host", "127.0.0.1",
         "--port", str(port),
         "--no-browser",
+        "--browser-session-timeout", "15",
         "--project-root", str(project_root),
     ]
 
@@ -504,7 +657,7 @@ def start_web_entry(
     browser_open: Callable[[str], Any] = webbrowser.open,
     process_identity: Callable[[int], str | None] = get_process_identity,
     sleep: Callable[[float], None] = time.sleep,
-    timeout: float = 20.0,
+    timeout: float = WEB_START_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     data_dir = Path(data_dir or platform_data_dir())
     state = _load_state(data_dir)
@@ -535,9 +688,9 @@ def start_web_entry(
             browser_open(web_entry_url(port))
             return {"status": "reused", "port": port, "owned": False}
         if detected == "api":
-            raise WebEntryError(
-                f"MKLink API is already running on port {port} without Web assets"
-            )
+            # An API-only service still occupies the port.  Keep it untouched
+            # and continue scanning so the Web GUI can start on the next port.
+            continue
         if selected_port is None and port_available(port):
             selected_port = port
     if selected_port is None:
@@ -628,14 +781,12 @@ def web_entry_status(
         saved_identity = state.get("process_identity")
         if not saved_identity or process_identity(pid) != saved_identity:
             _clear_state(data_dir)
-            return {"status": "stale", "port": port, "pid": pid, "owned": False}
+            return {"status": "stopped", "port": port, "pid": pid, "owned": False}
         detected = probe_server(port) if port else None
-        return {
-            "status": "running" if detected == "web" else "stale",
-            "port": port,
-            "pid": pid,
-            "owned": True,
-        }
+        if detected == "web":
+            return {"status": "running", "port": port, "pid": pid, "owned": True}
+        _clear_state(data_dir)
+        return {"status": "stopped", "port": port, "pid": pid, "owned": False}
     detected = probe_server(DEFAULT_PORT)
     if detected == "web":
         return {"status": "running", "port": DEFAULT_PORT, "owned": False}
@@ -643,7 +794,12 @@ def web_entry_status(
 
 
 def protocol_python_executable() -> Path:
-    executable = Path(sys.executable).resolve()
+    executable = Path(sys.executable)
+    if sys.prefix == sys.base_prefix:
+        executable = executable.resolve()
+    else:
+        # Resolving a venv interpreter symlink would escape the environment.
+        executable = executable.absolute()
     if os.name == "nt" and executable.name.lower() == "python.exe":
         pythonw = executable.with_name("pythonw.exe")
         if pythonw.is_file():
@@ -724,10 +880,15 @@ def _install_windows_protocol(
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base) as key:
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, f"URL:{HANDLER_NAME}")
         winreg.SetValueEx(key, "URL Protocol", 0, winreg.REG_SZ, "")
+        winreg.SetValueEx(key, "FriendlyTypeName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
+        winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
         winreg.SetValueEx(key, WINDOWS_OWNER_VALUE, 0, winreg.REG_SZ, WINDOWS_OWNER_ID)
         winreg.SetValueEx(
             key, WINDOWS_HANDLER_VALUE, 0, winreg.REG_SZ, str(handler.resolve()),
         )
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\Application") as key:
+        winreg.SetValueEx(key, "ApplicationName", 0, winreg.REG_SZ, WINDOWS_FRIENDLY_NAME)
+        winreg.SetValueEx(key, "ApplicationDescription", 0, winreg.REG_SZ, WINDOWS_DESCRIPTION)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\DefaultIcon") as key:
         winreg.SetValueEx(key, "", 0, winreg.REG_SZ, str(python_executable))
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, base + r"\shell\open\command") as key:
@@ -856,6 +1017,27 @@ def install_protocol(
         "handler": str(handler),
         "registration": str(registration),
     }
+
+
+def install_quick_launcher(
+    *,
+    desktop: Path | None = None,
+) -> dict[str, Any]:
+    requirements = check_web_entry_requirements()
+    if not requirements["ready"]:
+        install_hint = f'python -m pip install -e "{repository_root()}[gui,mcp]"'
+        raise WebEntryError(
+            "Missing complete MKLink requirements: "
+            + ", ".join(requirements["missing"])
+            + f". Install with: {install_hint}"
+        )
+    result: dict[str, Any] = dict(install_protocol())
+    result["requirements"] = requirements
+    result["html"] = [
+        str(path.resolve())
+        for path in write_quick_launchers(desktop=desktop)
+    ]
+    return result
 
 
 def _delete_windows_registry_tree(path: str) -> None:

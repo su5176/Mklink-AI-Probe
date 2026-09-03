@@ -14,7 +14,6 @@
           <button :class="['tab-btn', { active: tab === 'superwatch' }]" @click="tab = 'superwatch'">SuperWatch</button>
           <button :class="['tab-btn', { active: tab === 'hardfault' }]" @click="tab = 'hardfault'">HardFault</button>
           <button :class="['tab-btn', { active: tab === 'memory' }]" @click="tab = 'memory'">Memory</button>
-          <button :class="['tab-btn', { active: tab === 'debug' }]" @click="tab = 'debug'">{{ tr('调试控制', 'Debug Control') }}</button>
           <button :class="['tab-btn', { active: tab === 'serial' }]" @click="tab = 'serial'">{{ tr('串口助手', 'Serial Assistant') }}</button>
           <button :class="['tab-btn', { active: tab === 'modbus' }]" @click="tab = 'modbus'">Modbus</button>
           <button :class="['tab-btn', { active: tab === 'systemview' }]" @click="tab = 'systemview'">RTOS Trace</button>
@@ -25,9 +24,6 @@
             <span class="status-dot" :class="bridgeOwner.startsWith('ai:') ? 'dot-ai' : 'dot-user'"></span>
             <span v-if="bridgeOwner.startsWith('ai:')">{{ tr('AI 正在使用设备', 'AI is using the device') }}</span>
             <span v-else>{{ bridgeOwnerLabel }}</span>
-          </span>
-          <span v-if="deviceStatus.connected" class="device-summary" :title="deviceStatus.port || ''">
-            {{ deviceStatus.mcu || tr('已连接', 'Connected') }}
           </span>
           <button
             type="button"
@@ -43,34 +39,46 @@
             <Usb v-else :size="14" aria-hidden="true" />
             <span>{{ connecting ? tr('连接中', 'Connecting') : disconnecting ? tr('断开中', 'Disconnecting') : deviceStatus.connected ? tr('断开', 'Disconnect') : tr('连接设备', 'Connect Device') }}</span>
           </button>
+          <button
+            type="button"
+            class="device-quick-action reset-action"
+            :disabled="!deviceStatus.connected || connecting || disconnecting || resetting || rebootingProbe"
+            :title="tr('重启 MCU', 'Restart MCU')"
+            data-testid="mcu-reset-action"
+            @click="quickReset"
+          >
+            <LoaderCircle v-if="resetting" class="spinning" :size="14" aria-hidden="true" />
+            <RotateCcw v-else :size="14" aria-hidden="true" />
+            <span>{{ resetting ? tr('重启中...', 'Restarting...') : tr('重启 MCU', 'Restart MCU') }}</span>
+          </button>
+          <button
+            type="button"
+            class="device-quick-action reset-action"
+            :disabled="!deviceStatus.connected || connecting || disconnecting || resetting || rebootingProbe"
+            :title="tr('重启 MKLink 探针', 'Reboot MKLink probe')"
+            data-testid="reboot-probe"
+            @click="quickRebootProbe"
+          >
+            <LoaderCircle v-if="rebootingProbe" class="spinning" :size="14" aria-hidden="true" />
+            <RefreshCw v-else :size="14" aria-hidden="true" />
+            <span>{{ rebootingProbe ? tr('重启中...', 'Rebooting...') : tr('重启 MKLink', 'Reboot MKLink') }}</span>
+          </button>
           <div v-if="connectionError" class="device-quick-error" role="alert">
+            <button
+              class="device-quick-error-close"
+              type="button"
+              :title="tr('关闭错误提示', 'Dismiss error')"
+              :aria-label="tr('关闭错误提示', 'Dismiss error')"
+              data-testid="dismiss-connection-error"
+              @click="clearConnectionError"
+            ><X :size="14" aria-hidden="true" /></button>
             <span>{{ connectionError }}</span>
-            <button type="button" @click="goConnect">{{ tr('打开配置', 'Open Config') }}</button>
+            <button class="device-quick-error-config" type="button" @click="goConnect">{{ tr('打开配置', 'Open Config') }}</button>
           </div>
         </div>
       </div>
 
       <RttViewTab v-show="tab === 'rtt'" :device-connected="deviceStatus.connected" />
-
-      <!-- 调试控制 -->
-      <div v-if="tab === 'debug'">
-        <SetupHint
-          v-if="!deviceStatus.connected"
-          kind="device"
-          :message="tr('调试控制需要 MKLink 设备连接。', 'Debug Control requires an MKLink device connection.')"
-          :primary-label="tr('连接设备', 'Connect Device')"
-          :busy="connecting"
-          @primary="quickConnect"
-        />
-        <template v-else>
-          <div class="btn-group">
-            <button class="btn" @click="doHalt">{{ tr('暂停 CPU', 'Halt CPU') }}</button>
-            <button class="btn" @click="doResume">{{ tr('恢复 CPU', 'Resume CPU') }}</button>
-            <button class="btn" @click="doReset">{{ tr('复位', 'Reset') }}</button>
-            <button class="btn btn-danger" @click="doErase">{{ tr('整片擦除', 'Chip Erase') }}</button>
-          </div>
-        </template>
-      </div>
 
       <HardFaultTab v-if="tab === 'hardfault'" :device-connected="deviceStatus.connected" :symbol-loaded="deviceStatus.axf?.loaded === true" />
       <MemoryTab v-if="tab === 'memory'" :device-connected="deviceStatus.connected" />
@@ -85,12 +93,12 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue'
-import { LoaderCircle, Unplug, Usb } from '@lucide/vue'
+import { LoaderCircle, RefreshCw, RotateCcw, Unplug, Usb, X } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMklinkApi } from '../composables/useMklinkApi'
-import { useToast } from '../composables/useToast'
 import { useResourceStatus } from '../composables/useResourceStatus'
 import { useDashboardSetup } from '../composables/useDashboardSetup'
+import { useToast } from '../composables/useToast'
 import RttViewTab from '../components/dash/RttViewTab.vue'
 import HardFaultTab from '../components/dash/HardFaultTab.vue'
 import SymbolsTab from '../components/dash/SymbolsTab.vue'
@@ -99,18 +107,11 @@ import SuperWatchTab from '../components/dash/SuperWatchTab.vue'
 import SerialMonitorTab from '../components/dash/SerialMonitorTab.vue'
 import ModbusTab from '../components/dash/ModbusTab.vue'
 import SystemViewTab from '../components/dash/SystemViewTab.vue'
-import SetupHint from '../components/dash/SetupHint.vue'
 import { tr } from '../composables/useLanguage'
 
 const route = useRoute()
 const router = useRouter()
-const {
-  deviceStatus,
-  resetDevice,
-  eraseDevice,
-  haltDevice,
-  resumeDevice,
-} = useMklinkApi()
+const { deviceStatus, resetDevice, rebootProbe } = useMklinkApi()
 const toast = useToast()
 const {
   connecting,
@@ -118,11 +119,14 @@ const {
   connectionError,
   quickConnect,
   quickDisconnect,
+  clearConnectionError,
 } = useDashboardSetup()
 const { refresh: refreshResource, getBridgeOwner } = useResourceStatus()
 const dashboardTabs = new Set(['rtt', 'superwatch', 'memory', 'symbols', 'hardfault', 'serial', 'modbus', 'systemview'])
 const routeTab = Array.isArray(route.query.tab) ? route.query.tab[0] : route.query.tab
 const tab = ref(typeof routeTab === 'string' && dashboardTabs.has(routeTab) ? routeTab : 'rtt')
+const resetting = ref(false)
+const rebootingProbe = ref(false)
 
 const bridgeOwner = computed(() => getBridgeOwner())
 const bridgeOwnerLabel = computed(() => {
@@ -142,22 +146,50 @@ refreshResource()
 setInterval(refreshResource, 3000)
 
 function goConnect() {
+  clearConnectionError()
   router.push({ name: 'config' })
 }
 
-async function doReset() {
-  if (!confirm(tr('确定要复位 CPU？', 'Reset the CPU?'))) return
-  try { await resetDevice(); toast.success(tr('已复位', 'CPU reset')) } catch (e: any) { toast.error(e.message) }
+async function quickReset() {
+  if (!deviceStatus.value.connected || resetting.value || rebootingProbe.value) return
+  resetting.value = true
+  try {
+    await resetDevice()
+    toast.success(tr('MCU 已复位', 'MCU reset'))
+  } catch (cause) {
+    toast.error(tr('MCU 复位失败：', 'Failed to reset MCU: ') + (
+      cause instanceof Error ? cause.message : String(cause)
+    ))
+  } finally {
+    resetting.value = false
+    await refreshResource()
+  }
 }
-async function doErase() {
-  if (!confirm(tr('确定要整片擦除？此操作不可撤销。', 'Erase the entire chip? This cannot be undone.'))) return
-  try { await eraseDevice(); toast.success(tr('整片擦除完成', 'Chip erase complete')) } catch (e: any) { toast.error(e.message) }
+
+async function quickRebootProbe() {
+  if (!deviceStatus.value.connected || resetting.value || rebootingProbe.value) return
+  if (!window.confirm(tr(
+    '重启 MKLink 探针会中断当前调试和数据流，并释放串口连接。确认继续？',
+    'Rebooting the MKLink probe interrupts debugging and data streams and releases the serial connection. Continue?',
+  ))) return
+
+  rebootingProbe.value = true
+  try {
+    await rebootProbe()
+    toast.success(tr(
+      'MKLink 已重启，请等待探针重新枚举后再连接',
+      'MKLink rebooted. Wait for the probe to enumerate before reconnecting.',
+    ))
+  } catch (cause) {
+    toast.error(tr('MKLink 重启失败: ', 'Failed to reboot MKLink: ') + (
+      cause instanceof Error ? cause.message : String(cause)
+    ))
+  } finally {
+    rebootingProbe.value = false
+    await refreshResource()
+  }
 }
-async function doHalt() {
-  if (!confirm(tr('确定要暂停 CPU？', 'Halt the CPU?'))) return
-  try { await haltDevice(); toast.info(tr('CPU 已暂停', 'CPU halted')) } catch (e: any) { toast.error(e.message) }
-}
-async function doResume() { try { await resumeDevice(); toast.success(tr('CPU 已恢复', 'CPU resumed')) } catch (e: any) { toast.error(e.message) } }
+
 </script>
 
 <style scoped>
@@ -212,7 +244,8 @@ async function doResume() { try { await resumeDevice(); toast.success(tr('CPU �
   min-width: 0;
 }
 .dashboard-nav-row .tabs-bar {
-  flex: 1;
+  flex: 1 1 0;
+  width: 0;
   min-width: 0;
   margin-bottom: 0;
   border-bottom: 0;
@@ -226,14 +259,6 @@ async function doResume() { try { await resumeDevice(); toast.success(tr('CPU �
 .resource-status-inline {
   display: flex; align-items: center; gap: 6px;
   font-size: 12px; color: var(--muted);
-}
-.device-summary {
-  max-width: 120px;
-  overflow: hidden;
-  color: var(--muted);
-  font-size: 12px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 .device-quick-action {
   display: inline-flex;
@@ -251,6 +276,7 @@ async function doResume() { try { await resumeDevice(); toast.success(tr('CPU �
 }
 .device-quick-action.connected { border-color: var(--border); background: transparent; color: var(--muted); }
 .device-quick-action:disabled { cursor: wait; opacity: 0.65; }
+.reset-action:disabled { cursor: not-allowed; }
 .device-quick-error {
   position: absolute;
   z-index: 20;
@@ -265,8 +291,11 @@ async function doResume() { try { await resumeDevice(); toast.success(tr('CPU �
   background: var(--surface);
   color: var(--danger);
   font-size: 12px;
+  padding-right: 30px;
 }
-.device-quick-error button { justify-self: end; border: 0; background: transparent; color: var(--accent); cursor: pointer; }
+.device-quick-error button { border: 0; background: transparent; color: var(--accent); cursor: pointer; }
+.device-quick-error-close { position: absolute; top: 5px; right: 5px; display: inline-flex; padding: 3px; color: var(--muted) !important; }
+.device-quick-error-config { justify-self: end; }
 .spinning { animation: device-spin 0.8s linear infinite; }
 @keyframes device-spin { to { transform: rotate(360deg); } }
 .status-dot {
@@ -282,6 +311,5 @@ async function doResume() { try { await resumeDevice(); toast.success(tr('CPU �
 }
 @media (max-width: 520px) {
   .resource-status-inline { display: none; }
-  .device-summary { max-width: 92px; }
 }
 </style>

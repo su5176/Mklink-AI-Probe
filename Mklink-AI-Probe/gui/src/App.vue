@@ -15,13 +15,25 @@
           target="_blank"
           rel="noopener noreferrer"
         >{{ tr('在线文档', 'Docs') }}</a>
-        <a
-          class="external-link"
-          data-testid="taobao-link"
-          href="https://item.taobao.com/item.htm?ft=t&id=1020501356342"
-          target="_blank"
-          rel="noopener noreferrer"
-        >{{ tr('淘宝店', 'Store') }}</a>
+        <details class="store-menu" data-testid="taobao-menu">
+          <summary class="external-link" data-testid="taobao-link">{{ tr('淘宝店铺', 'Stores') }}</summary>
+          <div class="store-menu-panel">
+            <a
+              class="store-menu-item"
+              data-testid="official-store-link"
+              href="https://item.taobao.com/item.htm?ft=t&id=1020501356342"
+              target="_blank"
+              rel="noopener noreferrer"
+            >{{ tr('官方智沐店铺', 'Official Zhi Mu Store') }}</a>
+            <a
+              class="store-menu-item"
+              data-testid="xianji-store-link"
+              href="https://item.taobao.com/item.htm?ft=t&id=1074695414484"
+              target="_blank"
+              rel="noopener noreferrer"
+            >{{ tr('先楫定制店铺', 'Xianji Custom Store') }}</a>
+          </div>
+        </details>
       </nav>
       <div class="header-right">
         <button
@@ -81,6 +93,7 @@ import { useMklinkApi } from './composables/useMklinkApi'
 import { useBackendHealth } from './composables/useBackendHealth'
 import { useAppUpdater } from './composables/useAppUpdater'
 import { language, toggleLanguage, tr } from './composables/useLanguage'
+import { startBrowserSessionLease } from './lib/browserSessionLease'
 
 const router = useRouter()
 const route = useRoute()
@@ -98,6 +111,7 @@ const {
 const initialBackendReady = ref(false)
 const updateDismissed = ref(false)
 let statusPollingStarted = false
+let stopBrowserSessionLease: () => void = () => undefined
 const appVersion = __APP_VERSION__
 const buildCommit = __APP_BUILD_COMMIT__
 
@@ -125,12 +139,14 @@ watch(backendState, state => {
 }, { immediate: true })
 
 onMounted(() => {
+  stopBrowserSessionLease = startBrowserSessionLease(!isTauri)
   startHealthPolling(5000)
   void checkForUpdates()
 })
 onUnmounted(() => {
   if (statusPollingStarted) stopStatusPolling()
   stopHealthPolling()
+  stopBrowserSessionLease()
 })
 </script>
 
@@ -198,6 +214,7 @@ body {
   border-bottom: 2px solid transparent;
   transition: all 0.15s;
   font-family: var(--font-body);
+  white-space: nowrap;
 }
 .nav-tab:hover { color: var(--fg); border-bottom-color: var(--border); }
 .nav-tab.active {
@@ -222,6 +239,43 @@ body {
   white-space: nowrap;
   border-bottom: 2px solid transparent;
 }
+.store-menu {
+  position: relative;
+}
+.store-menu > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.store-menu > summary::-webkit-details-marker { display: none; }
+.store-menu-panel {
+  position: absolute;
+  z-index: 30;
+  top: calc(100% - 2px);
+  right: 0;
+  display: grid;
+  min-width: 190px;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  box-shadow: 0 8px 20px rgba(20, 20, 19, 0.12);
+}
+.store-menu-item {
+  display: block;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.store-menu-item:hover { background: var(--border-subtle); color: var(--accent); }
+.store-menu-pending,
+.store-menu-pending:hover { color: var(--dim); cursor: not-allowed; }
 .external-link:hover { color: var(--accent); border-bottom-color: var(--border); }
 .language-toggle {
   height: 28px;
@@ -257,6 +311,11 @@ body {
     padding: 12px 8px;
   }
   .external-link { height: 44px; padding: 0 8px; }
+  .store-menu-panel {
+    position: fixed;
+    top: 46px;
+    right: 8px;
+  }
   .header-right {
     grid-column: 1 / -1;
     width: 100%;

@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import hashlib
 import json
+import os
 import re
 from pathlib import Path
 
@@ -409,6 +410,24 @@ class DwarfCache:
         )
 
 
+def _default_dwarf_cache_dir(project_root: str | None = None) -> Path:
+    """Keep reusable parser data with the user-selected task/project root."""
+    explicit = os.environ.get("MKLINK_CACHE_DIR")
+    if explicit:
+        return Path(explicit).expanduser().resolve() / "dwarf"
+    if project_root:
+        return (
+            Path(project_root).expanduser().resolve()
+            / ".mklink"
+            / "cache"
+            / "dwarf"
+        )
+    build_root = os.environ.get("MKLINK_BUILD_ROOT")
+    if build_root:
+        return Path(build_root).expanduser().resolve() / "cache" / "dwarf"
+    return Path.home() / ".mklink" / "dwarf_cache"
+
+
 def load_dwarf_info(
     source: str,
     *,
@@ -419,8 +438,15 @@ def load_dwarf_info(
     from mklink.elf_backend import get_elf_backend
 
     selected = get_elf_backend(backend, project_root=project_root)
-    cache = DwarfCache()
+    cache = None
     if use_cache:
+        try:
+            cache = DwarfCache(str(_default_dwarf_cache_dir(project_root)))
+        except OSError:
+            # A read-only project must not make AXF parsing fail, and must not
+            # trigger a hidden fallback to the user profile/system drive.
+            cache = None
+    if cache is not None:
         cached = cache.load(
             source,
             backend=selected.name,
@@ -429,13 +455,16 @@ def load_dwarf_info(
         if cached:
             return cached
     info = selected.dwarf_info(source)
-    if use_cache:
-        cache.save(
-            source,
-            info,
-            backend=selected.name,
-            parser_version=selected.parser_version,
-        )
+    if cache is not None:
+        try:
+            cache.save(
+                source,
+                info,
+                backend=selected.name,
+                parser_version=selected.parser_version,
+            )
+        except OSError:
+            pass
     return info
 
 

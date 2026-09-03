@@ -19,7 +19,9 @@ const steps = computed(() =>
 )
 
 async function onOpenDir() {
-  await openInExplorer(props.check.firmware_dir)
+  if (props.check.firmware_dir) {
+    await openInExplorer(props.check.firmware_dir)
+  }
 }
 
 function fwLabel(fw: FirmwareInfo): string {
@@ -55,7 +57,7 @@ function fwLabel(fw: FirmwareInfo): string {
               <div class="fw-path">{{ fw.path }}</div>
             </div>
           </div>
-          <button class="open-dir-btn" @click="onOpenDir">
+          <button v-if="check.firmware_dir" class="open-dir-btn" @click="onOpenDir">
             {{ tr('打开 MK-Firmware 所在位置', 'Open MK-Firmware Location') }}
           </button>
         </section>

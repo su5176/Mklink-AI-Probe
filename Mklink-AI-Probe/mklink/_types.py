@@ -20,6 +20,8 @@ IDCODE_RETRY_INTERVAL_MS = 500
 IDCODE_TIMEOUT_MS = 10000
 FLM_LOAD_TIMEOUT = 300.0
 DEFAULT_BAUDRATE = 115200
+MKLINK_IDENTITY_TOKEN = "__mklink_probe_7f3a__"
+MKLINK_IDENTITY_COMMAND = f"print('{MKLINK_IDENTITY_TOKEN}')"
 
 
 # ---------------------------------------------------------------------------

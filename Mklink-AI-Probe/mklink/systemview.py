@@ -28,6 +28,7 @@ class SystemViewSession:
         self._channel = channel
         self._running = False
         self._prefetched = bytearray()
+        self._needs_failed_start_reset = False
 
     _HOST_HELLO = b"SV\x01\x00"
     _CLIENT_HELLO_PREFIX = b"SV"
@@ -35,6 +36,7 @@ class SystemViewSession:
     _COMMAND_STOP = b"\x02"
     _COMMAND_GET_TASKLIST = b"\x04"
     _TASKLIST_RETRY_DELAY_S = 0.15
+    _STREAM_DRAIN_INTERVAL_S = 0.01
 
     def start(
         self,
@@ -88,32 +90,36 @@ class SystemViewSession:
                 pass
             time.sleep(0.5)
 
-        # 2) 专用 SystemView 模式在握手前不会推送事件，可靠等待启动回执。
-        resp = self._bridge.send_command(cmd, timeout=20.0)
-        result.update(RTTSession._parse_rtt_startup(resp))
-        if found:
-            result["control_block_addr"] = f"0x{cb_addr_int:08X}"
-        if not result.get("control_block_addr"):
-            raise RuntimeError(
-                f"SystemView 未找到 RTT 控制块（起始地址 {addr}, "
-                f"搜索范围 {actual_search_size} 字节）"
-            )
-
-        # 3) 进入原始流，执行 SEGGER UART Recorder 四字节握手。
-        self._bridge._enter_stream(DeviceState.SYSTEMVIEW_STREAM)
+        # Sending SystemView.start may switch the probe before the final reply is
+        # parsed.  Keep the recovery obligation explicit until the Recorder
+        # handshake has completed so every failed start restores command mode.
+        self._needs_failed_start_reset = True
         try:
+            # 2) 专用 SystemView 模式在握手前不会推送事件，可靠等待启动回执。
+            resp = self._bridge.send_command(cmd, timeout=20.0)
+            result.update(RTTSession._parse_rtt_startup(resp))
+            if found:
+                result["control_block_addr"] = f"0x{cb_addr_int:08X}"
+            if not result.get("control_block_addr"):
+                raise RuntimeError(
+                    f"SystemView 未找到 RTT 控制块（起始地址 {addr}, "
+                    f"搜索范围 {actual_search_size} 字节）"
+                )
+
+            # 3) 进入原始流，执行 SEGGER UART Recorder 四字节握手。
+            self._bridge._enter_stream(DeviceState.SYSTEMVIEW_STREAM)
             self._bridge._write_raw(self._HOST_HELLO)
             self._prefetched = bytearray(self._read_recorder_hello(timeout=2.0))
             self._bridge._write_raw(self._COMMAND_START)
-        except Exception:
+        except Exception as error:
             try:
-                self._bridge._write_raw(b"SystemView.stop()\n")
-                time.sleep(0.1)
-            finally:
-                self._bridge._exit_stream()
-                self._prefetched.clear()
+                self.reset_failed_start(cause=error)
+            except Exception:
+                # Never replace the actual startup failure with cleanup noise.
+                pass
             raise
         self._running = True
+        self._needs_failed_start_reset = False
         self._started_at = time.monotonic()
         self._tasklist_requested = False
         return result
@@ -166,7 +172,7 @@ class SystemViewSession:
             if prefetched:
                 chunks.append(prefetched)
                 total = len(prefetched)
-        deadline = time.time() + duration
+        deadline = time.monotonic() + max(0.0, float(duration))
         while True:
             budget = None if max_bytes is None else max(0, int(max_bytes) - total)
             if budget == 0:
@@ -179,9 +185,10 @@ class SystemViewSession:
                 chunks.append(chunk)
                 total += len(chunk)
             self._request_tasklist_after_startup()
-            if time.time() >= deadline:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
                 break
-            time.sleep(0.05)
+            time.sleep(min(self._STREAM_DRAIN_INTERVAL_S, remaining))
         # 收尾再 drain 一次，避免漏掉最后一段
         try:
             budget = None if max_bytes is None else max(0, int(max_bytes) - total)
@@ -193,6 +200,75 @@ class SystemViewSession:
             pass
         return b"".join(chunks)
 
+    def reset_failed_start(self, *, cause: BaseException | None = None) -> str:
+        """Best-effort recovery after an incomplete SystemView start.
+
+        Unlike RTT, SystemView does not arm a prompt-to-stream transition in
+        the bridge.  Normalizing the bridge to READY and stopping the
+        firmware-side forwarder is sufficient.  A command timeout leaves the
+        bridge in ERROR, so normalize it once more before the bounded raw-stop
+        fallback.  The method is idempotent because ``Device.systemview_start``
+        also calls it while releasing a failed session.
+        """
+        self._running = False
+        self._prefetched.clear()
+        self._tasklist_requested = False
+        if not self._needs_failed_start_reset:
+            return ""
+        self._needs_failed_start_reset = False
+
+        # send_command uses ERROR both for a prompt timeout (the probe may have
+        # entered its stream) and for a serial transport failure.  Only the
+        # former is recoverable in place.  Never turn a real disconnect back
+        # into a synthetic READY state or write more bytes to a broken port.
+        if getattr(self._bridge, "_transport_error", None) is not None:
+            return ""
+        if (
+            self._bridge.state is DeviceState.ERROR
+            and not isinstance(cause, TimeoutError)
+        ):
+            return ""
+
+        remaining = ""
+        try:
+            remaining = self._bridge._exit_stream()
+        except Exception:
+            pass
+
+        recover = getattr(
+            self._bridge, "_recover_failed_stream_start", None,
+        )
+        if callable(recover):
+            # The old start prompt may arrive after the stop write and falsely
+            # satisfy send_command(stop).  Production bridges must always use
+            # identity-verified recovery, even when their local state was not
+            # ERROR; only simple compatibility bridges use the legacy path.
+            try:
+                recover(b"SystemView.stop()\n")
+            except Exception:
+                pass
+            return remaining
+
+        try:
+            return self._bridge.send_command("SystemView.stop()", timeout=5.0)
+        except Exception as stop_error:
+            # A stop-command timeout is the same recoverable stream ambiguity
+            # as a start timeout.  A ConnectionError/transport ERROR is not.
+            if (
+                self._bridge.state is DeviceState.ERROR
+                and not isinstance(stop_error, TimeoutError)
+            ):
+                return remaining
+            try:
+                self._bridge._exit_stream()
+            except Exception:
+                pass
+            try:
+                self._bridge._write_raw(b"SystemView.stop()\n")
+            except Exception:
+                pass
+            return remaining
+
     def stop(self) -> str:
         """停止采集：停止目标记录并退出探针 SystemView 模式。
 
@@ -200,14 +276,28 @@ class SystemViewSession:
         ``>>>`` 提示符，send_command 等不到回执会把 bridge 置 ERROR。raw 写 +
         小睡让探针停止推流、回到提示符，bridge 保持 READY 供后续命令使用。
         """
+        write_error: ConnectionError | None = None
         try:
-            self._bridge._write_raw(self._COMMAND_STOP)
-            self._bridge._write_raw(b"SystemView.stop()\n")
-            time.sleep(0.3)
-        except Exception:
-            pass  # 停止失败也继续恢复状态
-        remaining = self._bridge._exit_stream()
-        self._prefetched.clear()
-        self._running = False
-        self._tasklist_requested = False
-        return remaining
+            if getattr(self._bridge, "_transport_error", None) is None:
+                try:
+                    self._bridge._write_raw(self._COMMAND_STOP)
+                    self._bridge._write_raw(b"SystemView.stop()\n")
+                    time.sleep(0.3)
+                except ConnectionError as error:
+                    write_error = error
+                except Exception:
+                    pass  # 非传输停止失败仍允许本地会话结束
+
+            remaining = self._bridge._exit_stream()
+            transport_error = getattr(self._bridge, "_transport_error", None)
+            if transport_error is not None:
+                raise ConnectionError(
+                    "SystemView stop failed because the serial transport is unavailable"
+                ) from transport_error
+            if write_error is not None:
+                raise write_error
+            return remaining
+        finally:
+            self._prefetched.clear()
+            self._running = False
+            self._tasklist_requested = False

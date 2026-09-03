@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import tomllib
 import zipfile
 from pathlib import Path
 
@@ -43,6 +44,81 @@ def test_version_comparison_handles_stable_and_prerelease(updater):
     assert updater.version_key("0.1.3") > updater.version_key("0.1.3-rc.1")
     with pytest.raises(ValueError, match="unsupported version"):
         updater.version_key("latest")
+
+
+def test_skill_update_cache_uses_explicit_task_cache(updater, monkeypatch, tmp_path):
+    cache_root = tmp_path / "task-cache"
+    monkeypatch.setenv("MKLINK_CACHE_DIR", str(cache_root))
+
+    assert updater.default_cache_file() == (
+        cache_root / "mklink-ai-probe" / "skill-update-check.json"
+    )
+
+
+def test_repository_plugin_version_matches_package(updater):
+    root = SCRIPT_PATH.parents[1]
+    plugin = json.loads(
+        (root / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )
+
+    assert plugin["version"] == updater.current_version(root)
+
+
+def test_release_gui_versions_match_package(updater):
+    root = SCRIPT_PATH.parents[1]
+    package_version = updater.current_version(root)
+    main_cargo = tomllib.loads(
+        (root / "gui" / "src-tauri" / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    site_agent_cargo = tomllib.loads(
+        (root / "site-agent-gui" / "src-tauri" / "Cargo.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+    main_tauri = json.loads(
+        (root / "gui" / "src-tauri" / "tauri.conf.json").read_text(encoding="utf-8")
+    )
+    site_agent_tauri = json.loads(
+        (root / "site-agent-gui" / "src-tauri" / "tauri.conf.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert {
+        main_cargo["package"]["version"],
+        site_agent_cargo["package"]["version"],
+        main_tauri["version"],
+        site_agent_tauri["version"],
+    } == {package_version}
+
+
+def test_manifest_sources_prefer_github_and_fall_back_to_gitee(
+    updater, monkeypatch,
+):
+    github, gitee = updater.DEFAULT_MANIFEST_URLS
+    assert github == (
+        "https://raw.githubusercontent.com/Aladdin-Wang/"
+        "Mklink-AI-Probe/updates/latest.json"
+    )
+    assert gitee == (
+        "https://gitee.com/Aladdin-Wang/Mklink-AI-Probe/raw/updates/latest.json"
+    )
+
+    calls = []
+
+    def request(url):
+        calls.append(url)
+        if url == github:
+            raise OSError("GitHub unavailable")
+        return json.dumps({"version": "0.1.6"}).encode("utf-8")
+
+    monkeypatch.setattr(updater, "_request_bytes", request)
+
+    manifest, manifest_url = updater.fetch_manifest(updater.DEFAULT_MANIFEST_URLS)
+
+    assert manifest == {"version": "0.1.6"}
+    assert manifest_url == gitee
+    assert calls == [github, gitee]
 
 
 def test_check_uses_24_hour_cache_without_hiding_newer_version(
@@ -154,6 +230,44 @@ def test_copy_installed_skill_removes_untracked_stale_web_assets(
     assert outside.read_text(encoding="utf-8") == "keep"
 
 
+def test_copy_installed_skill_removes_legacy_maintainer_context(
+    updater, monkeypatch, tmp_path,
+):
+    root = make_root(tmp_path / "installed", "0.1.2")
+    legacy_files = [
+        root / "_maintainer" / "testing" / "test_private.py",
+        root / ".pytest_cache" / "README.md",
+        root / "commands" / "maintainer.md",
+        root / "docs" / "ai" / "project-memory.json",
+        root / "MK-Firmware" / "HPMLink_V4.3.7.uf2",
+        root / "mklink.egg-info" / "PKG-INFO",
+        root / "native" / "stcp_bridge" / "main.go",
+        root / "skills" / "maintaining-mklink-ai-probe" / "SKILL.md",
+        root / "AGENTS.md",
+        root / "CLAUDE.md",
+        root / "GEMINI.md",
+    ]
+    for path in legacy_files:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("maintainer only", encoding="utf-8")
+    user_file = root / "user-note.txt"
+    user_file.write_text("keep", encoding="utf-8")
+    source = make_root(tmp_path / "source", "0.1.3", skill_text="new skill")
+    archive = make_archive(tmp_path / "skill.zip", source)
+    cache = tmp_path / "cache" / "skill-update-check.json"
+    monkeypatch.setattr(updater, "default_cache_file", lambda: cache)
+
+    updater.install_skill_archive(
+        root=root,
+        archive_path=archive,
+        expected_version="0.1.3",
+        source_commit="a" * 40,
+    )
+
+    assert not any(path.exists() for path in legacy_files)
+    assert user_file.read_text(encoding="utf-8") == "keep"
+
+
 def test_git_checkout_is_never_overwritten(updater, tmp_path):
     root = make_root(tmp_path / "checkout", "0.1.2")
     (root / ".git").mkdir()
@@ -206,8 +320,32 @@ def test_desktop_update_is_not_skipped_when_skill_is_already_current(
     assert "skill" not in result
 
 
+def test_desktop_installer_uses_its_per_machine_default(updater, monkeypatch, tmp_path):
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"installer")
+    calls = []
+    monkeypatch.setattr(updater, "_port_in_use", lambda _port: False)
+    monkeypatch.setattr(updater, "_installed_app", lambda: (tmp_path / "Program Files", "0.1.8"))
+    monkeypatch.setattr(
+        updater.subprocess,
+        "run",
+        lambda arguments, check=False: calls.append((arguments, check))
+        or type("Completed", (), {"returncode": 0})(),
+    )
+
+    result = updater.install_desktop(installer)
+
+    assert calls == [([str(installer), "/S"], False)]
+    assert result["install_location"] == str(tmp_path / "Program Files")
+
+
 def test_skill_instructions_require_proactive_check_and_user_approval():
     text = (SCRIPT_PATH.parents[1] / "SKILL.md").read_text(encoding="utf-8")
+    install = (SCRIPT_PATH.parents[1] / "references" / "install.md").read_text(
+        encoding="utf-8"
+    )
     assert "skill_update.py check --json" in text
-    assert "install --yes --json" in text
     assert "只有用户明确同意后" in text
+    assert "(references/install.md)" in text
+    assert "install --yes --json" in install
+    assert install.index("只有用户明确同意后") < install.index("install --yes --json")

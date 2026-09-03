@@ -11,6 +11,7 @@ import {
   saveDesktopSettings,
 } from '../lib/desktopSettings'
 import { pickSymbolFile } from '../lib/filePicker'
+import { refreshRttAddressForSymbol } from '../lib/rttSymbolAddress'
 import type { AxlStatus } from '../types/mklink'
 
 const connecting = ref(false)
@@ -41,6 +42,20 @@ export function useDashboardSetup() {
   const catalog = useSymbolCatalog()
   const toast = useToast()
 
+  async function refreshRttForSymbols(path: string): Promise<void> {
+    const refreshed = await refreshRttAddressForSymbol(
+      window.localStorage,
+      path,
+      api.findRtt,
+    )
+    if (refreshed.error) {
+      toast.warn(
+        tr('AXF 已加载，但 RTT 地址自动刷新失败：', 'AXF loaded, but automatic RTT address refresh failed: ')
+        + (refreshed.error instanceof Error ? refreshed.error.message : String(refreshed.error)),
+      )
+    }
+  }
+
   async function quickConnect(): Promise<boolean> {
     if (api.deviceStatus.value.connected || connecting.value) return true
     connecting.value = true
@@ -51,6 +66,13 @@ export function useDashboardSetup() {
         restore_last: true,
         ...(isSymbolFilePath(path) ? { axf: path } : {}),
       })
+      if (
+        isSymbolFilePath(path)
+        && api.deviceStatus.value.axf?.loaded
+        && isSameFileSourcePath(path, api.deviceStatus.value.axf.axf_path)
+      ) {
+        await refreshRttForSymbols(path)
+      }
       toast.success(tr('设备已连接', 'Device connected'))
       return true
     } catch (cause) {
@@ -79,6 +101,10 @@ export function useDashboardSetup() {
     }
   }
 
+  function clearConnectionError(): void {
+    connectionError.value = ''
+  }
+
   async function parseSelectedSymbols(): Promise<boolean> {
     const path = symbolPath.value.trim()
     if (!isSymbolFilePath(path)) return false
@@ -94,6 +120,7 @@ export function useDashboardSetup() {
       if (!isSameFileSourcePath(path, result.axf_path)) {
         throw new Error(tr('后端未切换到所选符号文件', 'The backend did not switch to the selected symbol file'))
       }
+      await refreshRttForSymbols(path)
       await catalog.ensureLoaded(true)
       toast.success(tr(`已加载 ${result.variable_count || 0} 个可读变量`, `Loaded ${result.variable_count || 0} readable variables`))
       return true
@@ -122,6 +149,9 @@ export function useDashboardSetup() {
         ...settings,
         symbolPath: source.path,
         symbolDisplayPath: source.displayPath === source.path ? '' : source.displayPath,
+        rttAddress: isSameFileSourcePath(settings.symbolPath, source.path)
+          ? settings.rttAddress
+          : '',
       })
       syncSettings()
     } catch (cause) {
@@ -143,6 +173,7 @@ export function useDashboardSetup() {
     hasSymbolSource: computed(() => isSymbolFilePath(symbolPath.value)),
     quickConnect,
     quickDisconnect,
+    clearConnectionError,
     loadSymbolFile,
     parseSelectedSymbols,
   }

@@ -13,14 +13,14 @@ describe('SuperWatchTab', () => {
         stubs: {
           SymbolVariablePanel: {
             name: 'SymbolVariablePanel',
-            emits: ['visibility-change', 'selection-removed'],
+            emits: ['visibility-change', 'selection-removed', 'snapshot-change'],
             props: ['deviceConnected', 'latestValues', 'hiddenChannels'],
             template: '<aside class="variable-panel-stub" />',
           },
           WaveformViewer: {
             name: 'WaveformViewer',
             emits: ['latest-values'],
-            props: ['mode', 'deviceConnected', 'hiddenChannels'],
+            props: ['mode', 'deviceConnected', 'hiddenChannels', 'arraySnapshotPath'],
             template: '<main class="waveform-stub" />',
           },
         },
@@ -37,6 +37,10 @@ describe('SuperWatchTab', () => {
     await nextTick()
     expect(wrapper.findComponent(SymbolVariablePanel).props('hiddenChannels')).toEqual(new Set(['gain']))
     expect(wrapper.findComponent(WaveformViewer).props('hiddenChannels')).toEqual(new Set(['gain']))
+    expect(wrapper.findComponent(WaveformViewer).props('arraySnapshotPath')).toBe(null)
+    wrapper.findComponent(SymbolVariablePanel).vm.$emit('snapshot-change', 'samples')
+    await nextTick()
+    expect(wrapper.findComponent(WaveformViewer).props('arraySnapshotPath')).toBe('samples')
 
     wrapper.findComponent(SymbolVariablePanel).vm.$emit('selection-removed', 'gain')
     await nextTick()
