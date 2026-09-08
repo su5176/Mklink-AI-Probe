@@ -262,12 +262,14 @@ XPI 基址按芯片族选择：
 
 如果项目 MCU 还没有 profile，先运行 `python -m mklink mcu-detect`。
 
-`project-init` 会自动执行此操作，通常不需要手动运行。
+`project-init` 不再复制 FLM；烧录时优先按精确器件和镜像范围从统一算法目录选择并部署。
 
 ### 配置管理
 
 #### `python -m mklink project-init`
-初始化项目配置。自动检测 IAR/Keil 工程类型，解析对应工程文件、匹配 MCU、自动发现 COM 口、拷贝 FLM。若 MCU 未知，会先执行 MCU profile 发现；多内部 FLM 候选或本地 FLM 缺失时会停止并给出下一步提示。
+离线解析 Keil/IAR/HPM 工程，只保存精确器件、工程目标、固件/符号路径和内存布局等必要信息。新配置不写入猜测的 `mcu_key`、COM 口或 FLM 路径，不连接探针、不下载 Pack，不创建 RTT/工具链模板；重复初始化保留已有手动设置。算法是否支持在实际烧录时校验，不以初始化成功代表可安全烧录。
+
+端口默认连接时自动发现，可显式指定 Windows `COM6`、macOS `/dev/cu.*` 或 Linux `/dev/ttyACM*`。跨系统共享工程使用相对输出路径；不会把 Windows 绝对盘符猜测成 Mac 挂载目录。Mac + Parallels 使用与排障见 [macos-linux.md](macos-linux.md)。
 
 #### `python -m mklink project-info`
 显示当前项目配置状态（COM 口、MCU、IDE 类型、HEX/MAP 路径、RTT 配置等）。
@@ -283,9 +285,9 @@ XPI 基址按芯片族选择：
 ## 自动配置检查
 
 所有硬件操作命令（`flash`、`rtt`、`test`）执行前会自动检查 `.mklink/` 配置：
-- `config.json` — COM 口、MCU 类型、IDE 类型
+- `config.json` — 可选连接覆盖（新工程只保存 SWD 时钟）
 - `project_info.json` — HEX/MAP/OUT 文件路径（IDE-agnostic）
-- `rtt_config.json` — RTT 地址
+- `rtt_config.json` — 可选 RTT 配置，首次使用时解析地址
 - MICROKEEN 磁盘 FLM 文件（profile 指定时需要）
 
 如果配置缺失或无效，会提示运行 `python -m mklink project-init`。

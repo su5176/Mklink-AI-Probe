@@ -76,6 +76,7 @@ async function fetchCatalog(): Promise<SymbolCatalogPage> {
       || page.axf_path !== first.axf_path
       || page.fingerprint.size !== first.fingerprint.size
       || page.fingerprint.mtime_ns !== first.fingerprint.mtime_ns
+      || page.fingerprint.sha256 !== first.fingerprint.sha256
     ) {
       throw new Error('Symbol catalog changed while loading; retry')
     }
@@ -107,6 +108,7 @@ function sameIdentity(page: SymbolBrowsePage): boolean {
     && current !== null
     && page.fingerprint.size === current.size
     && page.fingerprint.mtime_ns === current.mtime_ns
+    && page.fingerprint.sha256 === current.sha256
 }
 
 async function fetchBrowse(path = '', offset: number | null = null): Promise<SymbolBrowsePage> {
@@ -153,11 +155,27 @@ async function loadBrowseChildren(node: SymbolBrowseNode): Promise<void> {
 }
 
 async function searchSymbols(query: string): Promise<SymbolDescriptor[]> {
+  // The search box is usable while the initial catalog pages are still loading.
+  if (loadingPromise) await loadingPromise
+  else if (generation.value <= 0) await startLoad()
   const params = new URLSearchParams({ q: query })
   const payload = await request<{ results: SymbolSearchResult[] }>(
     `/api/symbols/search?${params.toString()}`,
   )
-  return payload.results.map(result => result.descriptor).filter(Boolean)
+  // The suggestion endpoint is capped at 50 leaves; a single array can fill it.
+  // Search the full loaded catalog too, retaining backend-only exact lazy paths.
+  const terms = query.split(/[,，;；\n]+/).map(term => term.trim().toLocaleLowerCase()).filter(Boolean)
+  const matches = items.value.filter(item => !terms.length || terms.some(term => (
+    item.path.toLocaleLowerCase().includes(term) || item.type_name.toLocaleLowerCase().includes(term)
+  )))
+  const merged = new Map<string, SymbolDescriptor>()
+  for (const result of payload.results) {
+    if (result.descriptor) merged.set(result.descriptor.path, result.descriptor)
+  }
+  for (const item of matches) {
+    if (!merged.has(item.path)) merged.set(item.path, item)
+  }
+  return [...merged.values()]
 }
 
 async function loadCatalog(): Promise<void> {
@@ -207,6 +225,7 @@ async function refreshStatus(): Promise<SymbolCatalogStatus> {
     || currentFingerprint === null
     || status.fingerprint.size !== currentFingerprint.size
     || status.fingerprint.mtime_ns !== currentFingerprint.mtime_ns
+    || status.fingerprint.sha256 !== currentFingerprint.sha256
   )
   if (identityChanged) {
     await startLoad()

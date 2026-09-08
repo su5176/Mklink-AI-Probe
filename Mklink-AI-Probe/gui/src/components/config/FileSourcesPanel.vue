@@ -4,6 +4,7 @@ import { FolderOpen, ScanSearch } from '@lucide/vue'
 import { isSameFileSourcePath, isSymbolFilePath } from '../../lib/desktopSettings'
 import type { AxlStatus } from '../../types/mklink'
 import { tr } from '../../composables/useLanguage'
+import { trackedSymbolPath, trackedSymbolError } from '../../lib/trackedSymbolSource'
 
 const props = defineProps<{
   symbolPath: string
@@ -111,8 +112,9 @@ const parserBackend = computed(() => {
       data-testid="symbol-path-validation"
       :class="['path-validation', { invalid: symbolPath.trim() && !isSymbolFilePath(symbolPath) }]"
     >
-      {{ !symbolPath.trim() ? tr('未配置 AXF / ELF 文件', 'No AXF / ELF file configured') : browserSymbolUpload ? tr(`浏览器上传 · ${displayedSymbolPath}（解析文件已缓存到本机服务）`, `Browser upload · ${displayedSymbolPath} (cached by local service)`) : isSymbolFilePath(symbolPath) ? tr('路径格式有效', 'Valid path') : tr('仅支持 .axf、.elf 或 .out 文件', 'Only .axf, .elf, or .out files are supported') }}
+      {{ !symbolPath.trim() ? tr('未配置 AXF / ELF 文件', 'No AXF / ELF file configured') : browserSymbolUpload ? (isSameFileSourcePath(trackedSymbolPath, symbolPath) ? tr(`自动跟踪 · ${displayedSymbolPath}（本次页面会话）`, `Tracking · ${displayedSymbolPath} (this page session)`) : tr(`文件快照 · ${displayedSymbolPath}；重新编译后请重新选择，或输入原文件路径以自动跟踪`, `Snapshot · ${displayedSymbolPath}; reselect after rebuilding, or enter the original path for tracking`)) : isSymbolFilePath(symbolPath) ? tr('自动跟踪原文件内容变化', 'Tracking changes to the original file') : tr('仅支持 .axf、.elf 或 .out 文件', 'Only .axf, .elf, or .out files are supported') }}
     </div>
+    <div v-if="trackedSymbolError && isSameFileSourcePath(trackedSymbolPath, symbolPath)" role="alert">{{ tr('符号文件自动重载失败：', 'Automatic symbol reload failed: ') + trackedSymbolError }}</div>
 
     <div v-if="symbolStatus.error" class="alert alert-error">{{ symbolStatus.error }}</div>
 

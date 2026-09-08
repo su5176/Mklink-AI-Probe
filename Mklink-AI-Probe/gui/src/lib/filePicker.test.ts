@@ -16,6 +16,19 @@ async function loadPickerWithDialog(result: unknown) {
 }
 
 describe('file picker', () => {
+  it('retains a symbol handle and calls the browser picker with its Window receiver', async () => {
+    vi.doMock('@tauri-apps/api/core', () => ({ isTauri: () => false }))
+    const selected = new File(['ELF'], 'app.axf')
+    const handle = { kind: 'file' as const, name: selected.name, getFile: vi.fn().mockResolvedValue(selected) }
+    vi.stubGlobal('showOpenFilePicker', vi.fn(function (this: Window) {
+      expect(this).toBe(window)
+      return Promise.resolve([handle])
+    }))
+    const picker = await import('./filePicker')
+    expect(await picker.pickSymbolFile()).toBe(selected)
+    expect(picker.symbolFileHandle(selected)).toBe(handle)
+    expect(await picker.pickTrackedFirmwareFiles()).toEqual([{ kind: 'tracked-browser-firmware', file: selected, handle }])
+  })
   it('opens an AXF/ELF single-file dialog', async () => {
     const { open, picker } = await loadPickerWithDialog('C:\\firmware\\app.axf')
 

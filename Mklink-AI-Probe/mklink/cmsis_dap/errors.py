@@ -21,6 +21,9 @@ class FlashErrorCode(str, Enum):
     BIN_ADDRESS_MISSING = "BIN_ADDRESS_MISSING"
     IMAGE_OUT_OF_RANGE = "IMAGE_OUT_OF_RANGE"
     TARGET_LOCKED = "TARGET_LOCKED"
+    SECURITY_NOT_SUPPORTED = "SECURITY_NOT_SUPPORTED"
+    UNLOCK_FAIL = "UNLOCK_FAIL"
+    LOCK_FAIL = "LOCK_FAIL"
     ERASE_FAIL = "ERASE_FAIL"
     PROGRAM_FAIL = "PROGRAM_FAIL"
     VERIFY_FAIL = "VERIFY_FAIL"
@@ -43,6 +46,9 @@ FLASH_ERROR_TITLES: Mapping[FlashErrorCode, str] = MappingProxyType({
     FlashErrorCode.BIN_ADDRESS_MISSING: "缺少 BIN 起始地址",
     FlashErrorCode.IMAGE_OUT_OF_RANGE: "镜像超出 Flash 范围",
     FlashErrorCode.TARGET_LOCKED: "目标芯片已锁定",
+    FlashErrorCode.SECURITY_NOT_SUPPORTED: "不支持安全操作",
+    FlashErrorCode.UNLOCK_FAIL: "解锁失败",
+    FlashErrorCode.LOCK_FAIL: "加锁失败",
     FlashErrorCode.ERASE_FAIL: "擦除失败",
     FlashErrorCode.PROGRAM_FAIL: "烧录失败",
     FlashErrorCode.VERIFY_FAIL: "校验失败",

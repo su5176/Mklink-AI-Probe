@@ -378,8 +378,10 @@ def deploy_algorithm_to_probe(
     if not target.is_file() or hashlib.sha256(target.read_bytes()).hexdigest() != digest:
         temporary = root / (target.name + ".{}.tmp".format(uuid.uuid4().hex))
         try:
-            temporary.write_bytes(payload)
+            from mklink.file_content import write_verified, sync_directory
+            write_verified(temporary, payload)
             os.replace(str(temporary), str(target))
+            sync_directory(root)
         finally:
             if temporary.exists():
                 temporary.unlink()

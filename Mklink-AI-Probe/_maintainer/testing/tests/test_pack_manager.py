@@ -1911,6 +1911,61 @@ def test_worker_import_indexes_the_descriptor_inside_a_real_pack_archive(tmp_pat
     assert Path(result["pack_path"]).read_bytes() == source.read_bytes()
 
 
+def test_worker_import_repairs_split_processor_and_oldest_first_releases(tmp_path):
+    source = tmp_path / "Linko.LKS07x.1.1.2.pack"
+    descriptor = """<?xml version="1.0" encoding="utf-8"?>
+<package schemaVersion="1.2">
+  <vendor>Linko</vendor>
+  <name>LKS07x</name>
+  <description>LKS07 Device Family Pack</description>
+  <url>https://example.com/LKS07x</url>
+  <releases>
+    <release version="1.0.0">Initial version</release>
+    <release version="1.1.0">Updated flash</release>
+    <release version="1.1.2">Current version</release>
+  </releases>
+  <devices>
+    <family Dfamily="LKS07 Series" Dvendor="Linko:1020">
+      <processor Dcore="Cortex-M0" DcoreVersion="r2p1" Dfpu="0" Dmpu="0" Dendian="Little-endian"/>
+      <processor Dclock="96000000"/>
+      <device Dname="LKS32MC071C8T8">
+        <memory id="IROM1" start="0x00000000" size="0x10000" startup="1" default="1"/>
+        <memory id="IRAM1" start="0x20000000" size="0x3000" init="0" default="1"/>
+        <algorithm name="Flash\\LKS32MC07x_64kB.FLM" start="0x00000000" size="0x10000" default="1"/>
+      </device>
+    </family>
+  </devices>
+</package>
+"""
+    with ZipFile(source, "w") as archive:
+        archive.writestr("Linko.LKS07x.pdsc", descriptor)
+        archive.writestr("Flash/LKS32MC07x_64kB.FLM", b"algorithm")
+    source_bytes = source.read_bytes()
+    cache_root = tmp_path / "cache"
+    paths = PackPaths(cache_root)
+
+    result = handle_request(
+        {
+            "command": "import",
+            "payload": {"path": str(source)},
+            "root": str(cache_root),
+            "staging_dir": str(
+                (paths.staging_dir / "relaxed-import").resolve()
+            ),
+        },
+        lambda event: None,
+    )
+
+    index = json.loads(paths.index_file.read_text(encoding="utf-8"))
+    target = index["LKS32MC071C8T8"]
+    assert result["pack_id"] == "Linko.LKS07x"
+    assert result["version"] == "1.1.2"
+    assert target["from_pack"]["version"] == "1.1.2"
+    assert target["algorithms"][0]["file_name"] == "Flash/LKS32MC07x_64kB.FLM"
+    assert source.read_bytes() == source_bytes
+    assert Path(result["pack_path"]).read_bytes() == source_bytes
+
+
 def test_worker_import_indexes_missing_url_pack_without_rewriting_readonly_source(
     tmp_path,
 ):
@@ -2061,6 +2116,29 @@ def test_local_import_descriptor_does_not_confuse_extension_url_with_pack_url():
     assert [child.tag for child in children[:3]] == ["vendor", "name", "url"]
     assert [child.tag for child in children].count("url") == 1
     assert [child.tag for child in children].count("{urn:extension}url") == 1
+
+
+def test_local_import_descriptor_keeps_conflicting_anonymous_processors_separate():
+    descriptor = b"""<?xml version="1.0" encoding="utf-8"?>
+<package>
+  <vendor>Vendor</vendor><name>Pack</name><url>https://example.com/</url>
+  <devices><family Dfamily="Test">
+    <processor Dcore="Cortex-M0"/>
+    <processor Dcore="Cortex-M3"/>
+  </family></devices>
+</package>
+"""
+
+    normalized = pack_worker_module._normalize_local_import_descriptor(descriptor)
+    root = ElementTree.fromstring(normalized)
+    processors = [
+        element for element in root.iter()
+        if element.tag.rsplit("}", 1)[-1] == "processor"
+    ]
+
+    assert [processor.attrib["Dcore"] for processor in processors] == [
+        "Cortex-M0", "Cortex-M3",
+    ]
 
 
 def test_worker_import_missing_url_pack_without_devices_still_fails(tmp_path):

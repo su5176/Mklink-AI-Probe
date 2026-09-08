@@ -1,5 +1,6 @@
 import { ref, readonly } from 'vue'
 import { API_BASE } from '../lib/runtimeEndpoint'
+import { tr } from './useLanguage'
 
 async function api(path: string, options?: RequestInit) {
   const res = await fetch(`${API_BASE}${path}`, {
@@ -11,7 +12,13 @@ async function api(path: string, options?: RequestInit) {
   })
   if (!res.ok) {
     const err = await res.json().catch(() => null)
-    throw new Error(err?.detail || res.statusText)
+    const detail = err?.detail
+    if (detail?.code === 'PROBE_BUSY') {
+      const owner = String(detail.conflict_owner ?? '').split(':').at(-1)
+      const name = ({ rtt: 'RTT View', superwatch: 'SuperWatch', systemview: 'RTOS Trace', vofa: 'VOFA+' } as Record<string, string>)[owner ?? ''] ?? owner
+      throw new Error(tr(`请先停止 ${name || '当前采集'}，再启动此功能。`, `Stop ${name || 'the current capture'} before starting this feature.`))
+    }
+    throw new Error(typeof detail === 'string' ? detail : detail?.message || res.statusText)
   }
   return res.json()
 }

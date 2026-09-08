@@ -47,30 +47,21 @@ def parse_load_result(output: str) -> dict:
             "success": m.group(2) == "success",
         })
 
-    # Fallback: 如果没有找到 loaded 模式，检查是否有 100% 进度且无错误
-    if not results:
-        if progress and progress[-1]["percent"] == 100:
-            # 100% 进度存在，检查是否有错误标志
-            if "error" not in output.lower() and "fail" not in output.lower():
-                return {"success": True, "progress": progress}
-        # 也检查返回值是否为 "0"（设备端成功标志）
-        for line in output.strip().split("\n"):
-            if line.strip() == "0":
-                return {"success": True, "progress": progress}
-        return {"success": False, "progress": progress}
-
+    # A bare return code is not proof that programming happened. Fail closed
+    # on any error even when earlier progress reached 100%.
+    has_failure = bool(re.search(r"\b(?:error|failed|failure|fail)\b", output, re.I))
+    completed = bool(results) and all(item["success"] for item in results)
+    completed = completed or bool(re.search(r"\bloaded\s+success(?:fully)?\b", output, re.I))
+    if results and not all(item["success"] for item in results):
+        completed = False
+    elif not results and progress and progress[-1]["percent"] == 100:
+        completed = True
+    result = {"success": completed and not has_failure, "progress": progress}
     if len(results) == 1:
-        return {
-            "success": results[0]["success"],
-            "filename": results[0]["filename"],
-            "progress": progress,
-        }
-
-    return {
-        "success": all(r["success"] for r in results),
-        "results": results,
-        "progress": progress,
-    }
+        result["filename"] = results[0]["filename"]
+    elif results:
+        result["results"] = results
+    return result
 
 
 # ---------------------------------------------------------------------------

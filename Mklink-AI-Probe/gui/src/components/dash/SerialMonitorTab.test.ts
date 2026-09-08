@@ -9,7 +9,7 @@ const mocks = vi.hoisted(() => ({
   toastSuccess: vi.fn(),
   toastInfo: vi.fn(),
   useBinaryStream: vi.fn(),
-  downloadTextFile: vi.fn(),
+  saveBlobFile: vi.fn(),
   terminalWrites: [] as string[],
   terminalClears: 0,
   terminalInput: null as null | ((data: string) => void),
@@ -32,7 +32,7 @@ vi.mock('../../composables/useBinaryStream', () => ({
 }))
 
 vi.mock('../../lib/downloadTextFile', () => ({
-  downloadTextFile: mocks.downloadTextFile,
+  saveBlobFile: mocks.saveBlobFile,
   timestampedLogName: (prefix: string) => `${prefix}-test.log`,
 }))
 
@@ -55,7 +55,10 @@ vi.mock('@xterm/xterm', () => ({
     getSelection() { return '' }
     paste(text: string) { mocks.terminalInput?.(text) }
     selectAll() {}
-    write(text: string) { mocks.terminalWrites.push(text) }
+    write(text: string, callback?: () => void) {
+      mocks.terminalWrites.push(text)
+      callback?.()
+    }
     focus() {}
     dispose() {}
   },
@@ -132,7 +135,7 @@ describe('SerialMonitorTab', () => {
     mocks.toastError.mockReset()
     mocks.toastSuccess.mockReset()
     mocks.toastInfo.mockReset()
-    mocks.downloadTextFile.mockReset()
+    mocks.saveBlobFile.mockReset().mockResolvedValue(true)
     mocks.terminalWrites.length = 0
     mocks.terminalClears = 0
     mocks.terminalInput = null
@@ -169,8 +172,7 @@ describe('SerialMonitorTab', () => {
     mocks.terminalBinary.serialTerminal.value = {
       type: 'serial-terminal', sequence: 1n, text: '\u001b[31mprompt> ',
     }
-    await wrapper.vm.$nextTick()
-    expect(mocks.terminalWrites.join('')).toContain('\u001b[31mprompt> ')
+    await vi.waitFor(() => expect(mocks.terminalWrites.join('')).toContain('\u001b[31mprompt> '))
 
     mocks.terminalInput?.('help\r')
     await vi.waitFor(() => {
@@ -192,10 +194,15 @@ describe('SerialMonitorTab', () => {
       lines: [{ timestampNs: 1_000_000n, direction: 'RX', rawHex: '4F4B0A', ascii: 'OK\n' }],
     }
     await vi.waitFor(() => expect(wrapper.find('[data-testid="serial-save-log"]').attributes('disabled')).toBeUndefined())
+    expect(wrapper.get('[data-testid="serial-log-text"]').attributes('aria-pressed')).toBe('true')
+    expect((wrapper.get('[data-testid="serial-log-timestamp"]').element as HTMLInputElement).checked).toBe(false)
+    expect(wrapper.get('.virtual-log-text').text()).toBe('OK\\n')
+    await wrapper.get('[data-testid="serial-log-hex"]').trigger('click')
+    expect(wrapper.get('.virtual-log-text').text()).toBe('4F 4B 0A')
     await wrapper.get('[data-testid="serial-save-log"]').trigger('click')
-    expect(mocks.downloadTextFile).toHaveBeenCalledWith(
-      'serial-test.log', expect.stringContaining('\tRX\t4F4B0A  OK\\n'),
-    )
+    expect(mocks.saveBlobFile).toHaveBeenCalledWith('serial-test.log', expect.any(Blob))
+    const saved = mocks.saveBlobFile.mock.calls[0][1] as Blob
+    expect(Array.from(new Uint8Array(await saved.arrayBuffer()))).toEqual([0x4f, 0x4b, 0x0a])
 
     wrapper.unmount()
     expect(fetchMock.mock.calls.some(call => String(call[0]).endsWith('/api/dash/serial/stop'))).toBe(false)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from mklink.file_content import is_metadata_file
 
 
 def _fmt_hex(hex_str: str) -> str:
@@ -43,22 +44,32 @@ def find_uvprojx(project_root: str) -> str | None:
     if root.is_absolute() and root.is_dir():
         # 直接搜索该目录下的 .uvprojx 文件
         for f in sorted(root.glob("*.uvprojx")):
+            if is_metadata_file(f):
+                continue
             return str(f)
         # 搜索 MDK-ARM/ 子目录
         for f in sorted(root.glob("MDK-ARM/*.uvprojx")):
+            if is_metadata_file(f):
+                continue
             return str(f)
         return None
 
     # 相对路径：优先搜索 MDK-ARM/ 子目录
     for f in sorted(root.glob("MDK-ARM/*.uvprojx")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     # 项目根目录
     for f in sorted(root.glob("*.uvprojx")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     # 一级子目录
     for f in sorted(root.glob("*/*.uvprojx")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     return None
@@ -80,10 +91,11 @@ def parse_uvprojx(uvprojx_path: str, target_name: str | None = None) -> dict | N
 
     try:
         tree = ET.parse(str(path))
-    except ET.ParseError:
+    except (ET.ParseError, OSError):
         return None
 
     root = tree.getroot()
+    _strip_namespaces(root)
     base_dir = path.parent
 
     # 查找目标 Target
@@ -105,9 +117,7 @@ def parse_uvprojx(uvprojx_path: str, target_name: str | None = None) -> dict | N
     }
 
     # 编译器类型
-    uac6 = _text(tco, "..//uAC6", "")
-    if uac6 == "":
-        uac6 = _text(target, "ToolsetNumber", "")
+    uac6 = _text(target, "uAC6", "")
     result["compiler"] = "ac6" if uac6 == "1" else "ac5"
 
     # Flash 算法配置
@@ -127,14 +137,14 @@ def parse_uvprojx(uvprojx_path: str, target_name: str | None = None) -> dict | N
         result["flash_size"] = mem.get("flash_size", 0)
 
     # Scatter file 优先级最高（umfTarg="0" 时生效）
-    ldads = target.find(".//LDads")
+    ldads = target.find("TargetOption/TargetArmAds/LDads")
     if ldads is not None:
         umf = ldads.find("umfTarg")
         if umf is not None and umf.text and umf.text.strip() == "0":
             scatter = ldads.find("ScatterFile")
             if scatter is not None and scatter.text and scatter.text.strip():
                 sct_rel = scatter.text.strip()
-                sct_abs = (base_dir / sct_rel).resolve()
+                sct_abs = _project_path(base_dir, sct_rel)
                 if sct_abs.exists():
                     sct_mem = parse_scatter_file(str(sct_abs))
                     if sct_mem:
@@ -158,9 +168,9 @@ def parse_uvprojx(uvprojx_path: str, target_name: str | None = None) -> dict | N
     result["listing_dir"] = listing_dir
 
     # 解析绝对路径
-    result["hex_path"] = str((base_dir / output_dir / (output_name + ".hex")).resolve())
-    result["map_path"] = str((base_dir / listing_dir / (output_name + ".map")).resolve())
-    result["axf_path"] = str((base_dir / output_dir / (output_name + ".axf")).resolve())
+    result["hex_path"] = str(_project_path(base_dir, output_dir) / (output_name + ".hex"))
+    result["map_path"] = str(_project_path(base_dir, listing_dir) / (output_name + ".map"))
+    result["axf_path"] = str(_project_path(base_dir, output_dir) / (output_name + ".axf"))
 
     # Include 路径和宏定义
     cads = target.find("TargetOption/TargetArmAds/Cads/VariousControls")
@@ -193,7 +203,21 @@ def _find_target(root: ET.Element, target_name: str | None) -> ET.Element | None
         if name_el is not None and name_el.text == target_name:
             return t
 
-    return targets[0]
+    return None
+
+
+def _strip_namespaces(root: ET.Element) -> None:
+    for element in root.iter():
+        element.tag = element.tag.rsplit("}", 1)[-1]
+
+
+def _project_path(base: Path, value: str) -> Path:
+    # Keil writes Windows separators even when the project is read on macOS.
+    # Foreign absolute drive paths are not guessed/remapped to host mounts.
+    normalized = value.replace("\\", "/")
+    if re.match(r"^[A-Za-z]:/|^//", normalized) and base.drive == "":
+        return Path(normalized)
+    return (base / normalized).resolve()
 
 
 def _text(parent: ET.Element, tag: str, default: str = "") -> str:
@@ -282,7 +306,7 @@ def _parse_memory_layout(cpu_str: str, target: ET.Element) -> dict:
         result["flash_size"] = int(m.group(2), 16)
 
     # 尝试从 OnChipMemories 获取更精确的值
-    ocm = target.find(".//OnChipMemories")
+    ocm = target.find("TargetOption/TargetArmAds/ArmAdsMisc/OnChipMemories")
     if ocm is not None:
         iram = ocm.find("IRAM")
         if iram is not None:
@@ -385,7 +409,11 @@ def uses_scatter_file(uvprojx_path: str) -> tuple[bool, str | None]:
         return False, None
 
     root = tree.getroot()
-    for ldads in root.iter("LDads"):
+    _strip_namespaces(root)
+    target = _find_target(root, None)
+    if target is None:
+        return False, None
+    for ldads in target.findall("TargetOption/TargetArmAds/LDads"):
         umf = ldads.find("umfTarg")
         # umfTarg="0" → 使用 scatter file；"1" 或缺失 → 使用 Target Dialog
         if umf is not None and umf.text and umf.text.strip() == "0":
@@ -393,7 +421,7 @@ def uses_scatter_file(uvprojx_path: str) -> tuple[bool, str | None]:
             if scatter is not None and scatter.text and scatter.text.strip():
                 sct_rel = scatter.text.strip()
                 uvp_dir = Path(uvprojx_path).parent
-                sct_abs = (uvp_dir / sct_rel).resolve()
+                sct_abs = _project_path(uvp_dir, sct_rel)
                 if sct_abs.exists():
                     return True, str(sct_abs)
                 return True, sct_rel
@@ -439,7 +467,7 @@ def _parse_groups(target: ET.Element) -> list[dict]:
             files.append({
                 "name": _text(f, "FileName", ""),
                 "path": _text(f, "FilePath", ""),
-                "type": int(_text(f, "FileType", "1")),
+                "type": int(_text(f, "FileType", "1")) if _text(f, "FileType", "1").isdigit() else 1,
             })
         groups.append({"name": name, "files": files})
     return groups

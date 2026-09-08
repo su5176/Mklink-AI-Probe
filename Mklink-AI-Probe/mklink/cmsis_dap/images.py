@@ -400,7 +400,14 @@ class ImageInspector:
                     snapshot.flush()
                     os.fsync(snapshot.fileno())
                 after = os.fstat(source.fileno())
-                if not self._same_stat(before, after) or size != before.st_size:
+                if (
+                    not self._same_stat(before, after)
+                    or size != before.st_size
+                    # Windows/remote filesystems may retain timestamps while
+                    # a writer replaces same-size bytes. Compare fresh content
+                    # too, before accepting a firmware snapshot for erasure.
+                    or self._stream_sha256(source_path) != digest
+                ):
                     raise FlashError(
                         FlashErrorCode.FILE_FORMAT_ERROR,
                         "firmware changed during snapshot creation",
@@ -500,6 +507,24 @@ class ImageInspector:
         Tuple[ImageSegment, ...],
         Tuple[Tuple[ImageSegment, bytes], ...],
     ]:
+        return self.decode_hex(
+            path,
+            max_records=self._max_hex_records,
+            max_decoded_size=self._max_hex_decoded_size,
+            max_segments=self._max_hex_segments,
+        )
+
+    @staticmethod
+    def decode_hex(
+        path: Path,
+        *,
+        max_records: int = _DEFAULT_MAX_HEX_RECORDS,
+        max_decoded_size: int = _DEFAULT_MAX_HEX_DECODED_SIZE,
+        max_segments: int = _DEFAULT_MAX_HEX_SEGMENTS,
+    ) -> Tuple[
+        Tuple[ImageSegment, ...],
+        Tuple[Tuple[ImageSegment, bytes], ...],
+    ]:
         chunks = []
         decoded_size = 0
         record_count = 0
@@ -563,14 +588,14 @@ class ImageInspector:
                         )
                     if record_type != 0x01:
                         record_count += 1
-                        if record_count > self._max_hex_records:
+                        if record_count > max_records:
                             raise FlashError(
                                 FlashErrorCode.FILE_FORMAT_ERROR,
                                 "Intel HEX record limit exceeded",
                             )
 
                     if record_type == 0x00:
-                        if decoded_size + byte_count > self._max_hex_decoded_size:
+                        if decoded_size + byte_count > max_decoded_size:
                             raise FlashError(
                                 FlashErrorCode.FILE_FORMAT_ERROR,
                                 "Intel HEX decoded data exceeds configured size limit",
@@ -610,6 +635,9 @@ class ImageInspector:
                             )
                         address_base = int.from_bytes(payload, "big") << 16
                     elif record_type in (0x03, 0x05):
+                        # Entry-point metadata is not a Flash write address.
+                        # Combined boot/application images may contain several
+                        # entries; programming and verification use data only.
                         if byte_count != 4 or record_address != 0:
                             raise FlashError(
                                 FlashErrorCode.FILE_FORMAT_ERROR,
@@ -648,7 +676,7 @@ class ImageInspector:
             if start == previous_end:
                 previous_payload.extend(payload)
             else:
-                if len(merged) >= self._max_hex_segments:
+                if len(merged) >= max_segments:
                     raise FlashError(
                         FlashErrorCode.FILE_FORMAT_ERROR,
                         "Intel HEX segment limit exceeded",

@@ -76,6 +76,10 @@
           </div>
         </div>
         <div class="rtt-secondary-tools">
+          <LogDisplayControls
+            v-if="viewMode === 'log'" id-prefix="rtt"
+            v-model:mode="logDisplayMode" v-model:show-timestamp="showLogTimestamp"
+          />
           <div v-if="viewMode === 'log'" class="format-help">
             <button
               data-testid="rtt-format-help" type="button" class="icon-action"
@@ -127,7 +131,10 @@
         />
         <div class="rtt-chart-hint">{{ tr('滚轮缩放坐标 · 左键拖动曲线 · 双击复位', 'Wheel to zoom axes · Left-drag to pan · Double-click to reset') }}</div>
       </div>
-      <VirtualLogPanel v-if="viewMode === 'log'" ref="logPanel" class="rtt-view-log" />
+      <VirtualLogPanel
+        v-if="viewMode === 'log'" ref="logPanel" class="rtt-view-log"
+        :display-mode="logDisplayMode" :show-timestamp="showLogTimestamp"
+      />
       <div v-else class="rtt-terminal-shell">
         <RttTerminalPanel
           ref="terminalPanel" :input-enabled="transmitEnabled"
@@ -159,8 +166,9 @@ import {
 } from '../../lib/desktopSettings'
 import { RenderScheduler } from '../../lib/stream/renderScheduler'
 import { cancelRttAddressRefresh } from '../../lib/rttSymbolAddress'
-import { downloadTextFile, timestampedLogName } from '../../lib/downloadTextFile'
+import { saveBlobFile, timestampedLogName } from '../../lib/downloadTextFile'
 import ControlToolbar from './ControlToolbar.vue'
+import LogDisplayControls, { type LogDisplayMode } from './LogDisplayControls.vue'
 import RttTransmitBar from './RttTransmitBar.vue'
 import RttTerminalPanel from './RttTerminalPanel.vue'
 import VirtualLogPanel, { type VirtualLogInput } from './VirtualLogPanel.vue'
@@ -203,6 +211,8 @@ const numericChannelCount = ref(0)
 const numericChannelNames = ref<string[]>([])
 const chartEnabled = ref(true)
 const viewMode = ref<'log' | 'terminal'>('terminal')
+const logDisplayMode = ref<LogDisplayMode>('text')
+const showLogTimestamp = ref(false)
 const formatHelpOpen = ref(false)
 const hasChartData = ref(false)
 const renderPaused = ref(false)
@@ -252,6 +262,7 @@ let chartDrag: {
 const CHART_MARGIN = { left: 58, right: 18, top: 14, bottom: 38 }
 const CHART_COLORS = ['#4f8ff7', '#34c47c', '#f2ad3d', '#ed5d68', '#9b7af5', '#28b8c7']
 const terminalEncoder = new TextEncoder()
+const logEncoder = new TextEncoder()
 let terminalInput = ''
 let terminalInputTimer: ReturnType<typeof setTimeout> | null = null
 let terminalSendChain = Promise.resolve()
@@ -366,6 +377,7 @@ watch(() => logBinary.rttLines.value, batch => {
   if (viewMode.value !== 'log' || !batch || renderPaused.value) return
   logPanel.value?.append(batch.lines.map(line => ({
     time: line.timestampNs, level: line.level, text: line.text,
+    raw: logEncoder.encode(`${line.text}\n`),
   } satisfies VirtualLogInput)))
 })
 
@@ -712,11 +724,24 @@ function detachBinary(): void {
   attachedBinaryMode = null
 }
 
+let lastSourceChange = 0
 async function refreshStatus(): Promise<Record<string, any> | null> {
   try {
     const response = await fetch(`${API_BASE}/api/dash/rtt/status`)
     if (response.ok) {
       const status = await response.json()
+      const changed = status.file_source_change
+      if (changed && changed.sequence !== lastSourceChange) {
+        lastSourceChange = changed.sequence
+        if (changed.rtt_addr && isRttAddress(changed.rtt_addr)) {
+          rttAddress.value = changed.rtt_addr
+          persistSettings({ ...settings.value, rttAddress: changed.rtt_addr })
+        } else {
+          rttAddress.value = ''
+          persistSettings({ ...settings.value, rttAddress: '' })
+        }
+        runtimeError.value = changed.error || changed.message || tr('符号文件已变化，请重新检测地址', 'Symbol file changed. Detect the address again.')
+      }
       statusKnown.value = true
       statusRunning.value = status.running === true
       if (statusRunning.value && typeof status.encoding === 'string') {
@@ -865,8 +890,13 @@ function clearVisibleOutput(): void {
 }
 
 function saveLog(): void {
-  const text = logPanel.value?.exportText() || ''
-  if (text) downloadTextFile(timestampedLogName('rtt'), text)
+  const raw = logPanel.value?.exportRaw() ?? new Uint8Array()
+  if (raw.byteLength) {
+    void saveBlobFile(
+      timestampedLogName('rtt'),
+      new Blob([new Uint8Array(raw)], { type: 'application/octet-stream' }),
+    )
+  }
 }
 
 onMounted(() => {

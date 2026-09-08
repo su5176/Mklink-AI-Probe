@@ -11,15 +11,18 @@ description: 使用 MKLink/MicroLink 操作目标 MCU：固件烧录、内存与
 
 ## 开始前
 
+- 每个会话首次加载本 Skill 时立即检查版本：调用 MCP
+  `ping(force_update_check=True)` 并读取 `update`；没有该参数或 MCP 时，在本
+  Skill 根目录运行 `python scripts/skill_update.py check --force --json`。
+  不等到首次设备操作，不使用上次会话的 24 小时缓存；本会话后续调用不重复检查。
+  离线继续任务，发现新版本时简要提示；安装仍须用户同意，按需读
+  [安装与更新](references/install.md)。
 - 有 MKLink MCP tool 时优先使用；能力未覆盖时用 `python -m mklink <command>`。
   参数以 tool schema/`--help` 为准，找不到入口再读[操作速查](references/tool-index.md)。
 - 首次需要生成脚本、日志、采集或报告时，工作根目录固定为用户指定的非系统盘
   目录；用户未指定时使用目标项目 `.mklink/`。项目在系统盘或没有项目时先询问，
   不写 Skill 目录、AI 客户端目录、桌面或系统临时目录。按需读取
   [工作目录与清理](references/work-files.md)，并报告实际路径。
-- 每会话首次实际使用时，只通过 MCP `ping.update` 或
-  `scripts/skill_update.py check --json` 检查一次更新。离线不阻塞任务；安装更新
-  只有用户明确同意后才执行，并读取[安装与更新](references/install.md)。
 
 ## 不可绕过的设备边界
 
@@ -51,6 +54,14 @@ description: 使用 MKLink/MicroLink 操作目标 MCU：固件烧录、内存与
   `hpm_flash_cfg`。
 - **供电**：`set_power_on` 每次都先确认 1800/3300/5000 mV 并传
   `confirm_user=True`。5000 mV 还须确认供电路径和负载耐压，并传 `confirm_5v=True`。
+- **加锁/解锁**：先调用 `security_status`，只有返回 `supported:true` 的精确型号才可
+  继续；不支持的型号必须停止，禁止改通用型号绕过白名单。加锁必须提供刚校验通过
+  的完整固件；解锁会永久擦除该型号声明的 Flash/EEPROM/备份数据，必须分别确认
+  操作、数据丢失和本次恢复电压。只允许工具内置的可逆保护等级，绝不尝试 RDP2。
+  当前 GD32 仅 `GD32F303xE` 512 KiB 容量组完成真机闭环；其安全操作必须使用
+  复位下连接和用户确认电压的断电复位。不要用该结果推断其他 GD32 系列也受支持。
+  当前 PY32 仅精确型号 `PY32F030K28T6` 完成真机闭环；解锁会擦除全部 64 KiB
+  Flash，并强制使用复位下连接和用户确认电压的断电复位。其他 PY32 型号保持禁用。
 
 ## 按需路由
 

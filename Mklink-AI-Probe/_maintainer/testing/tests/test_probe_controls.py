@@ -211,6 +211,18 @@ def test_device_set_power_on_stops_active_streams_only_after_validation():
     assert device._bridge.commands == [("cmd.set_power_on(3300)", 10.0)]
 
 
+def test_device_set_power_off_stops_streams_and_disables_vcc():
+    device = _connected_device()
+    events = []
+    device._rtt_session = SimpleNamespace(_running=True)
+    device.rtt_stop = lambda: events.append("rtt-stop")
+
+    device.set_power_off()
+
+    assert events == ["rtt-stop"]
+    assert device._bridge.commands == [("cmd.set_power_off()", 10.0)]
+
+
 def test_device_reboot_sends_probe_command_then_disconnects_and_releases_hil_lock():
     device = _connected_device()
     bridge = device._bridge
@@ -241,7 +253,7 @@ def test_mcp_ping_reports_rtt_write_utf8_limit(monkeypatch):
     monkeypatch.setattr("mklink.toolchain.status", lambda: {})
     monkeypatch.setattr(
         "mklink.update_check.check_for_update",
-        lambda: {"checked": False},
+        lambda **kwargs: {"checked": False},
     )
     mcp = _Mcp()
     mcp_server._register_health_tools(mcp)
@@ -287,6 +299,66 @@ def test_mcp_exposes_guarded_power_and_probe_reboot(monkeypatch):
         ("power", 5000, True),
         ("reboot",),
         ("reset-holder",),
+    ]
+
+
+def test_mcp_security_tools_share_guarded_one_shot_backend(monkeypatch):
+    mcp = _Mcp()
+    calls = []
+    monkeypatch.setattr(mcp_server, "_reset_device", lambda: calls.append(("reset",)))
+    monkeypatch.setattr(
+        "mklink.security_operations.run_security_operation",
+        lambda action, target_part, **kwargs: calls.append(
+            (action, target_part, kwargs)
+        ) or {"status": "succeeded", "action": action},
+    )
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.security.security_capability",
+        lambda part: SimpleNamespace(public=lambda: {"part_number": part, "supported": True}),
+    )
+
+    mcp_server._register_security_tools(mcp)
+
+    assert mcp.tools["security_status"]("STM32L010F4P6")["supported"] is True
+    assert mcp.tools["security_lock"](
+        "STM32L010F4P6", "firmware.bin", 3300,
+        base_address=0x08000000,
+        confirm_user=True,
+    )["action"] == "lock"
+    assert mcp.tools["security_unlock"](
+        "STM32L010F4P6",
+        3300,
+        confirm_user=True,
+        confirm_data_loss=True,
+    )["action"] == "unlock"
+    assert calls == [
+        ("reset",),
+        (
+            "lock",
+            "STM32L010F4P6",
+            {
+                "voltage_mv": 3300,
+                "confirm_user": True,
+                "firmware": "firmware.bin",
+                "base_address": 0x08000000,
+                "probe_id": None,
+                "frequency": 1_000_000,
+                "timeout": 240.0,
+            },
+        ),
+        ("reset",),
+        (
+            "unlock",
+            "STM32L010F4P6",
+            {
+                "voltage_mv": 3300,
+                "confirm_user": True,
+                "confirm_data_loss": True,
+                "probe_id": None,
+                "frequency": 1_000_000,
+                "timeout": 240.0,
+            },
+        ),
     ]
 
 

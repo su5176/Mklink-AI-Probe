@@ -11,7 +11,10 @@ const mocks = vi.hoisted(() => ({
     paste: ReturnType<typeof vi.fn>
     selectAll: ReturnType<typeof vi.fn>
     selection: string
+    writes: string[]
   }>,
+  animationFrames: new Map<number, FrameRequestCallback>(),
+  nextAnimationFrame: 1,
   native: false,
   invoke: vi.fn(),
 }))
@@ -42,6 +45,7 @@ vi.mock('@xterm/xterm', () => ({
         paste: vi.fn((text: string) => this.instance.onData?.(text)),
         selectAll: vi.fn(),
         selection: '',
+        writes: [],
       }
       this.instance = instance
       mocks.terminals.push(this.instance)
@@ -60,7 +64,10 @@ vi.mock('@xterm/xterm', () => ({
     paste(text: string) { this.instance.paste(text) }
     selectAll() { this.instance.selectAll() }
     clear() {}
-    write() {}
+    write(text: string, callback?: () => void) {
+      this.instance.writes.push(text)
+      callback?.()
+    }
     focus() {}
     dispose() {}
   },
@@ -78,6 +85,16 @@ describe('RttTerminalPanel', () => {
     mocks.terminals.length = 0
     mocks.native = false
     mocks.invoke.mockReset()
+    mocks.animationFrames.clear()
+    mocks.nextAnimationFrame = 1
+    vi.stubGlobal('requestAnimationFrame', (callback: FrameRequestCallback) => {
+      const id = mocks.nextAnimationFrame++
+      mocks.animationFrames.set(id, callback)
+      return id
+    })
+    vi.stubGlobal('cancelAnimationFrame', (id: number) => {
+      mocks.animationFrames.delete(id)
+    })
     Object.defineProperty(navigator, 'clipboard', {
       configurable: true,
       value: {
@@ -98,6 +115,24 @@ describe('RttTerminalPanel', () => {
 
     expect(mocks.terminalOptions).toHaveLength(1)
     expect(mocks.terminalOptions[0].convertEol).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('coalesces high-rate output into one xterm write per animation frame', () => {
+    const wrapper = mount(RttTerminalPanel, { props: { inputEnabled: true } })
+    for (let index = 0; index < 100; index += 1) {
+      ;(wrapper.vm as any).write(`line-${index}\n`)
+    }
+
+    expect(mocks.animationFrames.size).toBe(1)
+    expect(mocks.terminals[0].writes).toEqual([])
+    const callback = [...mocks.animationFrames.values()][0]
+    mocks.animationFrames.clear()
+    callback(16)
+
+    expect(mocks.terminals[0].writes).toHaveLength(1)
+    expect(mocks.terminals[0].writes[0]).toContain('line-0\n')
+    expect(mocks.terminals[0].writes[0]).toContain('line-99\n')
     wrapper.unmount()
   })
 

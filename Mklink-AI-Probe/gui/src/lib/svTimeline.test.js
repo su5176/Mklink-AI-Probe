@@ -428,6 +428,8 @@ describe('SvTimeline continuous filtering', () => {
   })
 
   it('draws each live update in a continuously advancing window', () => {
+    // Keep setData's clock consistent with the synthetic animation frames.
+    const now = vi.spyOn(performance, 'now').mockReturnValue(0)
     const timeline = Object.create(SvTimeline.prototype)
     Object.assign(timeline, {
       PALETTE: ['#1'],
@@ -449,12 +451,14 @@ describe('SvTimeline continuous filtering', () => {
     expect(timeline._followTarget).toEqual({ start: -40, end: 60 })
     timeline.renderFrame((timeline._followTransitionAt || 0) + 100)
     expect([timeline.viewStart, timeline.viewEnd]).toEqual([-40, 60])
+    now.mockReturnValue(100)
     timeline.setData([{ tid: 1, name: 'main', start: 101, end: 120 }])
     expect([timeline.viewStart, timeline.viewEnd]).toEqual([-40, 60])
     expect(timeline._followTarget).toEqual({ start: 20, end: 120 })
     timeline.renderFrame((timeline._followTransitionAt || 0) + 100)
     expect([timeline.viewStart, timeline.viewEnd]).toEqual([20, 120])
     expect(timeline._drawLive).toHaveBeenCalledTimes(2)
+    now.mockRestore()
   })
 
   it('interpolates the live view on animation frames', () => {

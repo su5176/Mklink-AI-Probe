@@ -477,7 +477,7 @@ def test_rtt_start_failure_keeps_the_explicit_device_connection():
     assert state["resource_manager"].get_status() == {}
 
 
-def test_dashboard_start_stops_running_peer_before_acquiring_resources():
+def test_dashboard_start_preserves_peer_until_user_explicitly_stops_it():
     class DashboardManager:
         def __init__(self):
             self.running = False
@@ -501,11 +501,15 @@ def test_dashboard_start_stops_running_peer_before_acquiring_resources():
         superwatch_started = client.post("/api/dash/superwatch/start", json={})
 
     assert rtt_started.status_code == 200
-    assert superwatch_started.status_code == 200
-    assert superwatch_started.json()["stopped"] == ["rtt"]
-    managers["rtt"].stop.assert_called_once_with()
-    assert managers["rtt"].running is False
-    assert managers["superwatch"].running is True
+    assert superwatch_started.status_code == 409
+    managers["rtt"].stop.assert_not_called()
+    assert managers["rtt"].running is True
+    assert managers["superwatch"].running is False
+    status = state["resource_manager"].get_status()
+    assert status["mklink_bridge"]["owner"] == "user:dashboard:rtt"
+    with patch("mklink.remote.dashboards.get_managers", return_value=managers):
+        assert client.post("/api/dash/rtt/stop").status_code == 200
+        assert client.post("/api/dash/superwatch/start").status_code == 200
     status = state["resource_manager"].get_status()
     assert status["mklink_bridge"]["owner"] == "user:dashboard:superwatch"
     assert status["target_debug"]["owner"] == "user:dashboard:superwatch"
@@ -1207,6 +1211,7 @@ def test_async_dashboard_initialization_failure_releases_leases(
     device = MagicMock()
     device.connected = True
     device._systemview_defaults.return_value = {}
+    device._axf = None
     getattr(device, start_method).side_effect = RuntimeError("async init failed")
     state["device"] = device
 

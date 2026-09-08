@@ -847,6 +847,7 @@ def test_serial_binary_stream_skips_legacy_formatting_without_sse_clients(monkey
     monitor.event_callback(SerialEvent(1.0, "TEST", "RX", rx))
     monitor.chunk_callback("TEST", "TX", tx, 2.0)
     monitor.event_callback(SerialEvent(2.0, "TEST", "TX", tx))
+    manager._byte_batcher.flush()
 
     assert hub.batches == [
         (rx, len(rx), SERIAL_RX_BYTES, StreamType.SERIAL),

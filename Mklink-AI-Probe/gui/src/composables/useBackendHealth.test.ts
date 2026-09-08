@@ -19,4 +19,15 @@ describe('useBackendHealth startup lifecycle', () => {
     expect(health.backendState.value).toBe('dead')
     health.stopHealthPolling()
   })
+
+  it('uses the backend-reported listener port for a proxied health response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'ok', backend_port: 8766 })))
+    const { useBackendHealth } = await import('./useBackendHealth')
+    const health = useBackendHealth()
+
+    await health.refreshHealth()
+
+    expect(health.backendState.value).toBe('alive')
+    expect(health.backendPort.value).toBe(8766)
+  })
 })

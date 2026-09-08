@@ -142,8 +142,9 @@ def test_prepare_release_rejects_nested_repository_skill_layout(
 
 
 def test_public_skill_archive_excludes_repository_maintenance(
-    release_module, tmp_path,
+    release_module, monkeypatch, tmp_path,
 ):
+    monkeypatch.setattr(release_module, "_requires_builtin_flm", lambda _version: False)
     source_commit = subprocess.check_output(
         ["git", "rev-parse", "HEAD"],
         cwd=release_module.REPO_ROOT,
@@ -191,6 +192,23 @@ def test_public_skill_archive_excludes_repository_maintenance(
     )
     assert {"AGENTS.md", "CLAUDE.md", "GEMINI.md"}.isdisjoint(files)
     assert not any(path.startswith("MK-Firmware/") for path in files)
+
+
+def test_020_skill_archive_requires_builtin_algorithms(release_module, tmp_path):
+    archive_path = tmp_path / "skill.zip"
+    root = "Mklink-AI-Probe-v0.2.0"
+    with zipfile.ZipFile(archive_path, "w") as archive:
+        archive.writestr(f"{root}/pyproject.toml", '[project]\nversion = "0.2.0"\n')
+        archive.writestr(f"{root}/SKILL.md", "# Skill\n")
+        archive.writestr(
+            f"{root}/.claude-plugin/plugin.json",
+            json.dumps({"version": "0.2.0"}),
+        )
+        archive.writestr(f"{root}/scripts/skill_update.py", "# updater\n")
+        archive.writestr(f"{root}/scripts/win_usb_rename.ps1", "# rename\n")
+
+    with pytest.raises(ValueError, match="requires built-in algorithm assets"):
+        release_module._validate_skill_archive(archive_path, "0.2.0")
 
 
 def test_public_skill_allowlist_includes_only_bundled_runtime_scripts(release_module):

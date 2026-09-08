@@ -8,6 +8,8 @@ MKLink Serial Bridge — COM 口发现和磁盘管理。
 from __future__ import annotations
 
 import os
+import re
+import sys
 import serial
 from serial.tools import list_ports
 
@@ -35,6 +37,8 @@ def _normalize_flm_name(flm_name: str) -> str:
     """Return a plain FLM filename from a device path or filename."""
     flm_name = flm_name.replace("\\", "/").rstrip("/")
     flm_name = os.path.basename(flm_name)
+    if flm_name.startswith("._"):
+        return ""
     if flm_name and not flm_name.upper().endswith(".FLM"):
         flm_name = flm_name + ".FLM"
     return flm_name
@@ -239,6 +243,42 @@ def _windows_volume_label(root: str) -> str | None:
         return None
 
 
+def _find_posix_microkeen_disk() -> str | None:
+    """Only accept mounted MICROKEEN volumes, never an ordinary directory."""
+    def valid(path: str) -> bool:
+        name = os.path.basename(path.rstrip("/"))
+        label = r"MICROKEEN(?: [0-9]+)?" if sys.platform == "darwin" else r"MICROKEEN"
+        return (bool(re.fullmatch(label, name, re.IGNORECASE))
+                and not os.path.islink(path) and os.path.ismount(path)
+                and os.path.isdir(path))
+
+    configured = os.environ.get("MKLINK_MICROKEEN_DISK", "").strip()
+    if configured:
+        root = os.path.abspath(configured)
+        return root if valid(root) else None
+
+    parents = ["/Volumes"] if sys.platform == "darwin" else ["/media", "/run/media", "/mnt"]
+    candidates: set[str] = set()
+    for parent in parents:
+        try:
+            with os.scandir(parent) as entries:
+                children = [entry.path for entry in entries if entry.is_dir(follow_symlinks=False)]
+        except OSError:
+            continue
+        for child in children:
+            if valid(child):
+                candidates.add(child)
+            elif sys.platform != "darwin" and not os.path.ismount(child):
+                # Linux desktop automounters use /media/<user>/<volume>.
+                try:
+                    with os.scandir(child) as entries:
+                        candidates.update(entry.path for entry in entries if valid(entry.path))
+                except OSError:
+                    continue
+    # Do not program an arbitrary probe if several volumes are connected.
+    return next(iter(candidates)) if len(candidates) == 1 else None
+
+
 def find_microkeen_disk() -> str | None:
     """查找 MICROKEEN 磁盘路径。
 
@@ -246,7 +286,7 @@ def find_microkeen_disk() -> str | None:
     返回磁盘根路径，如 'D:\\'，未找到返回 None。
     """
     if os.name != "nt":
-        return None
+        return _find_posix_microkeen_disk()
 
     # Service and scheduled-task sessions can enumerate removable volumes
     # differently from an interactive shell.  An operator may provide a
@@ -469,19 +509,10 @@ def copy_flm_to_microkeen(flm_name: str) -> tuple[bool, str | None]:
     # 目标路径（设备上使用带扩展名的文件名）
     dest_path = os.path.join(flm_dir, flm_name_with_ext)
 
-    # 检查目标文件是否存在
-    if os.path.isfile(dest_path):
-        src_size = os.path.getsize(src_path)
-        dest_size = os.path.getsize(dest_path)
-        if src_size == dest_size:
-            print(f"[OK] FLM 已存在且大小相同，跳过拷贝: {dest_path} ({src_size} bytes)")
-            return True, dest_path
-        else:
-            print(f"[INFO] FLM 文件大小不同，将重新拷贝: {dest_path} (源:{src_size} vs 目标:{dest_size})")
-
     try:
-        shutil.copy2(src_path, dest_path)
-        print(f"[OK] 已拷贝 FLM: {src_path} -> {dest_path}")
+        from mklink.file_content import copy_verified
+        changed = copy_verified(src_path, dest_path)
+        print(f"[OK] FLM {'已拷贝' if changed else '内容相同'}: {dest_path}")
         return True, dest_path
     except Exception as e:
         print(f"[FAIL] 拷贝失败: {e}")

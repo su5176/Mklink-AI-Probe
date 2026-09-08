@@ -261,13 +261,16 @@ def _idcode(dev: Any) -> str | None:
 # ==========================================================================
 def _register_health_tools(mcp: Any) -> None:
     @mcp.tool()
-    def ping() -> dict:
+    def ping(force_update_check: bool = False) -> dict:
         """Health check for the mklink MCP server.
 
         Call this first to confirm the server is alive before invoking any
         hardware tool. Requires no device connection. Also reports the
         effective built-in ELF/DWARF backend and optional external GNU tool
         availability. AXF features use the bundled backend by default.
+        Set force_update_check=True when first loading the MKLink Skill in a
+        conversation to fetch the latest release instead of reusing the cache.
+        Subsequent health calls can use the default; this never installs updates.
         """
         from importlib.metadata import version, PackageNotFoundError
         from mklink.toolchain import status as toolchain_status
@@ -281,7 +284,7 @@ def _register_health_tools(mcp: Any) -> None:
             "server": "mklink-ai-probe",
             "transport": "stdio",
             "sdk_version": ver,
-            "update": check_for_update(),
+            "update": check_for_update(force=force_update_check),
             "limits": _capabilities(),
             **toolchain_status(),
         }
@@ -588,6 +591,83 @@ def _register_flash_tools(mcp: Any) -> None:
         finally:
             _reset_device()
         return {"rebooted": True, "connected": False}
+
+
+def _register_security_tools(mcp: Any) -> None:
+    @mcp.tool()
+    def security_status(target_part: str) -> dict:
+        """Report fail-closed lock/unlock support for an exact MCU part number."""
+        from mklink.cmsis_dap.security import security_capability
+
+        return security_capability(target_part).public()
+
+    @mcp.tool()
+    @_exclusive_hardware_tool
+    def security_lock(
+        target_part: str,
+        firmware: str,
+        voltage_mv: StrictInt,
+        base_address: StrictInt | None = None,
+        confirm_user: bool = False,
+        probe_id: str | None = None,
+        frequency: StrictInt = 1_000_000,
+        timeout: float = 240.0,
+    ) -> dict:
+        """Enable validated reversible read protection, then power-cycle.
+
+        ``confirm_user`` must be true only after the user explicitly confirms
+        this operation and the exact ``voltage_mv`` for this call.
+        """
+        from mklink.security_operations import run_security_operation
+
+        if confirm_user is not True:
+            raise ValueError("security lock requires explicit user confirmation")
+        _reset_device()
+        return run_security_operation(
+            "lock",
+            target_part,
+            voltage_mv=voltage_mv,
+            confirm_user=confirm_user,
+            firmware=firmware,
+            base_address=base_address,
+            probe_id=probe_id,
+            frequency=frequency,
+            timeout=timeout,
+        )
+
+    @mcp.tool()
+    @_exclusive_hardware_tool
+    def security_unlock(
+        target_part: str,
+        voltage_mv: StrictInt,
+        confirm_user: bool = False,
+        confirm_data_loss: bool = False,
+        probe_id: str | None = None,
+        frequency: StrictInt = 1_000_000,
+        timeout: float = 240.0,
+    ) -> dict:
+        """Disable validated read protection, erase protected data, and power-cycle.
+
+        Both confirmations must be true. The user must explicitly confirm the
+        exact restore voltage and permanent loss of protected nonvolatile data.
+        """
+        from mklink.security_operations import run_security_operation
+
+        if confirm_user is not True or confirm_data_loss is not True:
+            raise ValueError(
+                "security unlock requires explicit voltage and data-loss confirmations"
+            )
+        _reset_device()
+        return run_security_operation(
+            "unlock",
+            target_part,
+            voltage_mv=voltage_mv,
+            confirm_user=confirm_user,
+            confirm_data_loss=confirm_data_loss,
+            probe_id=probe_id,
+            frequency=frequency,
+            timeout=timeout,
+        )
 
 
 def _register_memory_tools(mcp: Any) -> None:
@@ -1996,6 +2076,7 @@ def build_server() -> Any:
     _register_project_tools(mcp)
     _register_connection_tools(mcp)
     _register_flash_tools(mcp)
+    _register_security_tools(mcp)
     _register_memory_tools(mcp)
     _register_variable_tools(mcp)
     _register_debug_tools(mcp)

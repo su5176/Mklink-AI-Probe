@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,8 @@ from mklink.cmsis_dap.backend import HpmRomBackend, PyOcdBackend, RoutingFlashBa
 from mklink.cmsis_dap.backend import (
     _expand_pack_flm_regions,
     _install_custom_flm_regions,
+    _mask_custom_flm_interrupts,
+    _power_cycle_mklink_probe,
     _relocate_pack_flm_regions,
 )
 from mklink.cmsis_dap.errors import FlashError, FlashErrorCode
@@ -27,6 +30,10 @@ class FakeTarget:
 
     def reset_and_halt(self) -> None:
         self.reset_and_halt_calls += 1
+
+    def read_core_register(self, name):
+        assert name in {"ipsr", "control"}
+        return 0
 
     def reset(self, reset_type=None) -> None:
         self.reset_calls.append(reset_type)
@@ -162,6 +169,833 @@ def test_pyocd_backend_reads_exact_bytes_from_target() -> None:
     backend.disconnect()
 
 
+@pytest.mark.parametrize("invalid_context", [False, True])
+def test_stm32f103_security_writes_only_rdp_pair_and_verifies_each_stage(invalid_context) -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def __init__(self, target):
+            self.target = target
+            self.calls = []
+
+        def init(self, operation):
+            assert self.target.reset_and_halt_calls >= 1
+            self.calls.append(("init", operation))
+
+        def erase_sector(self, address):
+            self.calls.append(("erase", address))
+
+        def program_page(self, address, data):
+            self.calls.append(("program", address, bytes(data)))
+            self.target.option_bytes[:] = data
+
+        def uninit(self):
+            self.calls.append(("uninit",))
+
+        def cleanup(self):
+            self.uninit()
+
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFFF800
+        length = 16
+        is_flash = True
+
+        def __init__(self, target):
+            self.flash = SecurityFlash(target)
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.option_bytes = bytearray([0xA5, 0x5A] + [0xFF, 0x00] * 7)
+            self.option_region = OptionRegion(self)
+            super().__init__((self.option_region,))
+
+        def read_core_register(self, name):
+            return 2 if invalid_context and name == "control" else 0
+
+        def read_memory_block8(self, address, size):
+            if address == 0x1FFFF800:
+                return bytes(self.option_bytes[:size])
+            if address == 0x4002201C:
+                locked = self.option_bytes[:2] != b"\xA5\x5A"
+                return (0x03FFFFFC | (0x2 if locked else 0)).to_bytes(4, "little")[:size]
+            raise AssertionError(hex(address))
+
+    target = Target()
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "stm32f103-rdp1"
+    backend._algorithm_reset_required = True
+
+    if invalid_context:
+        with pytest.raises(FlashError, match="privileged main-stack"):
+            backend.lock_security()
+        assert target.option_region.flash.calls == []
+        assert target.option_bytes[:2] == b"\xA5\x5A"
+        return
+
+    assert "activated after reset" in backend.lock_security()
+    assert target.option_bytes[:2] == b"\x00\xFF"
+    assert target.option_bytes[2:] == bytes([0xFF, 0x00] * 7)
+    assert "mass-erased" in backend.unlock_security()
+    assert target.option_bytes[:2] == b"\xA5\x5A"
+    assert target.reset_and_halt_calls == 3
+    assert [call[0] for call in target.option_region.flash.calls] == [
+        "init", "erase", "uninit", "init", "program", "uninit",
+        "init", "erase", "uninit", "init", "program", "uninit",
+    ]
+
+
+def test_gd32f303_security_validates_identity_and_preserves_erased_options() -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def __init__(self, target):
+            self.target = target
+            self.calls = []
+            self.prepared = False
+            self.ram_owner = None
+
+        def init(self, operation):
+            if not self.prepared:
+                self.ram_owner = "options"
+                self.prepared = True
+            assert self.ram_owner == "options", "stale FLM cache after main-Flash programming"
+            self.calls.append(("init", operation))
+
+        def erase_sector(self, address):
+            self.calls.append(("erase", address))
+
+        def program_page(self, address, data):
+            self.calls.append(("program", address, bytes(data)))
+            self.target.option_bytes[:] = data
+
+        def uninit(self):
+            self.calls.append(("uninit",))
+
+        def cleanup(self):
+            self.uninit()
+            self.prepared = False
+            self.calls.append(("cleanup",))
+
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFFF800
+        length = 16
+        is_flash = True
+
+        def __init__(self, target):
+            self.flash = SecurityFlash(target)
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.option_bytes = bytearray(b"\xA5\x5A" + b"\xFF\xFF" * 7)
+            self.density_fault = False
+            self.option_region = OptionRegion(self)
+            super().__init__((self.option_region,))
+
+        def read_memory_block8(self, address, size):
+            if address == 0xE0042000:
+                return (0x21040414).to_bytes(4, "little")[:size]
+            if address == 0x1FFFF7E0:
+                if self.density_fault:
+                    raise RuntimeError("FAULT ACK")
+                return (0x00400200).to_bytes(4, "little")[:size]
+            if address == 0x4002201C:
+                protected = self.option_bytes[:2] != b"\xA5\x5A"
+                return (0x03FFFFFC | (0x2 if protected else 0)).to_bytes(4, "little")[:size]
+            if address == 0x1FFFF800:
+                return bytes(self.option_bytes[:size])
+            raise AssertionError(hex(address))
+
+    target = Target()
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "gd32f303xe-spc"
+
+    assert "power-cycle reset is required" in backend.lock_security()
+    assert target.option_bytes == b"\x00\xFF" + b"\xFF\xFF" * 7
+    target.density_fault = True
+    assert "mass-erased" in backend.unlock_security()
+    assert target.option_bytes == b"\xA5\x5A" + b"\xFF\xFF" * 7
+    # Simulate the intervening main FLM overwriting target RAM in one job.
+    target.option_region.flash.ram_owner = "main"
+    target.density_fault = False
+    assert "power-cycle reset is required" in backend.lock_security()
+    assert target.option_region.flash.prepared is False
+    programmed = [
+        call[2] for call in target.option_region.flash.calls if call[0] == "program"
+    ]
+    assert programmed == [
+        b"\x00\xFF" + b"\xFF\xFF" * 7,
+        b"\xA5\x5A" + b"\xFF\xFF" * 7,
+        b"\x00\xFF" + b"\xFF\xFF" * 7,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("dbg_id", "density"),
+    [(0x21040413, 0x00400200), (0x21040414, 0x00400100)],
+)
+def test_gd32f303_security_rejects_identity_or_density_mismatch(dbg_id, density) -> None:
+    class Target:
+        def read_memory_block8(self, address, size):
+            values = {
+                0xE0042000: dbg_id,
+                0x1FFFF7E0: density,
+                0x4002201C: 0x03FFFFFC,
+            }
+            if address == 0x1FFFF800:
+                return (b"\xA5\x5A" + b"\xFF\xFF" * 7)[:size]
+            return values[address].to_bytes(4, "little")[:size]
+
+    backend = PyOcdBackend()
+    backend._session = FakeSession(Target())
+    backend._security_family = "gd32f303xe-spc"
+
+    with pytest.raises(FlashError) as raised:
+        backend.lock_security()
+    assert raised.value.code is FlashErrorCode.LOCK_FAIL
+
+
+def test_py32f030_security_validates_identity_and_preserves_other_options() -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def __init__(self, target):
+            self.target = target
+            self.calls = []
+
+        def init(self, operation):
+            self.calls.append(("init", operation))
+
+        def erase_sector(self, address):
+            self.calls.append(("erase", address))
+
+        def program_page(self, address, data):
+            self.calls.append(("program", address, bytes(data)))
+            self.target.option_bytes[:] = data
+
+        def uninit(self):
+            self.calls.append(("uninit",))
+
+    class MainRegion:
+        name = "flash"
+        start = 0x08000000
+        length = 0x10000
+        is_flash = True
+
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFF0E80
+        length = 16
+        is_flash = True
+
+        def __init__(self, target):
+            self.flash = SecurityFlash(target)
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.option_bytes = bytearray.fromhex(
+                "aa be 55 41 ff 00 00 ff ff ff ff ff ff ff 00 00"
+            )
+            self.option_region = OptionRegion(self)
+            super().__init__((MainRegion(), self.option_region))
+
+        def read_memory_block8(self, address, size):
+            if address in {0x40015800, 0x1FFF0FF8}:
+                return (0x60001000).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E00:
+                uid = bytearray(range(16))
+                uid[12] = 0x78
+                return bytes(uid[:size])
+            if address == 0x40022010:
+                return (0).to_bytes(4, "little")[:size]
+            if address == 0x40022020:
+                return int(self.option_bytes[0]).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E80:
+                return bytes(self.option_bytes[:size])
+            raise AssertionError(hex(address))
+
+    target = Target()
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "py32f030x8-rdp1"
+
+    assert backend._write_py32f030_rdp(0xBB)[0] is True
+    assert target.option_bytes == bytes.fromhex(
+        "bb be 44 41 ff 00 00 ff ff ff ff ff ff ff 00 00"
+    )
+    assert backend._write_py32f030_rdp(0xAA)[0] is True
+    assert target.option_bytes == bytes.fromhex(
+        "aa be 55 41 ff 00 00 ff ff ff ff ff ff ff 00 00"
+    )
+    programmed = [
+        call[2] for call in target.option_region.flash.calls if call[0] == "program"
+    ]
+    assert programmed[0][1] == programmed[1][1]
+    assert programmed[0][3:] == programmed[1][3:]
+
+
+@pytest.mark.parametrize("factory_id", [0x60001001, 0xFFFFFFFF])
+def test_py32f030_security_rejects_identity_mismatch(factory_id) -> None:
+    class MainRegion:
+        start = 0x08000000
+        length = 0x10000
+        is_flash = True
+
+    class Target:
+        memory_map = (MainRegion(),)
+
+        def read_memory_block8(self, address, size):
+            values = {
+                0x40015800: 0x60001000,
+                0x1FFF0FF8: factory_id,
+            }
+            return values[address].to_bytes(4, "little")[:size]
+
+    backend = PyOcdBackend()
+    backend._session = FakeSession(Target())
+    backend._security_family = "py32f030x8-rdp1"
+
+    with pytest.raises(FlashError) as raised:
+        backend.lock_security()
+    assert raised.value.code is FlashErrorCode.LOCK_FAIL
+
+
+@pytest.mark.parametrize("bad_result", [None, "preserved", "blank", "identity"])
+def test_py32f030_unlock_verifies_transition_before_returning_to_program(
+    monkeypatch, bad_result,
+) -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def __init__(self, target):
+            self.target = target
+
+        def init(self, _operation):
+            pass
+
+        def erase_sector(self, _address):
+            pass
+
+        def program_page(self, _address, data):
+            self.target.option_bytes[:] = data
+            raise RuntimeError(
+                "target was not halted as expected after calling flash algorithm routine (IPSR=3)"
+            )
+
+        def uninit(self):
+            if self.target.option_bytes[0] == 0xAA:
+                raise RuntimeError("the reset also interrupted UnInit")
+
+    class MainRegion:
+        name = "flash"
+        start = 0x08000000
+        length = 0x10000
+        is_flash = True
+
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFF0E80
+        length = 16
+        is_flash = True
+
+        def __init__(self, target, with_flash=True):
+            self.flash = SecurityFlash(target) if with_flash else object()
+
+    class Target(FakeTarget):
+        def __init__(self, protected=True, with_flash=True):
+            self.option_bytes = bytearray.fromhex(
+                ("bb be 44 41" if protected else "aa be 55 41")
+                + " ff 00 00 ff ff ff ff ff ff ff 00 00"
+            )
+            self.option_region = OptionRegion(self, with_flash=with_flash)
+            super().__init__((MainRegion(), self.option_region))
+
+        def read_memory_block8(self, address, size):
+            if address in {0x40015800, 0x1FFF0FF8}:
+                return (0x60001000).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E00:
+                uid = bytearray(range(16))
+                uid[12] = 0x78
+                return bytes(uid[:size])
+            if address == 0x40022010:
+                return (0).to_bytes(4, "little")[:size]
+            if address == 0x40022020:
+                return int(self.option_bytes[0]).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E80:
+                return bytes(self.option_bytes[:size])
+            if 0x08000000 <= address < 0x08010000:
+                return b"\xFF" * size
+            raise AssertionError(hex(address))
+
+    target = Target(protected=True)
+    power_cycles = []
+    backend = PyOcdBackend(power_cycle=lambda probe, voltage: power_cycles.append((probe, voltage)))
+    backend._session = FakeSession(target)
+    old_session = backend._session
+    old_session.options = {}
+    backend._security_family = "py32f030x8-rdp1"
+    backend._probe_identifier = "probe"
+    backend._reset_mode = "power-cycle"
+    backend._reset_voltage_mv = 3300
+    backend._connection_arguments = {"probe": "probe", "target": "PY32F030K28T6", "frequency": 1_000_000}
+
+    fresh_target = Target(protected=False, with_flash=False)
+    original_read = fresh_target.read_memory_block8
+    def read_result(address, size):
+        if bad_result == "identity" and address == 0x40015800:
+            return (0).to_bytes(4, "little")
+        if bad_result == "blank" and address == 0x0800F000:
+            return b"\x00" + b"\xFF" * (size - 1)
+        return original_read(address, size)
+    fresh_target.read_memory_block8 = read_result
+    if bad_result == "preserved":
+        fresh_target.option_bytes[1] = 0xBF
+        fresh_target.option_bytes[3] = 0x40
+
+    def reconnect(**kwargs):
+        assert old_session.close_calls == 1
+        assert kwargs["connect_mode"] == "halt"
+        backend._session = FakeSession(fresh_target)
+        backend._security_family = "py32f030x8-rdp1"
+        backend._reset_voltage_mv = 3300
+        backend._connection_arguments = kwargs
+
+    monkeypatch.setattr(backend, "connect", reconnect)
+    monkeypatch.setattr("mklink.cmsis_dap.backend.time.sleep", lambda _delay: None)
+
+    if bad_result is not None:
+        with pytest.raises(FlashError) as raised:
+            backend.unlock_security()
+        assert raised.value.code is FlashErrorCode.UNLOCK_FAIL
+    else:
+        assert "verified erased" in backend.unlock_security()
+    assert power_cycles == [("probe", 3300)]
+    assert backend._py32f030_unlock_transition_pending is False
+
+
+def test_py32f030_unlock_does_not_hide_unrelated_algorithm_failures() -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def init(self, _operation):
+            pass
+
+        def erase_sector(self, _address):
+            pass
+
+        def program_page(self, _address, _data):
+            raise RuntimeError(
+                "target was not halted as expected after calling flash algorithm routine (IPSR=2)"
+            )
+
+        def uninit(self):
+            pass
+
+    class Region:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFF0E80
+        length = 16
+        is_flash = True
+
+        def __init__(self):
+            self.flash = SecurityFlash()
+
+    class MainRegion:
+        start = 0x08000000
+        length = 0x10000
+        is_flash = True
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.option_bytes = bytes.fromhex(
+                "bb be 44 41 ff 00 00 ff ff ff ff ff ff ff 00 00"
+            )
+            super().__init__((MainRegion(), Region()))
+
+        def read_memory_block8(self, address, size):
+            if address in {0x40015800, 0x1FFF0FF8}:
+                return (0x60001000).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E00:
+                uid = bytearray(range(16))
+                uid[12] = 0x78
+                return bytes(uid[:size])
+            if address == 0x40022010:
+                return (0).to_bytes(4, "little")[:size]
+            if address == 0x40022020:
+                return (0xBB).to_bytes(4, "little")[:size]
+            if address == 0x1FFF0E80:
+                return self.option_bytes[:size]
+            raise AssertionError(hex(address))
+
+    backend = PyOcdBackend()
+    backend._session = FakeSession(Target())
+    backend._security_family = "py32f030x8-rdp1"
+    with pytest.raises(FlashError) as raised:
+        backend.unlock_security()
+    assert raised.value.code is FlashErrorCode.UNLOCK_FAIL
+    assert backend._py32f030_unlock_transition_pending is False
+
+
+def test_stm32f413_security_preserves_non_rdp_options_and_never_uses_level2() -> None:
+    class SecurityFlash:
+        class Operation:
+            ERASE = "erase"
+            PROGRAM = "program"
+
+        def __init__(self, target):
+            self.target = target
+            self.calls = []
+
+        def init(self, operation):
+            self.calls.append(("init", operation))
+
+        def erase_sector(self, address):
+            self.calls.append(("erase", address))
+
+        def program_page(self, address, data):
+            self.calls.append(("program", address, bytes(data)))
+            self.target.optcr[:] = data
+            raise RuntimeError("cannot read register ipsr because core #0 is not halted")
+
+        def uninit(self):
+            self.calls.append(("uninit",))
+
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFFC000
+        length = 4
+        is_flash = True
+
+        def __init__(self, target):
+            self.flash = SecurityFlash(target)
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.optcr = bytearray.fromhex("edaaff7f")
+            self.option_region = OptionRegion(self)
+            super().__init__((self.option_region,))
+
+        def read_memory_block8(self, address, size):
+            if address == 0xE0042000:
+                return (0x10006463).to_bytes(4, "little")[:size]
+            if address == 0x40023C14:
+                return bytes(self.optcr[:size])
+            if address == 0x40023C0C:
+                return (0).to_bytes(4, "little")[:size]
+            raise AssertionError(hex(address))
+
+    target = Target()
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "stm32f413-rdp1"
+
+    assert "activated after reset" in backend.lock_security()
+    assert target.optcr == bytes.fromhex("edbbff7f")
+    assert "mass-erased" in backend.unlock_security()
+    assert target.optcr == bytes.fromhex("edaaff7f")
+    programmed = [
+        call[2] for call in target.option_region.flash.calls if call[0] == "program"
+    ]
+    assert programmed == [bytes.fromhex("edbbff7f"), bytes.fromhex("edaaff7f")]
+    assert all(payload[1] != 0xCC for payload in programmed)
+
+
+def test_stm32g474_security_preserves_every_non_rdp_option_field() -> None:
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FFF7800
+        length = 84
+        is_flash = True
+
+        def __init__(self, _target):
+            self.flash = object()
+
+    class Target(FakeTarget):
+        def __init__(self):
+            words = (
+                0xFFEFF8AA,
+                0x0000FFFF,
+                0x00008000,
+                0x008000FF,
+                0x008000FF,
+                0x00000100,
+                0x0000FFFF,
+                0x00008000,
+                0x008000FF,
+                0x008000FF,
+                0x00010000,
+            )
+            self.options = bytearray(
+                b"".join(word.to_bytes(4, "little") for word in words)
+            )
+            self.physical_rdp = bytearray((0xAA, 0x55))
+            self.writes = []
+            self.option_region = OptionRegion(self)
+            super().__init__((self.option_region,))
+
+        def read_memory_block8(self, address, size):
+            if address == 0xE0042000:
+                return (0x20036469).to_bytes(4, "little")[:size]
+            if address == 0x1FFF75E0:
+                return (512).to_bytes(2, "little")[:size]
+            if address == 0x40022010:
+                return (0).to_bytes(4, "little")[:size]
+            if address == 0x1FFF7800:
+                physical = bytes((self.physical_rdp[0], 0, 0, 0, self.physical_rdp[1], 0, 0, 0))
+                return physical[:size]
+            if address in PyOcdBackend._STM32G474_OPTION_REGISTERS:
+                index = PyOcdBackend._STM32G474_OPTION_REGISTERS.index(address)
+                start = index * 4
+                return bytes(self.options[start : start + size])
+            raise AssertionError(hex(address))
+
+        def write32(self, address, value):
+            self.writes.append((address, value))
+            if address in PyOcdBackend._STM32G474_OPTION_REGISTERS:
+                index = PyOcdBackend._STM32G474_OPTION_REGISTERS.index(address)
+                start = index * 4
+                self.options[start : start + 4] = int(value).to_bytes(4, "little")
+            elif address == 0x40022014 and value == (1 << 17):
+                self.physical_rdp[:] = (self.options[0], self.options[0] ^ 0xFF)
+
+        def flush(self):
+            pass
+
+    target = Target()
+    original = bytes(target.options)
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "stm32g474-rdp1"
+
+    assert "power-cycle reset is required" in backend.lock_security()
+    assert target.options[0] == 0xBB
+    assert target.options[1:] == original[1:]
+    assert "mass-erased" in backend.unlock_security()
+    assert target.options == original
+    optr_writes = [
+        value for address, value in target.writes
+        if address == PyOcdBackend._STM32G474_OPTION_REGISTERS[0]
+    ]
+    assert [value & 0xFF for value in optr_writes] == [0xBB, 0xAA]
+    assert all(value & 0xFF != 0xCC for value in optr_writes)
+
+
+def test_stm32g474_option_programming_rejects_irreversible_rdp2() -> None:
+    class Target:
+        def write32(self, _address, _value):
+            raise AssertionError("RDP2 payload must be rejected before any write")
+
+    desired = bytearray(44)
+    desired[0] = 0xCC
+    with pytest.raises(RuntimeError, match="reversible RDP"):
+        PyOcdBackend._program_stm32g474_option_registers(Target(), bytes(desired))
+
+
+def test_stm32h743_security_updates_mirrors_and_preserves_other_options() -> None:
+    class Target(FakeTarget):
+        def __init__(self):
+            super().__init__()
+            self.current = [0x0BC6AAF0, 0x0BC6AAF0]
+            self.programmed = list(self.current)
+            self.flash_control = [0x31, 0x31]
+            self.option_control = 1
+            self.writes = []
+
+        def read_memory_block8(self, address, size):
+            if address == 0x5C001000:
+                return (0x20036450).to_bytes(4, "little")[:size]
+            if address == 0x1FF1E880:
+                return (2048).to_bytes(2, "little")[:size]
+            if address == 0x52002018:
+                return self.option_control.to_bytes(4, "little")[:size]
+            if address in PyOcdBackend._STM32H743_OPTSR_CUR_REGISTERS:
+                index = PyOcdBackend._STM32H743_OPTSR_CUR_REGISTERS.index(address)
+                return self.current[index].to_bytes(4, "little")[:size]
+            if address in PyOcdBackend._STM32H743_OPTSR_PRG_REGISTERS:
+                index = PyOcdBackend._STM32H743_OPTSR_PRG_REGISTERS.index(address)
+                return self.programmed[index].to_bytes(4, "little")[:size]
+            if address in PyOcdBackend._STM32H743_FLASH_SR_REGISTERS:
+                return (0).to_bytes(4, "little")[:size]
+            if address in PyOcdBackend._STM32H743_FLASH_CR_REGISTERS:
+                index = PyOcdBackend._STM32H743_FLASH_CR_REGISTERS.index(address)
+                return self.flash_control[index].to_bytes(4, "little")[:size]
+            raise AssertionError(hex(address))
+
+        def write32(self, address, value):
+            self.writes.append((address, value))
+            if address in PyOcdBackend._STM32H743_FLASH_KEY_REGISTERS:
+                index = PyOcdBackend._STM32H743_FLASH_KEY_REGISTERS.index(address)
+                self.flash_control[index] &= ~1
+            elif address == 0x52002008:
+                self.option_control &= ~1
+            elif address in PyOcdBackend._STM32H743_OPTSR_PRG_REGISTERS:
+                index = PyOcdBackend._STM32H743_OPTSR_PRG_REGISTERS.index(address)
+                self.programmed[index] = value
+            elif address == 0x52002018 and value == 2:
+                self.current = list(self.programmed)
+                self.option_control &= ~2
+            elif address == 0x52002018:
+                self.option_control = value
+            elif address in PyOcdBackend._STM32H743_FLASH_CR_REGISTERS:
+                index = PyOcdBackend._STM32H743_FLASH_CR_REGISTERS.index(address)
+                self.flash_control[index] = value
+
+        def flush(self):
+            pass
+
+    target = Target()
+    original = tuple(target.current)
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "stm32h743-rdp1"
+
+    assert "global reversible" in backend.lock_security()
+    assert [word >> 8 & 0xFF for word in target.current] == [0xBB, 0xBB]
+    assert all(
+        current & ~PyOcdBackend._STM32H743_RDP_MASK
+        == before & ~PyOcdBackend._STM32H743_RDP_MASK
+        for current, before in zip(target.current, original)
+    )
+    assert "mass-erased" in backend.unlock_security()
+    assert tuple(target.current) == original
+    rdp_writes = [
+        value >> 8 & 0xFF
+        for address, value in target.writes
+        if address in PyOcdBackend._STM32H743_OPTSR_PRG_REGISTERS
+    ]
+    assert rdp_writes == [0xBB, 0xBB, 0xAA, 0xAA]
+    assert 0xCC not in rdp_writes
+
+
+def test_stm32h743_option_programming_rejects_irreversible_rdp2() -> None:
+    class Target:
+        def write32(self, _address, _value):
+            raise AssertionError("RDP2 payload must be rejected before any write")
+
+    with pytest.raises(RuntimeError, match="reversible RDP"):
+        PyOcdBackend._program_stm32h743_option_registers(
+            Target(), (0x0BC6CCF0, 0x0BC6CCF0)
+        )
+
+
+def test_stm32l010_security_preserves_all_non_rdp_option_bytes() -> None:
+    class OptionRegion:
+        name = "mklink_security_option_bytes"
+        start = 0x1FF80000
+        length = 20
+        is_flash = True
+        flash = object()
+
+    class Target(FakeTarget):
+        def __init__(self):
+            self.options = bytearray.fromhex(
+                "aa0055ff70808f7f0000ffff0000ffff00000000"
+            )
+            self.option_region = OptionRegion()
+            super().__init__((self.option_region,))
+            self.control = 0x5
+            self.status = 0xC
+            self.writes = []
+            self.pe_keys = 0
+            self.opt_keys = 0
+
+        def read_memory_block8(self, address, size):
+            values = {
+                0x40015800: 0x10086457,
+                0x1FF8007C: 16,
+                0x4002201C: int.from_bytes(self.options[0:4], "little"),
+                0x40022004: self.control,
+                0x40022018: self.status,
+            }
+            if address == 0x1FF80000:
+                return bytes(self.options[:size])
+            if address in values:
+                return values[address].to_bytes(4, "little")[:size]
+            raise AssertionError(hex(address))
+
+        def write32(self, address, value):
+            self.writes.append((address, value))
+            if address == 0x4002200C:
+                self.pe_keys += 1
+                if self.pe_keys % 2 == 0:
+                    self.control &= ~1
+            elif address == 0x40022014:
+                self.opt_keys += 1
+                if self.opt_keys % 2 == 0:
+                    self.control &= ~(1 << 2)
+            elif address == 0x40022018:
+                self.status &= ~value
+            elif address == 0x1FF80000:
+                self.options[0:4] = value.to_bytes(4, "little")
+                self.status |= 1 << 1
+            elif address == 0x40022004:
+                self.control = value
+
+        def flush(self):
+            pass
+
+    target = Target()
+    original = bytes(target.options)
+    backend = PyOcdBackend()
+    backend._session = FakeSession(target)
+    backend._security_family = "stm32l010x4-rdp1"
+
+    assert "power-cycle reset is required" in backend.lock_security()
+    assert target.options[0] == 0xBB
+    assert target.options[2] == 0x44
+    assert int.from_bytes(target.options[:4], "little") == 0x014400BB
+    assert target.options[4:] == original[4:]
+
+    # Model the required POR loading the physical RDP byte into FLASH_OPTR.
+    assert "erased" in backend.unlock_security()
+    assert int.from_bytes(target.options[:4], "little") == 0x015500AA
+    assert target.options[4:] == original[4:]
+    payloads = [value for address, value in target.writes if address == 0x1FF80000]
+    assert payloads == [0x014400BB, 0x015500AA]
+    assert all(value & 0xFF != 0xCC for value in payloads)
+    assert target.control & 0x5 == 0x5
+
+
+def test_stm32l010_option_comparison_ignores_only_reserved_bytes() -> None:
+    desired = bytes.fromhex("aa00550170808f7f0000ffff0000ffff00000000")
+    normalised = bytes.fromhex("aa01550170808f7f0000ffff0000ffff00000000")
+
+    assert PyOcdBackend._stm32l010_options_match(normalised, desired) is True
+    changed_user = bytearray(normalised)
+    changed_user[4] ^= 1
+    assert PyOcdBackend._stm32l010_options_match(bytes(changed_user), desired) is False
+
+
+def test_stm32f103_locked_options_are_reconstructed_from_shadow_registers() -> None:
+    class Target:
+        def read_memory_block8(self, address, size):
+            if address == 0x1FFFF800:
+                raise RuntimeError("FAULT ACK")
+            if address == 0x4002201C:
+                return (0x03FFFFFE).to_bytes(4, "little")[:size]
+            if address == 0x40022020:
+                return (0xFFFFFFFF).to_bytes(4, "little")[:size]
+            raise AssertionError(hex(address))
+
+    options, directly_readable = PyOcdBackend._stm32f103_option_snapshot(Target())
+
+    assert directly_readable is False
+    assert options == bytes([0x00, 0xFF] + [0xFF, 0x00] * 7)
+
+
 def test_hpm_rom_backend_programs_without_flm_and_verifies_by_readback(
     tmp_path: Path,
 ) -> None:
@@ -227,6 +1061,43 @@ def test_hpm_rom_backend_programs_without_flm_and_verifies_by_readback(
         ("reset",),
         ("close",),
     ]
+
+
+def test_hpm_power_cycle_reset_restores_selected_voltage(monkeypatch) -> None:
+    calls = []
+
+    class Device:
+        def set_power_off(self):
+            calls.append(("power-off",))
+
+        def set_power_on(self, voltage_mv, *, confirm_5v=False):
+            calls.append(("power-on", voltage_mv, confirm_5v))
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("mklink.cmsis_dap.backend.time.sleep", lambda delay: calls.append(("wait", delay)))
+    backend = HpmRomBackend(
+        device_factory=lambda **_kwargs: Device(),
+        port_resolver=lambda _probe: "probe-port",
+    )
+    backend.connect(
+        "probe",
+        "HPM5300",
+        1_000_000,
+        board="hpm5300evk",
+        reset_mode="power-cycle",
+        reset_voltage_mv=5000,
+    )
+
+    backend.reset_run()
+
+    assert calls == [
+        ("power-off",),
+        ("wait", 3.0),
+        ("power-on", 5000, True),
+    ]
+    backend.disconnect()
 
 
 def test_hpm_rom_backend_rejects_hex_and_reports_verify_mismatch(tmp_path: Path) -> None:
@@ -322,7 +1193,7 @@ def test_routing_backend_selects_hpm_rom_only_for_hpm_targets() -> None:
     assert "board" not in calls[2][1]
 
 
-def test_connect_halts_target_and_disconnect_closes_session() -> None:
+def test_connect_relies_on_pyocd_connect_mode_and_disconnect_closes_session() -> None:
     session = FakeSession()
     backend = PyOcdBackend(session_factory=lambda probe, options: session)
 
@@ -330,7 +1201,7 @@ def test_connect_halts_target_and_disconnect_closes_session() -> None:
     backend.disconnect()
 
     assert session.open_calls == 1
-    assert session.target.reset_and_halt_calls == 1
+    assert session.target.reset_and_halt_calls == 0
     assert session.close_calls == 1
 
 
@@ -426,6 +1297,7 @@ def test_connect_builds_supported_options_and_reconnect_closes_old(
                 "frequency": 2_000_000,
                 "connect_mode": "under-reset",
                 "auto_unlock": False,
+                "reset_type": "hardware",
                 "pack": str(pack.resolve()),
             },
         ),
@@ -569,6 +1441,51 @@ def test_unknown_target_with_builtin_flm_uses_generic_target_and_catalog_ram(
     assert observed["payloads"] == (b"flm",)
     assert observed["ram"] == (0x20000000, 0x10000)
     assert observed["regions"] == ()
+    assert backend._algorithm_reset_required is True
+    assert session.target.reset_and_halt_calls == 0
+    backend.disconnect()
+
+
+def test_stm32l010_custom_flm_uses_l031_debug_topology(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    flm = tmp_path / "STM32L0xx_16.FLM"
+    flm.write_bytes(b"flm")
+    session = FakeSession()
+    observed = {}
+
+    class Sequence:
+        def insert_before(self, _task, item):
+            _name, callback = item
+            callback()
+
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.backend._install_custom_flm_regions",
+        lambda *_args: None,
+    )
+
+    def factory(_probe, options):
+        observed["options"] = options
+        original_open = session.open
+
+        def open_session():
+            session.delegate.will_init_target(session.target, Sequence())
+            original_open()
+
+        session.open = open_session
+        return session
+
+    backend = PyOcdBackend(session_factory=factory)
+    backend.connect(
+        object(),
+        "STM32L010F4P6",
+        1_000_000,
+        custom_flm_paths=(str(flm),),
+        custom_flm_digests=(hashlib.sha256(b"flm").hexdigest(),),
+    )
+
+    assert observed["options"]["target_override"] == "stm32l031x6"
+    assert backend._algorithm_reset_required is True
     backend.disconnect()
 
 
@@ -932,6 +1849,50 @@ def test_custom_flm_replaces_overlapping_builtin_region_on_cloned_map(
     assert len(target.memory_map.regions) == 2
 
 
+@pytest.mark.parametrize("region_name", ["mklink_custom_flm_0", "mklink_security_option_bytes"])
+def test_custom_flm_interrupt_mask_is_restored_after_algorithm_uninit(region_name) -> None:
+    events = []
+
+    class Flash:
+        def _call_function(self, value):
+            events.append(("call", target.primask, value))
+            return 7
+
+        def uninit(self):
+            events.append(("uninit", target.primask))
+
+    class Target:
+        def __init__(self):
+            self.primask = 0
+            self.memory_map = (
+                SimpleNamespace(name=region_name, flash=Flash()),
+            )
+
+        def read_core_register(self, name):
+            assert name == "primask"
+            return self.primask
+
+        def write_core_register(self, name, value):
+            assert name == "primask"
+            self.primask = value
+            events.append(("primask", value))
+
+    target = Target()
+    flash = target.memory_map[0].flash
+    _mask_custom_flm_interrupts(target)
+
+    assert flash._call_function(3) == 7
+    flash.uninit()
+
+    assert events == [
+        ("primask", 1),
+        ("call", 1, 3),
+        ("uninit", 1),
+        ("primask", 0),
+    ]
+    assert target.primask == 0
+
+
 def test_custom_flm_flash_calls_optional_verify_entry(tmp_path: Path, monkeypatch) -> None:
     from pyocd.core.memory_map import MemoryMap, RamRegion
     from pyocd.flash.flash import Flash
@@ -1054,6 +2015,71 @@ def test_chip_and_sector_erase_use_exact_modes_and_sorted_unique_addresses() -> 
     backend.disconnect()
 
 
+def test_custom_flm_resets_and_halts_once_before_erase_and_program(
+    tmp_path: Path,
+) -> None:
+    events = []
+
+    class Eraser:
+        def __init__(self, _session, _mode):
+            pass
+
+        def erase(self, addresses=None):
+            events.append(("erase", addresses))
+
+    class Programmer:
+        def __init__(self, _session, **_kwargs):
+            pass
+
+        def program(self, path, **_kwargs):
+            events.append(("program", path))
+
+    firmware = tmp_path / "firmware.bin"
+    firmware.write_bytes(b"hello world")
+    target = FakeTarget((FakeRegion(0x08000000, 0x4000),))
+    backend, _session = connected_backend(
+        target=target,
+        programmer_factory=Programmer,
+        eraser_factory=Eraser,
+    )
+    backend._algorithm_reset_required = True
+
+    backend.erase_sectors([0x08000000])
+    backend.program(ImageInspection(
+        "test",
+        file_path=str(firmware),
+        format="bin",
+        base_address=0x08000000,
+        start=0x08000000,
+        end=0x0800000B,
+    ))
+
+    assert target.reset_and_halt_calls == 1
+    assert [event[0] for event in events] == ["erase", "program"]
+    backend.disconnect()
+
+
+@pytest.mark.parametrize(("ipsr", "control"), [(3, 0), (0, 2), (0, 1)])
+def test_custom_flm_unsafe_reset_context_is_rejected_before_erase(ipsr, control):
+    erased = []
+    class Eraser:
+        def __init__(self, *args):
+            pass
+        def erase(self, *args):
+            erased.append(True)
+
+    target = FakeTarget((FakeRegion(0x08000000, 0x4000),))
+    target.read_core_register = lambda name: {"ipsr": ipsr, "control": control}[name]
+    backend, _ = connected_backend(target=target, eraser_factory=Eraser)
+    backend._algorithm_reset_required = True
+    with pytest.raises(FlashError, match="Flash was not erased") as raised:
+        backend.erase_sectors([0x08000000])
+    assert raised.value.code is FlashErrorCode.CONNECT_FAIL
+    assert not erased
+    assert not backend._algorithm_reset_done
+    backend.disconnect()
+
+
 @pytest.mark.parametrize(
     ("regions", "addresses", "code"),
     [
@@ -1094,32 +2120,41 @@ def test_sector_erase_accepts_real_flash_region_with_rx_access() -> None:
     backend.disconnect()
 
 
-def test_program_bin_passes_base_and_hex_does_not(tmp_path: Path) -> None:
+def test_program_bin_passes_base_and_hex_queues_sparse_data(tmp_path: Path) -> None:
     calls = []
 
     class Programmer:
-        def __init__(self, session):
+        def __init__(self, session, *, chip_erase):
+            assert chip_erase == "sector"
             calls.append(("create", session))
 
         def program(self, path, **kwargs):
             calls.append(("program", path, kwargs))
 
+        def add_file(self, stream, **kwargs):
+            calls.append(("add", stream.read(), kwargs))
+
+        def commit(self):
+            calls.append(("commit",))
+
     binary = tmp_path / "firmware.bin"
     binary.write_bytes(b"bin")
     ihex = tmp_path / "firmware.hex"
-    ihex.write_text(":00000001FF\n", encoding="ascii")
+    ihex.write_text(":03000000616263D7\n:00000001FF\n", encoding="ascii")
     backend, session = connected_backend(programmer_factory=Programmer)
 
     backend.program(
         ImageInspection("bin", file_path=str(binary), format="bin", base_address=0x80000000)
     )
-    backend.program(ImageInspection("hex", file_path=str(ihex), format="hex"))
+    backend.program(ImageInspection("hex", file_path=str(ihex), format="hex",
+                                    start=0, end=3, segments=(ImageSegment(0, 3),)))
 
     assert calls == [
         ("create", session),
         ("program", str(binary), {"base_address": 0x80000000}),
         ("create", session),
-        ("program", str(ihex), {}),
+        ("add", b"abc", {"file_format": "bin", "base_address": 0}),
+        ("commit",),
     ]
     backend.disconnect()
 
@@ -1128,7 +2163,8 @@ def test_program_forwards_pyocd_progress_callback(tmp_path: Path) -> None:
     reported = []
 
     class Programmer:
-        def __init__(self, _session, *, progress):
+        def __init__(self, _session, *, progress, chip_erase):
+            assert chip_erase == "sector"
             progress(0.5)
 
         def program(self, _path, **_kwargs):
@@ -1162,8 +2198,8 @@ def test_program_disables_memory_scans_for_custom_flm_regions(tmp_path: Path) ->
         def program(self, path, **kwargs):
             calls.append(("program", path, kwargs))
 
-    firmware = tmp_path / "external.hex"
-    firmware.write_text(":00000001FF\n", encoding="ascii")
+    firmware = tmp_path / "external.bin"
+    firmware.write_bytes(b"data")
     target = FakeTarget((FakeRegion(
         0x90000000,
         0x800000,
@@ -1174,14 +2210,15 @@ def test_program_disables_memory_scans_for_custom_flm_regions(tmp_path: Path) ->
     backend.program(ImageInspection(
         "external",
         file_path=str(firmware),
-        format="hex",
+        format="bin",
+        base_address=0x90000000,
         start=0x90000000,
         end=0x90001000,
     ))
 
     assert calls == [
-        ("create", session, {"smart_flash": False, "keep_unwritten": False}),
-        ("program", str(firmware), {}),
+        ("create", session, {"chip_erase": "sector", "smart_flash": False, "keep_unwritten": False}),
+        ("program", str(firmware), {"base_address": 0x90000000}),
     ]
     backend.disconnect()
 
@@ -1191,7 +2228,7 @@ def test_program_maps_locked_error_and_closes_session(tmp_path: Path) -> None:
     firmware.write_bytes(b"x")
 
     class Programmer:
-        def __init__(self, session):
+        def __init__(self, session, **kwargs):
             pass
 
         def program(self, path, **kwargs):
@@ -1213,7 +2250,7 @@ def test_program_maps_file_disappearance_to_file_not_found(tmp_path: Path) -> No
     firmware.write_bytes(b"x")
 
     class VanishedProgrammer:
-        def __init__(self, session):
+        def __init__(self, session, **kwargs):
             pass
 
         def program(self, path, **kwargs):
@@ -1459,6 +2496,8 @@ def test_verify_sparse_hex_reads_only_inspected_segments(tmp_path: Path) -> None
         file_path=str(firmware),
         format="hex",
         segments=(ImageSegment(first, first + 2), ImageSegment(second, second + 2)),
+        start=first,
+        end=second + 2,
     )
 
     backend.verify(image)
@@ -1579,6 +2618,107 @@ def test_reset_uses_stored_and_overridden_public_reset_types() -> None:
     with pytest.raises(ValueError):
         backend.reset_run("mystery")
     backend.disconnect()
+
+
+@pytest.mark.parametrize("state_name", ["HALTED", "LOCKUP", "RESET", "RUNNING", "SLEEPING"])
+@pytest.mark.parametrize("mode", ["default", "software", "hardware"])
+def test_final_reset_checks_execution_and_never_resumes_stranded_algorithm(state_name, mode):
+    from mklink.cmsis_dap.pyocd_runtime import import_pyocd_attr
+    Target = import_pyocd_attr("pyocd.core.target", "Target")
+    target = FakeTarget()
+    target.get_state = lambda: Target.State[state_name]
+    backend, session = connected_backend(target=target)
+    session.options = {}
+    backend._algorithm_reset_done = True
+    if state_name in {"RUNNING", "SLEEPING"}:
+        backend.reset_run(mode)
+        assert session.options == {}
+    else:
+        with pytest.raises(FlashError, match="reset did not start") as raised:
+            backend.reset_run(mode)
+        assert raised.value.code is FlashErrorCode.RESET_FAIL
+        assert session.options["resume_on_disconnect"] is False
+    backend.disconnect()
+
+
+def test_power_cycle_reset_uses_exact_probe_and_validated_restore_voltage() -> None:
+    calls = []
+    probe = FakeProbe("MKLINK-POWER")
+    backend = PyOcdBackend(
+        session_factory=lambda selected, _options: FakeSession(),
+        probe_provider=lambda: [probe],
+        power_cycle=lambda identifier, voltage: calls.append((identifier, voltage)),
+    )
+    backend.connect(
+        "MKLINK-POWER",
+        "STM32F103RE",
+        1_000_000,
+        reset_mode="power-cycle",
+        reset_voltage_mv=3300,
+    )
+
+    backend.reset_run()
+
+    assert calls == [("MKLINK-POWER", 3300)]
+    backend.disconnect()
+
+
+def test_power_cycle_reset_rejects_missing_or_invalid_restore_voltage() -> None:
+    backend = PyOcdBackend(
+        session_factory=lambda _probe, _options: FakeSession(),
+    )
+    backend.connect(object(), "STM32F103RE", 1_000_000, reset_mode="power-cycle")
+    error = assert_error(FlashErrorCode.RESET_FAIL, backend.reset_run)
+    assert "validated restore voltage" in error.message
+    backend.disconnect()
+
+    with pytest.raises(ValueError, match="1800, 3300, or 5000"):
+        backend.connect(
+            object(),
+            "STM32F103RE",
+            1_000_000,
+            reset_mode="power-cycle",
+            reset_voltage_mv=2500,
+        )
+
+
+def test_default_power_cycle_uses_matching_cdc_commands(monkeypatch) -> None:
+    calls = []
+
+    class Bridge:
+        def __init__(self, port):
+            calls.append(("bridge", port))
+
+        def connect(self):
+            calls.append(("connect",))
+            return True
+
+        def send_command(self, command, timeout):
+            calls.append(("command", command, timeout))
+
+        def close(self):
+            calls.append(("close",))
+
+    monkeypatch.setattr("mklink.bridge.MKLinkSerialBridge", Bridge)
+    monkeypatch.setattr(
+        "mklink.discovery.discover_mklink_command_ports",
+        lambda: [SimpleNamespace(device="COM42", serial_number="probe-42")],
+    )
+    monkeypatch.setattr(
+        "mklink.cmsis_dap.backend.time.sleep",
+        lambda delay: calls.append(("wait", delay)),
+    )
+
+    _power_cycle_mklink_probe("PROBE-42", 1800)
+
+    assert calls == [
+        ("bridge", "COM42"),
+        ("connect",),
+        ("command", "cmd.set_power_off()", 10.0),
+        ("wait", 3.0),
+        ("command", "cmd.set_power_on(1800)", 10.0),
+        ("close",),
+    ]
 
 
 def test_memory_regions_converts_only_flash_and_ram() -> None:

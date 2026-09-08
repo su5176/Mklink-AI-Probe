@@ -157,6 +157,7 @@ class JobBody(BaseModel):
     frequency: int = Field(default=1_000_000, ge=1, le=10_000_000)
     connect_mode: str = "halt"
     reset_mode: str = "default"
+    reset_voltage_mv: Optional[int] = None
     base_address: Optional[int] = None
     sector_addresses: List[int] = Field(default_factory=list)
     board: Optional[str] = None
@@ -251,6 +252,7 @@ def _flash_status(code: FlashErrorCode) -> int:
         FlashErrorCode.BIN_ADDRESS_MISSING,
         FlashErrorCode.IMAGE_OUT_OF_RANGE,
         FlashErrorCode.TARGET_LOCKED,
+        FlashErrorCode.SECURITY_NOT_SUPPORTED,
     }:
         return 422
     if code is FlashErrorCode.PACK_INDEX_UNAVAILABLE:
@@ -259,9 +261,11 @@ def _flash_status(code: FlashErrorCode) -> int:
         FlashErrorCode.PACK_DOWNLOAD_FAIL,
         FlashErrorCode.PACK_INTEGRITY_ERROR,
         FlashErrorCode.CONNECT_FAIL,
+        FlashErrorCode.UNLOCK_FAIL,
         FlashErrorCode.ERASE_FAIL,
         FlashErrorCode.PROGRAM_FAIL,
         FlashErrorCode.VERIFY_FAIL,
+        FlashErrorCode.LOCK_FAIL,
         FlashErrorCode.RESET_FAIL,
     }:
         return 502
@@ -511,6 +515,9 @@ def _refresh_pack_index(
 
 
 def _upload_path(paths: object, file_name: str, allowed_suffixes: Sequence[str]) -> Path:
+    from mklink.file_content import is_metadata_file
+    if is_metadata_file(file_name):
+        raise ValueError("macOS metadata is not a firmware/algorithm file")
     suffix = Path(file_name or "").suffix.casefold()
     if suffix not in set(allowed_suffixes):
         raise ValueError("upload must use one of: {}".format(", ".join(allowed_suffixes)))
@@ -525,6 +532,9 @@ def _upload_path(paths: object, file_name: str, allowed_suffixes: Sequence[str])
 
 def _local_firmware_path(raw_path: str, limit: int) -> Path:
     source = Path(str(raw_path or "")).expanduser().resolve()
+    from mklink.file_content import is_metadata_file
+    if is_metadata_file(source):
+        raise ValueError("macOS metadata is not a firmware file")
     if source.suffix.casefold() not in (".bin", ".hex"):
         raise ValueError("firmware path must use .bin or .hex")
     if not source.is_file():
@@ -725,6 +735,24 @@ def _captured_image_flash_regions(
         and getattr(algorithm, "pack_path", None)
         and os.path.normcase(os.path.abspath(str(algorithm.pack_path))) == pack_path
     ]
+    def range_is_covered(start: int, end: int) -> bool:
+        cursor = start
+        for candidate in sorted(
+            (
+                region for region in base_regions
+                if region.is_flash and region.writable
+            ),
+            key=lambda region: (region.start, region.end),
+        ):
+            if candidate.end <= cursor:
+                continue
+            if candidate.start > cursor:
+                return False
+            cursor = max(cursor, candidate.end)
+            if cursor >= end:
+                return True
+        return False
+
     expanded = []
     overrides = []
     for region in base_regions:
@@ -742,6 +770,20 @@ def _captured_image_flash_regions(
             for algorithm in algorithms
             if int(getattr(algorithm, "flash_start", -1)) == region.start
             and int(getattr(algorithm, "flash_size", 0)) > region.length
+            and not range_is_covered(
+                int(getattr(algorithm, "flash_start", -1)),
+                int(getattr(algorithm, "flash_start", -1))
+                + int(getattr(algorithm, "flash_size", 0)),
+            )
+            and not any(
+                other is not region
+                and int(getattr(algorithm, "flash_start", -1)) < other.end
+                and other.start < (
+                    int(getattr(algorithm, "flash_start", -1))
+                    + int(getattr(algorithm, "flash_size", 0))
+                )
+                for other in base_regions
+            )
         ]
         if not candidates:
             expanded.append(region)
@@ -921,6 +963,74 @@ def _job_flash_algorithms(
     return []
 
 
+def _daplink_memory_configuration(
+    services: OnlineFlashServices,
+    target: TargetRecord,
+    address: int,
+    size: int,
+) -> Dict[str, object]:
+    """Attach the bundled algorithm that gives an exact alias its memory map."""
+
+    if target.source != "daplink-builtin":
+        return {}
+    end = address + size
+    if end > 0x1_0000_0000:
+        raise FlashError(
+            FlashErrorCode.IMAGE_OUT_OF_RANGE,
+            "memory read exceeds the 32-bit target address space",
+        )
+    from mklink.cmsis_dap.algorithm_catalog import (
+        FlashAlgorithmError,
+        discover_flash_algorithms,
+        resolve_firmware_algorithms,
+    )
+
+    try:
+        algorithms = discover_flash_algorithms(target.part_number, paths=services.paths)
+        selections = resolve_firmware_algorithms(
+            algorithms,
+            ((address, end),),
+        )
+    except FlashAlgorithmError as error:
+        raise FlashError(
+            FlashErrorCode.TARGET_NOT_SUPPORTED,
+            str(error),
+        ) from error
+    selected = [selection.algorithm for selection in selections]
+    records = []
+    for algorithm in selected:
+        path = algorithm.custom_path or algorithm.builtin_blob_path
+        digest = algorithm.custom_sha256 or algorithm.builtin_blob_sha256
+        if not path or not digest:
+            raise FlashError(
+                FlashErrorCode.TARGET_NOT_SUPPORTED,
+                "DAPLink builtin target algorithm asset is unavailable",
+            )
+        records.append((
+            str(path),
+            str(digest),
+            (int(algorithm.flash_start), int(algorithm.flash_size)),
+        ))
+    ram_regions = {
+        (int(algorithm.ram_start), int(algorithm.ram_size))
+        for algorithm in selected
+        if int(getattr(algorithm, "ram_size", 0)) > 0
+    }
+    if len(ram_regions) != 1:
+        raise FlashError(
+            FlashErrorCode.TARGET_NOT_SUPPORTED,
+            "DAPLink builtin target has ambiguous algorithm RAM configuration",
+        )
+    ram_start, ram_size = next(iter(ram_regions))
+    return {
+        "custom_flm_paths": tuple(record[0] for record in records),
+        "custom_flm_digests": tuple(record[1] for record in records),
+        "custom_flm_regions": tuple(record[2] for record in records),
+        "custom_flm_ram_start": ram_start,
+        "custom_flm_ram_size": ram_size,
+    }
+
+
 def _start_job_with_configuration(
     services: OnlineFlashServices,
     body: JobBody,
@@ -929,6 +1039,15 @@ def _start_job_with_configuration(
     with services.configuration_lock:
         from mklink.hpm_config import is_hpm_target, normalize_hpm_configuration
 
+        if body.reset_mode == "power-cycle":
+            if body.reset_voltage_mv not in {1800, 3300, 5000}:
+                raise ValueError(
+                    "power-cycle reset requires reset_voltage_mv to be 1800, 3300, or 5000"
+                )
+        elif body.reset_voltage_mv is not None:
+            raise ValueError(
+                "reset_voltage_mv is only valid for power-cycle reset"
+            )
         hpm_target = is_hpm_target(target.part_number)
         board = body.board
         hpm_flash_cfg = body.hpm_flash_cfg
@@ -945,6 +1064,51 @@ def _start_job_with_configuration(
         pack_flm_regions = ()
         custom_flm_ram_start = None
         custom_flm_ram_size = None
+        security_family = None
+        security_flm_path = None
+        security_flm_digest = None
+        security_flm_region = None
+        if any(action in body.actions for action in ("unlock", "lock")):
+            from mklink.cmsis_dap.security import require_security_capability
+
+            security = require_security_capability(target.part_number)
+            assert security.algorithm_path is not None
+            security_family = security.family
+            security_flm_path = str(security.algorithm_path)
+            security_flm_digest = security.algorithm_sha256
+            security_flm_region = (security.option_address, security.option_size)
+            power_cycle_security = {
+                "gd32f303xe-spc",
+                "py32f030x8-rdp1",
+                "stm32g474-rdp1",
+                "stm32h743-rdp1",
+                "stm32l010x4-rdp1",
+            }
+            under_reset_unlock_security = power_cycle_security - {
+                "py32f030x8-rdp1",
+                "gd32f303xe-spc",
+            }
+            if security.family == "gd32f303xe-spc" and body.connect_mode not in {"halt", "under-reset"}:
+                raise FlashError(
+                    FlashErrorCode.SECURITY_NOT_SUPPORTED,
+                    "GD32F303 加锁/解锁必须使用普通暂停连接或复位下连接",
+                )
+            if security.family in power_cycle_security and (
+                body.reset_mode != "power-cycle" or "reset" not in body.actions
+            ):
+                raise FlashError(
+                    FlashErrorCode.SECURITY_NOT_SUPPORTED,
+                    "该器件加锁/解锁必须选择断电复位并在操作后执行复位",
+                )
+            if (
+                security.family in under_reset_unlock_security
+                and "unlock" in body.actions
+                and body.connect_mode != "under-reset"
+            ):
+                raise FlashError(
+                    FlashErrorCode.SECURITY_NOT_SUPPORTED,
+                    "该器件解锁必须使用复位下连接，避免目标程序与选项字节操作并发",
+                )
         inspection = None
         if any(action in body.actions for action in ("program", "verify")):
             if not body.image_id:
@@ -1068,10 +1232,15 @@ def _start_job_with_configuration(
             frequency=body.frequency,
             connect_mode=body.connect_mode,
             reset_mode=body.reset_mode,
+            reset_voltage_mv=body.reset_voltage_mv,
             base_address=body.base_address,
             sector_addresses=tuple(body.sector_addresses),
             board=board,
             hpm_flash_cfg=hpm_flash_cfg,
+            security_family=security_family,
+            security_flm_path=security_flm_path,
+            security_flm_digest=security_flm_digest,
+            security_flm_region=security_flm_region,
         )
         job_id = services.job_manager.start(job_request)
         return job_id, services.job_manager.get(job_id)
@@ -1168,6 +1337,13 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             and region.sector_size > 0
         ]
 
+    @router.get("/targets/{part_number}/security")
+    async def target_security(part_number: str) -> object:
+        target = await _blocking(_resolved_target, services.catalog, part_number)
+        from mklink.cmsis_dap.security import security_capability
+
+        return security_capability(target.part_number).public()
+
     @router.get("/targets/{part_number}/algorithms")
     async def target_flash_algorithms(part_number: str) -> object:
         target = await _blocking(_resolved_target, services.catalog, part_number)
@@ -1236,6 +1412,13 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
         address = await _blocking(_parse_base_address, body.address)
         if address is None:
             raise HTTPException(status_code=422, detail="address is required")
+        flash_configuration = await _blocking(
+            _daplink_memory_configuration,
+            services,
+            target,
+            address,
+            body.size,
+        )
         request = JobRequest(
             actions=("connect", "disconnect"),
             preempt_ai=body.preempt_ai,
@@ -1247,6 +1430,7 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             reset_mode=body.reset_mode,
             board=body.board,
             hpm_flash_cfg=body.hpm_flash_cfg,
+            **flash_configuration,
         )
         data = await _blocking(
             services.job_manager.read_memory,
@@ -1283,6 +1467,13 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
                 status_code=422,
                 detail="chunk_sizes must contain positive sizes that add up to size",
             )
+        flash_configuration = await _blocking(
+            _daplink_memory_configuration,
+            services,
+            target,
+            address,
+            body.size,
+        )
         request = JobRequest(
             actions=("connect", "disconnect"),
             preempt_ai=body.preempt_ai,
@@ -1294,6 +1485,7 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             reset_mode=body.reset_mode,
             board=body.board,
             hpm_flash_cfg=body.hpm_flash_cfg,
+            **flash_configuration,
         )
         filename = "read-0x{:08X}-{}.bin".format(address, body.size)
         return StreamingResponse(
@@ -1532,14 +1724,14 @@ def create_online_flash_router(services: OnlineFlashServices) -> APIRouter:
             source = await _blocking(
                 _local_firmware_path, path, services.upload_limit
             )
-            stat = await _blocking(source.stat)
+            from mklink.file_content import source_fingerprint
+            fingerprint = await _blocking(source_fingerprint, source)
         except (OSError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error))
         return {
             "available": True,
             "file_name": source.name,
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
+            **fingerprint,
         }
 
     @router.get("/images/{image_id}/preview")

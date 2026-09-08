@@ -22,6 +22,8 @@ import type {
 import { toHexPayload } from '../lib/rttTransmit'
 import type { RttEncoding } from '../lib/desktopSettings'
 import { API_BASE } from '../lib/runtimeEndpoint'
+import { trackSymbolSource } from '../lib/trackedSymbolSource'
+import { refreshRttAddressForSymbol } from '../lib/rttSymbolAddress'
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const headers = new Headers(options?.headers)
@@ -88,7 +90,18 @@ export function useMklinkApi() {
   ): Promise<UploadedFileSource> {
     const body = new FormData()
     body.append('file', file)
-    return api(`/api/files/${kind}`, { method: 'POST', body })
+    const uploaded = await api<UploadedFileSource>(`/api/files/${kind}`, { method: 'POST', body })
+    if (kind === 'symbol') trackSymbolSource(file, uploaded, {
+      upload: next => {
+        const data = new FormData()
+        data.append('file', next)
+        return api<UploadedFileSource>('/api/files/symbol', { method: 'POST', body: data })
+      },
+      connected: () => deviceStatus.value.connected,
+      parse: path => parseAxf(path),
+      refreshRtt: path => refreshRttAddressForSymbol(window.localStorage, path, findRtt),
+    })
+    return uploaded
   }
 
   async function getConfigStatus(): Promise<ConfigStatus> {

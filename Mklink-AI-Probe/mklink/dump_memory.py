@@ -953,10 +953,20 @@ class DumpMemoryStreamSession:
     def stop(self) -> None:
         if not self.started:
             return
+        command = build_dump_mem_command(
+            self.region_pairs, DUMP_MEMORY_STOP_PERIOD,
+        )
+        synchronize = getattr(self.bridge, "_stop_stream_and_sync", None)
+        if callable(synchronize):
+            try:
+                # A fixed delay can leave the stop prompt queued, completing
+                # the next RAM write/read before its own reply arrives.
+                if not synchronize((command + "\n").encode("utf-8")):
+                    raise TimeoutError("dump-memory stop did not restore command mode")
+            finally:
+                self.started = False
+            return
         try:
-            command = build_dump_mem_command(
-                self.region_pairs, DUMP_MEMORY_STOP_PERIOD,
-            )
             self.bridge._write_raw((command + "\n").encode("utf-8"))
             if self.stop_grace_s:
                 time.sleep(self.stop_grace_s)

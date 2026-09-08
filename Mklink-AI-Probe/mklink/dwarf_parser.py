@@ -347,7 +347,7 @@ def _finalize_array_size(
 
 
 class DwarfCache:
-    CACHE_SCHEMA_VERSION = 4
+    CACHE_SCHEMA_VERSION = 5
 
     def __init__(self, cache_dir: str | None = None):
         self.cache_dir = Path(cache_dir or (Path.home() / ".mklink" / "dwarf_cache"))
@@ -355,11 +355,10 @@ class DwarfCache:
 
     def _source_metadata(self, source: str) -> dict:
         p = Path(source)
-        stat = p.stat()
+        from mklink.file_content import source_fingerprint
         return {
             "source": str(p.resolve()),
-            "size": stat.st_size,
-            "mtime_ns": stat.st_mtime_ns,
+            **source_fingerprint(p),
         }
 
     def _key(self, source: str, backend: str, parser_version: str) -> Path:
@@ -397,12 +396,13 @@ class DwarfCache:
         *,
         backend: str,
         parser_version: str,
+        source_metadata: dict | None = None,
     ) -> None:
         data = {
             "cache_schema_version": self.CACHE_SCHEMA_VERSION,
             "backend": backend,
             "parser_version": parser_version,
-            "source_metadata": self._source_metadata(source),
+            "source_metadata": source_metadata or self._source_metadata(source),
             "info": _info_to_json(info),
         }
         self._key(source, backend, parser_version).write_text(
@@ -454,7 +454,11 @@ def load_dwarf_info(
         )
         if cached:
             return cached
+    from mklink.file_content import source_fingerprint
+    before = source_fingerprint(source)
     info = selected.dwarf_info(source)
+    if source_fingerprint(source) != before:
+        raise OSError("AXF changed while parsing; wait for the build to finish")
     if cache is not None:
         try:
             cache.save(
@@ -462,6 +466,7 @@ def load_dwarf_info(
                 info,
                 backend=selected.name,
                 parser_version=selected.parser_version,
+                source_metadata={"source": str(Path(source).resolve()), **before},
             )
         except OSError:
             pass

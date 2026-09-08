@@ -12,6 +12,7 @@ import sys
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Sequence
 
 
@@ -79,6 +80,40 @@ def _is_public_skill_file(relative: PurePosixPath) -> bool:
     )
 
 
+def _builtin_flm_assets():
+    import importlib.util
+
+    path = REPO_ROOT / "skills" / "tauri-gui-builder" / "scripts" / "builtin_flm_assets.py"
+    spec = importlib.util.spec_from_file_location("mklink_builtin_flm_assets", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load built-in algorithm asset validator")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _requires_builtin_flm(version: str) -> bool:
+    try:
+        parts = tuple(int(part) for part in version.split(".")[:3])
+    except ValueError:
+        return version.startswith("0.2.")
+    return parts >= (0, 2, 0)
+
+
+def _append_builtin_flm_assets(path: Path, root_name: str) -> None:
+    assets = _builtin_flm_assets()
+    source = assets.default_bundle_root(REPO_ROOT)
+    manifest = assets.validate_bundle(source)
+    with zipfile.ZipFile(path, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        for file_path in sorted(item for item in source.rglob("*") if item.is_file()):
+            relative = file_path.relative_to(source).as_posix()
+            archive.write(file_path, f"{root_name}/mklink/builtin_flm/{relative}")
+    print(
+        "Included built-in algorithms in Skill archive: "
+        f"{manifest['target_count']} targets, {manifest['blob_count']} blobs"
+    )
+
+
 def _validate_skill_archive(path: Path, version: str) -> None:
     with zipfile.ZipFile(path) as archive:
         files = {
@@ -119,6 +154,22 @@ def _validate_skill_archive(path: Path, version: str) -> None:
         plugin = json.loads(archive.read(str(plugin_path)))
         if str(plugin.get("version")) != version:
             raise ValueError("Skill archive plugin version does not match the release")
+        if _requires_builtin_flm(version):
+            bundle_prefix = PurePosixPath(root, "mklink", "builtin_flm")
+            bundle_files = [
+                info for info in archive.infolist()
+                if not info.is_dir()
+                and PurePosixPath(info.filename).is_relative_to(bundle_prefix)
+            ]
+            if not bundle_files:
+                raise ValueError("0.2.0 Skill archive requires built-in algorithm assets")
+            with TemporaryDirectory(prefix="mklink-skill-flm-") as temporary:
+                extraction_root = Path(temporary)
+                for info in bundle_files:
+                    archive.extract(info, extraction_root)
+                _builtin_flm_assets().validate_bundle(
+                    extraction_root.joinpath(*bundle_prefix.parts)
+                )
 
 
 def _build_skill_archive(
@@ -148,6 +199,8 @@ def _build_skill_archive(
     ]
     try:
         subprocess.run(command, check=True)
+        if _requires_builtin_flm(version):
+            _append_builtin_flm_assets(output, f"Mklink-AI-Probe-v{version}")
         _validate_skill_archive(output, version)
     except Exception:
         output.unlink(missing_ok=True)

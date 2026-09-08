@@ -78,6 +78,14 @@ def test_health_identifies_the_owning_desktop_instance():
     assert response.json()["desktop_instance_id"] == "instance-b"
 
 
+def test_health_reports_the_backend_listener_port():
+    app = create_app(auth_token=None, project_root=".", backend_port=8766)
+    with TestClient(app) as client:
+        response = client.get("/api/health")
+    assert response.status_code == 200
+    assert response.json()["backend_port"] == 8766
+
+
 def _wait_for_json(path, timeout: float = 20.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -96,7 +104,10 @@ def _wait_for_health(port: int, instance_id: str, timeout: float = 20.0):
                 f"http://127.0.0.1:{port}/api/health", timeout=0.5,
             ) as response:
                 payload = json.load(response)
-            if payload.get("desktop_instance_id") == instance_id:
+            if (
+                payload.get("desktop_instance_id") == instance_id
+                and payload.get("backend_port") == port
+            ):
                 return payload
         except OSError:
             pass

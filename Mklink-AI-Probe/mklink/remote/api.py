@@ -381,10 +381,13 @@ def remember_device_connection(
 
 
 def prepare_online_flash_connect(state: dict[str, Any], request) -> None:
-    """Release the shared CDC Device before an HPM online-flash connection."""
+    """Release shared CDC ownership before jobs that require the command bridge."""
     from mklink.hpm_config import is_hpm_target
 
-    if not is_hpm_target(request.target_part):
+    if (
+        not is_hpm_target(request.target_part)
+        and request.reset_mode != "power-cycle"
+    ):
         return
 
     from mklink.remote.dashboards import stop_bridge_dashboards
@@ -503,22 +506,17 @@ async def async_target_debug_lease(state: dict[str, Any], operation: str):
 
 
 def acquire_dashboard_resources(state: dict[str, Any], dashboard: str) -> list[str]:
-    """Stop bridge peers, then atomically lease resources for a dashboard."""
-    from mklink.remote.dashboards import stop_bridge_dashboards
+    """Lease a stream without implicitly stopping another user's capture."""
     from mklink.remote.resource_manager import ResourceGroup
 
     owner = f"user:dashboard:{dashboard}"
     manager = state["resource_manager"]
-    stopped = stop_bridge_dashboards(
-        exclude=dashboard,
-        resource_manager=manager,
-    )
     manager.acquire_many(
         [ResourceGroup.MKLINK_BRIDGE, ResourceGroup.TARGET_DEBUG],
         owner,
         preempt=True,
     )
-    return stopped
+    return []
 
 
 def _dashboard_start_lock(state: dict[str, Any]) -> asyncio.Lock:
@@ -700,6 +698,7 @@ def create_app(
     auth_token: str | None = None,
     project_root: str = ".",
     desktop_instance_id: str | None = None,
+    backend_port: int | None = None,
     browser_session_timeout: float | None = None,
 ):
     """Create the FastAPI application.
@@ -708,6 +707,7 @@ def create_app(
         auth_token: Required token for client authentication.
         project_root: Project root for .mklink/ config lookup.
         desktop_instance_id: Owning Tauri instance identifier, when packaged.
+        backend_port: Actual local HTTP listener port when already known.
         browser_session_timeout: Browser-tab lease timeout for Web-entry servers.
     """
     if not _check_fastapi():
@@ -757,6 +757,7 @@ def create_app(
         "auth_token": auth_token,
         "project_root": project_root,
         "desktop_instance_id": desktop_instance_id,
+        "backend_port": backend_port,
         "resource_manager": ResourceManager(),
     }
     _state["resource_manager"].on_preempt(
@@ -991,6 +992,66 @@ def create_app(
         if callable(detach_terminal):
             detach_terminal(rtt_terminal_hub)
 
+
+    from mklink.source_monitor import SourceMonitor
+    source_monitor = SourceMonitor()
+    source_monitor_task = None
+    _state["file_source_change"] = None
+
+    async def check_file_sources():
+        device = _state.get("device")
+        if device is None or not device.connected:
+            return
+        if source_monitor.device is not device:
+            _state["file_source_change"] = None
+        project = load_project_info(_state["project_root"]) or {}
+        changed = await run_in_threadpool(source_monitor.changed, device, project)
+        if not changed or device is not _state.get("device"):
+            return
+        event = {"sequence": time.time_ns(), "files": [Path(path).name for path in changed]}
+        _state["file_source_change"] = event
+        try:
+            async with _exclusive_probe_control("reload-file-sources") as (active, stopped):
+                if active is not device:
+                    return
+                event["stopped"] = stopped
+                if getattr(device, "_axf", None):
+                    await _reparse_active_symbols()
+                from mklink.project_config import ensure_rtt_config_updated
+                rtt = await run_in_threadpool(
+                    ensure_rtt_config_updated, _state["project_root"],
+                    source_path=getattr(device, "_axf", None),
+                )
+                event["rtt_addr"] = (rtt or {}).get("rtt_addr")
+                event["message"] = "AXF/MAP 内容已变化并重载；采集已停止，请确认目标固件后重新启动"
+        except Exception as error:
+            event["error"] = str(error)
+            logger.warning("File source reload failed: %s", error)
+
+    app.state.check_file_sources = check_file_sources
+
+    async def monitor_file_sources():
+        while True:
+            await asyncio.sleep(1)
+            try:
+                await check_file_sources()
+            except Exception:
+                logger.exception("File source monitor failed")
+
+    async def startup_file_sources():
+        nonlocal source_monitor_task
+        source_monitor_task = asyncio.create_task(monitor_file_sources())
+
+    async def shutdown_file_sources():
+        if source_monitor_task is not None:
+            source_monitor_task.cancel()
+            try:
+                await source_monitor_task
+            except asyncio.CancelledError:
+                pass
+
+    app.add_event_handler("startup", startup_file_sources)
+    app.add_event_handler("shutdown", shutdown_file_sources)
     app.add_event_handler("shutdown", shutdown_stream_producers)
 
     async def shutdown_device_and_resources() -> None:
@@ -1316,11 +1377,7 @@ def create_app(
 
     @app.post("/api/project-init")
     async def project_init():
-        """Auto-detect and parse Keil/IAR project, match MCU, save config.
-
-        Scans the project root for .uvprojx or .ewp files, parses project
-        info, matches MCU profile, and saves config + project_info + rtt_config.
-        """
+        """Parse a supported project offline, preserving existing advanced settings."""
         import io
         import contextlib
         from mklink.cli import _cli_project_init
@@ -1339,22 +1396,7 @@ def create_app(
             project_info = load_project_info(project_root) or {}
             config_status = check_project_config(project_root)
 
-            # 探针固件版本检查（异步执行，避免阻塞事件循环）
-            firmware_check_result: dict = {"status": "skipped"}
-            try:
-                from mklink import firmware_check as _fc
-                port = None
-                # Prefer the device's port if currently connected
-                dev = _state.get("device")
-                if dev is not None and getattr(dev, "port", None):
-                    port = dev.port
-                root = _fc._resolve_firmware_root()
-                check = await loop.run_in_executor(
-                    None, _fc.check_probe_firmware, port, root
-                )
-                firmware_check_result = check.to_dict()
-            except Exception as e:
-                firmware_check_result = {"status": "skipped", "error": str(e)}
+            firmware_check_result = {"status": "skipped", "reason": "offline-project-init"}
 
             return {
                 "success": True,
@@ -1477,6 +1519,30 @@ def create_app(
         mcu: str | None = None
         elf_backend: str | None = None
 
+    async def _disconnect_shared_device() -> dict[str, object]:
+        """Stop bridge dashboards and release the GUI-owned Device."""
+        async with _dashboard_start_lock(_state):
+            async with device_disconnect_lock:
+                from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
+
+                stopped = []
+                for name in BRIDGE_DASHBOARD_TYPES:
+                    manager = dashboard_managers.get(name)
+                    if manager is not None and _dashboard_worker_alive(manager):
+                        await run_in_threadpool(manager.stop)
+                        if _dashboard_worker_alive(manager):
+                            raise DashboardStopPending(name)
+                        stopped.append(name)
+                    _state["resource_manager"].release(f"user:dashboard:{name}")
+
+                device = _state["device"]
+                if device:
+                    remember_device_connection(_state, device)
+                    await run_in_threadpool(device.close)
+                    _state["device"] = None
+                    _state["dispatcher"] = None
+                return {"status": "disconnected", "stopped": stopped}
+
     @app.post("/api/device/connect")
     async def connect_device(
         port: str | None = Body(default=None),
@@ -1497,6 +1563,15 @@ def create_app(
                 if elf_backend is not None
                 else previous.get("elf_backend")
             )
+        stale_device = _state.get("device")
+        if stale_device is not None and not stale_device.connected:
+            # A USB removal makes ``Device.connected`` false immediately, but
+            # the old bridge still owns its serial handle and advisory port
+            # lock until ``close()`` runs.  Reconnecting in the same desktop
+            # process would then reject its own COM port and only an app
+            # restart could release it.  Tear down dashboards and the stale
+            # session before opening the newly enumerated probe.
+            await _disconnect_shared_device()
         if _state["device"] and _state["device"].connected:
             dev = _state["device"]
             manager = get_managers()["superwatch"]
@@ -1575,30 +1650,6 @@ def create_app(
             "elf_backend": device.axf_status.get("elf_backend"),
             "target_initializing": True,
         }
-
-    async def _disconnect_shared_device() -> dict[str, object]:
-        """Stop bridge dashboards and release the GUI-owned Device."""
-        async with _dashboard_start_lock(_state):
-            async with device_disconnect_lock:
-                from mklink.remote.dashboards import BRIDGE_DASHBOARD_TYPES
-
-                stopped = []
-                for name in BRIDGE_DASHBOARD_TYPES:
-                    manager = dashboard_managers.get(name)
-                    if manager is not None and _dashboard_worker_alive(manager):
-                        await run_in_threadpool(manager.stop)
-                        if _dashboard_worker_alive(manager):
-                            raise DashboardStopPending(name)
-                        stopped.append(name)
-                    _state["resource_manager"].release(f"user:dashboard:{name}")
-
-                device = _state["device"]
-                if device:
-                    remember_device_connection(_state, device)
-                    await run_in_threadpool(device.close)
-                    _state["device"] = None
-                    _state["dispatcher"] = None
-                return {"status": "disconnected", "stopped": stopped}
 
     @app.post("/api/device/disconnect")
     async def disconnect_device():
@@ -1764,7 +1815,8 @@ def create_app(
         elf_backend: str | None = Body(default=None, embed=True),
     ):
         """手动触发 AXF/ELF 符号表解析。"""
-        return await _reparse_active_symbols(axf, elf_backend)
+        async with _exclusive_probe_control("reload-symbol-source"):
+            return await _reparse_active_symbols(axf, elf_backend)
 
     class FlashRequest(BaseModel):
         firmware: str
@@ -1779,12 +1831,12 @@ def create_app(
     ):
         if not _state["device"] or not _state["device"].connected:
             raise HTTPException(status_code=400, detail="Device not connected")
-        async with async_target_debug_lease(_state, "flash"):
+        async with _exclusive_probe_control("flash") as (device, _stopped):
             try:
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     None,
-                    lambda: _state["device"].flash(
+                    lambda: device.flash(
                         firmware, verify=verify, reset_after=reset_after
                     ),
                 )
@@ -2028,6 +2080,7 @@ def create_app(
                 search_size,
                 mode,
                 _state["project_root"],
+                source_path=getattr(_state["device"], "_axf", None),
             )
             validate_request = getattr(
                 _state["device"], "validate_rtt_stream_request", None,
@@ -2111,7 +2164,7 @@ def create_app(
     @app.get("/api/dash/rtt/status")
     async def rtt_status():
         managers = get_managers()
-        return managers["rtt"].get_status()
+        return {**managers["rtt"].get_status(), "file_source_change": _state["file_source_change"]}
 
     @app.get("/api/dash/rtt/history")
     async def rtt_history():
@@ -2159,6 +2212,7 @@ def create_app(
                 search_size,
                 mode,
                 _state["project_root"],
+                source_path=getattr(_state["device"], "_axf", None),
             )
             validate_request = getattr(
                 _state["device"], "validate_rtt_stream_request", None,
@@ -2341,14 +2395,87 @@ def create_app(
                 generation=generation,
                 value=value,
             )
+        except SymbolCatalogError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except SuperWatchTransactionError as exc:
             raise HTTPException(status_code=409, detail=exc.to_detail()) from exc
+
+    @app.get("/api/dash/superwatch/peripherals")
+    async def superwatch_peripherals():
+        return await run_in_threadpool(get_managers()["superwatch"].peripheral_catalog)
+
+    _svd_targets = {}
+    _svd_target_lock = asyncio.Lock()
+
+    @app.get("/api/dash/superwatch/peripherals/targets")
+    async def peripheral_targets(q: str = ""):
+        from mklink.peripheral_watch import discover_svd_targets
+        async with _svd_target_lock:
+            if not _svd_targets:
+                targets = await run_in_threadpool(discover_svd_targets, _state["project_root"])
+                _svd_targets.update({target.key: target for target in targets})
+        matches = [target.public() for target in _svd_targets.values()
+                   if q.casefold() in target.target.casefold()]
+        return {"targets": matches[:200], "total": len(matches)}
+
+    @app.post("/api/dash/superwatch/peripherals/select")
+    async def peripheral_select(target_id: str = Body(..., embed=True)):
+        device = _state.get("device")
+        if not device or not device.connected:
+            raise HTTPException(status_code=400, detail="Device not connected")
+        target = _svd_targets.get(target_id)
+        if target is None:
+            raise HTTPException(status_code=404, detail="Select a chip from the installed Pack list")
+        try:
+            async with _dashboard_start_lock(_state):
+                return await run_in_threadpool(get_managers()["superwatch"].select_peripherals, device, target)
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Cannot load selected SVD: {exc}") from exc
 
     @app.get("/api/dash/superwatch/items")
     async def superwatch_items():
         managers = get_managers()
         items = await run_in_threadpool(managers["superwatch"].list_watches)
         return {"items": items}
+
+    def pinned_variable_payload(preferences):
+        device = _state.get("device")
+        catalog = getattr(device, "symbol_catalog", None) if device else None
+        usable = catalog is not None and not catalog.is_stale()
+        entries = []
+        for name in preferences["pins"]:
+            descriptor = catalog.by_path(name) if usable else None
+            entries.append({
+                "path": name,
+                "descriptor": descriptor.to_dict() if descriptor else None,
+                "reason": "" if descriptor else ("missing" if usable else "source-unavailable"),
+            })
+        return {**preferences, "entries": entries,
+                "generation": catalog.generation if catalog else 0}
+
+    @app.get("/api/dash/superwatch/pins")
+    async def superwatch_pins():
+        from mklink.watch_preferences import load_pins
+        try:
+            preferences = await run_in_threadpool(load_pins, _state["project_root"])
+            return await run_in_threadpool(pinned_variable_payload, preferences)
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.put("/api/dash/superwatch/pins")
+    async def superwatch_save_pins(
+        pins: list[str] = Body(...), revision: str = Body(...),
+    ):
+        from mklink.watch_preferences import PreferencesConflict, save_pins
+        try:
+            preferences = await run_in_threadpool(save_pins, _state["project_root"], pins, revision)
+            return await run_in_threadpool(pinned_variable_payload, preferences)
+        except PreferencesConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (OSError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.get("/api/dash/superwatch/array-snapshot")
     async def superwatch_array_snapshot():
@@ -3246,6 +3373,9 @@ def create_app(
             "device_connected": dev.connected if dev else False,
             **elf_status(project_root=_state["project_root"]),
         }
+        backend_port = _state.get("backend_port")
+        if isinstance(backend_port, int) and 1 <= backend_port <= 65535:
+            payload["backend_port"] = backend_port
         if _state["desktop_instance_id"]:
             payload["desktop_instance_id"] = _state["desktop_instance_id"]
         return payload
@@ -3528,7 +3658,13 @@ def run_server(
             auth_token=auth_token,
             project_root=project_root,
             desktop_instance_id=desktop_instance_id,
+            backend_port=port,
         )
+
+    def set_backend_port(value: int) -> None:
+        state = getattr(app.state, "mklink_state", None)
+        if isinstance(state, dict):
+            state["backend_port"] = value
 
     if auto_connect:
         import mklink
@@ -3586,6 +3722,7 @@ def run_server(
             auth_token=observation_token,
             private_correlation=observation_correlation,
         )
+        set_backend_port(port)
         browser_sessions = getattr(app.state, "browser_sessions", None)
         if browser_sessions is None:
             uvicorn.run(app, host=host, port=port, log_level="info")
@@ -3611,6 +3748,7 @@ def run_server(
             auth_token=observation_token,
             private_correlation=observation_correlation,
         )
+        set_backend_port(selected_port)
         _write_desktop_runtime_info(
             desktop_runtime_info,
             port=selected_port,

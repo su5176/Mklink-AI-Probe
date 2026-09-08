@@ -2,8 +2,14 @@ import { isTauri } from '@tauri-apps/api/core'
 
 const SYMBOL_FILTER = { name: 'AXF / ELF', extensions: ['axf', 'elf', 'out'] }
 const FIRMWARE_FILTER = { name: 'BIN / HEX', extensions: ['bin', 'hex'] }
+const FLM_FILTER = { name: 'CMSIS Flash Algorithm', extensions: ['flm'] }
 
 export type PickedFile = string | File | null
+const symbolHandles = new WeakMap<File, BrowserFirmwareFileHandle>()
+
+export function symbolFileHandle(file: File): BrowserFirmwareFileHandle | undefined {
+  return symbolHandles.get(file)
+}
 
 export interface BrowserFirmwareFileHandle {
   readonly kind: 'file'
@@ -56,8 +62,26 @@ async function pickFile(filter: { name: string, extensions: string[] }): Promise
   }
 }
 
-export function pickSymbolFile(): Promise<PickedFile> {
-  return pickFile(SYMBOL_FILTER)
+export async function pickSymbolFile(): Promise<PickedFile> {
+  const picker = (window as FirmwarePickerWindow).showOpenFilePicker
+  if (isTauri() || typeof picker !== 'function') return pickFile(SYMBOL_FILTER)
+  try {
+    const [handle] = await picker.call(window, {
+      multiple: false, excludeAcceptAllOption: true,
+      types: [{ description: SYMBOL_FILTER.name, accept: { 'application/octet-stream': ['.axf', '.elf', '.out'] } }],
+    })
+    if (!handle) return null
+    const file = await handle.getFile()
+    symbolHandles.set(file, handle)
+    return file
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') return null
+    return pickBrowserFile(SYMBOL_FILTER)
+  }
+}
+
+export function pickFlmFile(): Promise<PickedFile> {
+  return pickFile(FLM_FILTER)
 }
 
 export async function pickFirmwareFiles(multiple = false): Promise<Array<string | File>> {
@@ -89,7 +113,7 @@ export async function pickTrackedFirmwareFiles(multiple = false): Promise<Picked
   }
 
   try {
-    const handles = await picker({
+    const handles = await picker.call(window, {
       multiple,
       excludeAcceptAllOption: true,
       types: [{

@@ -1,13 +1,14 @@
-import { IS_TAURI } from './runtimeEndpoint'
+import { API_BASE, IS_TAURI, browserRuntimeBase } from './runtimeEndpoint'
 
 const RETRY_DELAY_MS = 1000
 
 export function browserSessionSocketUrl(
-  location: Pick<Location, 'host' | 'protocol'> = window.location,
+  location: Pick<Location, 'host' | 'protocol'> & Partial<Pick<Location, 'href'>> = window.location,
   clientId: string,
 ): string {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${protocol}//${location.host}/ws/browser-session?client_id=${encodeURIComponent(clientId)}`
+  const base = location.href ? browserRuntimeBase(location.href) : ''
+  return `${protocol}//${location.host}${base}/ws/browser-session?client_id=${encodeURIComponent(clientId)}`
 }
 
 function createClientId(): string {
@@ -22,10 +23,10 @@ function releaseBrowserDevice(clientId: string): void {
   // The backend releases the shared Device when the last browser session is
   // released. Keep this as one request so disconnect and session accounting
   // cannot race two concurrent Device.close() calls during pagehide.
-  if (navigator.sendBeacon?.('/api/browser-session/release', body)) return
+  if (navigator.sendBeacon?.(`${API_BASE}/api/browser-session/release`, body)) return
   // sendBeacon can be unavailable (or return false when its queue is full).
   // keepalive gives Chromium/WebView2 a second reliable page-close path.
-  void fetch('/api/browser-session/release', {
+  void fetch(`${API_BASE}/api/browser-session/release`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body,

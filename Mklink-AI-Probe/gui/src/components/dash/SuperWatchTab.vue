@@ -1,6 +1,11 @@
 <template>
   <div class="superwatch-workspace" :style="{ gridTemplateColumns: `${panelWidth}px 5px minmax(0, 1fr)` }">
-    <SymbolVariablePanel
+    <div class="watch-catalog-pane">
+      <div class="watch-source-tabs">
+        <button :class="{ active: source === 'variables' }" @click="source = 'variables'">{{ tr('程序变量', 'Variables') }}</button>
+        <button :class="{ active: source === 'peripherals' }" @click="source = 'peripherals'">{{ tr('芯片外设', 'Peripherals') }}</button>
+      </div>
+    <SymbolVariablePanel v-show="source === 'variables'"
       :device-connected="deviceConnected"
       :symbol-loaded="symbolLoaded"
       :symbol-error="symbolError"
@@ -11,6 +16,8 @@
       @selection-removed="clearChannelVisibility"
       @snapshot-change="snapshotPath = $event"
     />
+      <PeripheralWatchPanel v-show="source === 'peripherals'" :device-connected="deviceConnected" :latest-values="latestValues" />
+    </div>
     <div class="workspace-resizer" :title="tr('调整变量目录宽度', 'Resize variable catalog')" @mousedown="startResize"></div>
     <div class="waveform-pane">
       <WaveformViewer
@@ -27,6 +34,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import SymbolVariablePanel from './SymbolVariablePanel.vue'
+import PeripheralWatchPanel from './PeripheralWatchPanel.vue'
 import WaveformViewer from './WaveformViewer.vue'
 import { tr } from '../../composables/useLanguage'
 import { API_BASE } from '../../lib/runtimeEndpoint'
@@ -41,6 +49,7 @@ const props = withDefaults(defineProps<{
 })
 
 const panelWidth = ref(340)
+const source = ref('variables')
 const latestValues = shallowRef<Record<string, number | boolean>>({})
 const hiddenChannels = shallowRef(new Set<string>())
 const snapshotPath = ref<string | null>(null)
@@ -101,6 +110,11 @@ watch(() => props.deviceConnected, loadSnapshotSelection)
 </script>
 
 <style scoped>
+.watch-catalog-pane { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+.watch-catalog-pane :deep(.symbol-panel) { flex: 1; min-height: 0; }
+.watch-source-tabs { display: flex; border-bottom: 1px solid var(--border); flex: 0 0 auto; }
+.watch-source-tabs button { flex: 1; padding: 10px; border: 0; background: var(--surface); color: var(--muted); cursor: pointer; }
+.watch-source-tabs button.active { color: var(--accent); box-shadow: inset 0 -2px var(--accent); }
 .superwatch-workspace {
   display: grid;
   width: 100%;

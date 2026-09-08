@@ -21,6 +21,7 @@ export interface VisibleSymbolRow {
 
 export interface VisibleSymbolOptions {
   expanded: ReadonlySet<string>
+  collapsed?: ReadonlySet<string>
   selected: ReadonlySet<string>
   query: string
   selectedOnly: boolean
@@ -159,6 +160,10 @@ export function visibleSymbolRows(
   options: VisibleSymbolOptions,
 ): VisibleSymbolRow[] {
   const query = options.query.trim().toLocaleLowerCase()
+  const terms = query.split(/[,，;；\n]+/).map(term => term.trim()).filter(Boolean)
+  const matches = (path: string, type: string) => !terms.length || terms.some(term => (
+    path.toLocaleLowerCase().includes(term) || type.toLocaleLowerCase().includes(term)
+  ))
   const forceExpanded = Boolean(query) || options.selectedOnly
   const visible = new Map<string, boolean>()
   const selectedCounts = new Map<string, number>()
@@ -172,17 +177,14 @@ export function visibleSymbolRows(
       const selectedMatch = !options.selectedOnly || options.selected.has(node.key)
       const queryMatch = !query || Boolean(
         descriptor
-        && (descriptor.path.toLocaleLowerCase().includes(query)
-          || descriptor.type_name.toLocaleLowerCase().includes(query)),
+        && matches(descriptor.path, descriptor.type_name),
       )
       result = selectedMatch && queryMatch
     } else if (node.kind === 'container') {
       const container = node.container
       result = !options.selectedOnly && Boolean(
         container
-        && (!query
-          || container.path.toLocaleLowerCase().includes(query)
-          || container.type_name.toLocaleLowerCase().includes(query)),
+        && matches(container.path, container.type_name),
       )
     } else {
       result = query ? node.children.some(isVisible) : true
@@ -207,7 +209,8 @@ export function visibleSymbolRows(
   function appendVisible(node: SymbolTreeNode, depth: number): void {
     if (!isVisible(node)) return
     const expandable = node.kind === 'branch' || node.kind === 'range'
-    const expanded = expandable && (forceExpanded || options.expanded.has(node.key))
+    const expanded = expandable && !options.collapsed?.has(node.key)
+      && (forceExpanded || options.expanded.has(node.key))
     rows.push({
       node,
       depth,

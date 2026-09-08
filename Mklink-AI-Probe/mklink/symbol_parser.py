@@ -266,9 +266,10 @@ class SymbolCache:
 
     def save(self, elf_path: str, symbols: list[dict]) -> None:
         """Save symbols list to cache."""
+        from mklink.file_content import source_fingerprint
         cache_file = self._cache_dir / self._cache_key(elf_path)
         with open(cache_file, "w", encoding="utf-8") as f:
-            json.dump(symbols, f, indent=2, ensure_ascii=False)
+            json.dump({"fingerprint": source_fingerprint(elf_path), "symbols": symbols}, f, indent=2, ensure_ascii=False)
 
     def load(self, elf_path: str) -> Optional[list[dict]]:
         """Load symbols from cache. Returns None if not cached."""
@@ -276,8 +277,12 @@ class SymbolCache:
         if not cache_file.exists():
             return None
         try:
+            from mklink.file_content import source_fingerprint
             with open(cache_file, "r", encoding="utf-8") as f:
-                return json.load(f)
+                value = json.load(f)
+            if isinstance(value, dict) and value.get("fingerprint") == source_fingerprint(elf_path):
+                return value["symbols"]
+            return None
         except (json.JSONDecodeError, OSError):
             return None
 

@@ -4,6 +4,7 @@
 Usage:
     python build.py              # Build exe only (no bundle)
     python build.py --bundle     # Standard NSIS bundle with sidecar
+    python build.py --local-bundle # Local NSIS, no updater signing
     python build.py --check      # Check prerequisites only
     python build.py --clean      # Clean build artifacts
 
@@ -108,17 +109,17 @@ def build_builtin_pack_bundle(config_path, roots, output):
     return module.build_bundle(Path(config_path), [Path(root) for root in roots], Path(output))
 
 
-def build_daplinkutility_flm_bundle(executable, output):
-    """Load the pinned Qt resource extractor without making scripts a package."""
+def load_builtin_flm_assets():
+    """Load the local asset validator without making scripts a package."""
     import importlib.util
 
-    builder_path = Path(__file__).resolve().with_name("daplinkutility_resources.py")
-    spec = importlib.util.spec_from_file_location("mklink_daplinkutility_resources", builder_path)
+    validator_path = Path(__file__).resolve().with_name("builtin_flm_assets.py")
+    spec = importlib.util.spec_from_file_location("mklink_builtin_flm_assets", validator_path)
     if spec is None or spec.loader is None:
-        raise RuntimeError("cannot load DAPLinkUtility FLM builder")
+        raise RuntimeError("cannot load built-in algorithm asset validator")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.build_bundle(Path(executable), Path(output))
+    return module
 
 
 def builtin_pack_roots():
@@ -130,14 +131,24 @@ def builtin_pack_roots():
     return roots
 
 
-def daplinkutility_executable():
-    value = os.environ.get("MKLINK_DAPLINKUTILITY_EXE", "").strip()
-    if not value:
-        return None
-    executable = Path(value).resolve()
-    if not executable.is_file():
-        raise RuntimeError("DAPLinkUtility executable does not exist: {}".format(executable))
-    return executable
+def builtin_flm_root():
+    return load_builtin_flm_assets().default_bundle_root(SKILL_DIR)
+
+
+def validate_builtin_flm_bundle(root=None):
+    bundle_root = builtin_flm_root() if root is None else Path(root).resolve()
+    return load_builtin_flm_assets().validate_bundle(bundle_root)
+
+
+def require_release_builtin_flm_bundle():
+    root = builtin_flm_root()
+    try:
+        validate_builtin_flm_bundle(root)
+    except (FileNotFoundError, ValueError) as error:
+        raise RuntimeError(
+            "0.2.0 release bundle requires the complete local built-in algorithm assets"
+        ) from error
+    return root
 
 
 def build_sidecar(force=False):
@@ -180,17 +191,14 @@ def build_sidecar(force=False):
             ]
         else:
             print("[WARN] MKLINK_BUILTIN_PACK_ROOTS is not set; builtin Pack bundle omitted")
-        daplink_exe = daplinkutility_executable()
-        if daplink_exe is not None:
-            try:
-                import pefile  # noqa: F401
-            except ImportError:
-                run([sys.executable, "-m", "pip", "install", "pefile"])
-            flm_dir = Path(temporary) / "builtin_flm"
-            flm_manifest = build_daplinkutility_flm_bundle(daplink_exe, flm_dir)
+        flm_dir = builtin_flm_root()
+        if (flm_dir / "manifest.json").is_file():
+            flm_manifest = validate_builtin_flm_bundle(flm_dir)
             print(
-                "[OK] Built DAPLinkUtility FLM bundle: {} targets, {} blobs".format(
-                    flm_manifest["target_count"], flm_manifest["blob_count"]
+                "[OK] Collected built-in algorithm assets: {} targets, {} blobs; {}".format(
+                    flm_manifest["target_count"],
+                    flm_manifest["blob_count"],
+                    flm_manifest["release_note"],
                 )
             )
             builtin_args.extend([
@@ -198,7 +206,7 @@ def build_sidecar(force=False):
                 "{}{}mklink/builtin_flm".format(flm_dir, os.pathsep),
             ])
         else:
-            print("[WARN] MKLINK_DAPLINKUTILITY_EXE is not set; builtin FLM bundle omitted")
+            print("[WARN] Local built-in algorithm assets are unavailable; bundle omitted")
         run([
             sys.executable, "-m", "PyInstaller",
             "--noconfirm", "--clean", "--onefile", "--name", "mklink-sidecar",
@@ -280,12 +288,14 @@ def temporary_external_bin(config_path):
 
 
 @contextmanager
-def temporary_bundle_config(config_path):
+def temporary_bundle_config(config_path, *, signed=True):
     """Apply the standard NSIS-only sidecar bundle settings."""
     config_path = Path(config_path)
     original = config_path.read_bytes()
     data = json.loads(original.decode("utf-8"))
     bundle = data.setdefault("bundle", {})
+    if not signed:
+        bundle["createUpdaterArtifacts"] = False
     bundle["targets"] = ["nsis"]
     bundle["useLocalToolsDir"] = True
     # LZMA's solid dictionary can fail to mmap on Windows machines with a
@@ -337,7 +347,7 @@ def load_updater_private_key(env=None, home=None):
     return key
 
 
-def collect_signed_bundle_outputs(bundle_dir):
+def collect_signed_bundle_outputs(bundle_dir, *, signed=True):
     """Return the standard NSIS installer and its Tauri updater signature."""
     nsis_dir = Path(bundle_dir) / "nsis"
     setups = sorted(nsis_dir.glob("*.exe"))
@@ -345,6 +355,8 @@ def collect_signed_bundle_outputs(bundle_dir):
         raise RuntimeError("standard NSIS setup executable was not produced")
     if len(setups) != 1:
         raise RuntimeError("expected exactly one standard NSIS setup executable")
+    if not signed:
+        return {"setup": setups[0]}
     signature = Path(f"{setups[0]}.sig")
     if not signature.is_file():
         raise RuntimeError("Tauri updater signature was not produced")
@@ -354,9 +366,10 @@ def collect_signed_bundle_outputs(bundle_dir):
     }
 
 
-def build_release_bundle():
+def build_release_bundle(*, signed=True):
     """Build a bundle from the current source with a temporary sidecar config."""
-    signing_key = load_updater_private_key()
+    require_release_builtin_flm_bundle()
+    signing_key = load_updater_private_key() if signed else None
     staged_stcp = None
     try:
         if not build_sidecar(force=True):
@@ -374,15 +387,17 @@ def build_release_bundle():
                 raise RuntimeError(
                     f"stale bundle outputs still exist: {bundle_dir}"
                 )
-        with temporary_bundle_config(TAURI_DIR / "tauri.conf.json"):
-            return build_tauri(bundle=True, signing_key=signing_key)
+        with temporary_bundle_config(TAURI_DIR / "tauri.conf.json", signed=signed):
+            if signed:
+                return build_tauri(bundle=True, signing_key=signing_key)
+            return build_tauri(bundle=True, local_bundle=True)
     finally:
         if staged_stcp is not None:
             staged_stcp.unlink(missing_ok=True)
         (TAURI_DIR / "binaries" / "mklink-sidecar-x86_64-pc-windows-msvc.exe").unlink(missing_ok=True)
 
 
-def build_tauri(bundle=False, signing_key=None):
+def build_tauri(bundle=False, signing_key=None, *, local_bundle=False):
     """Build Tauri application."""
     cmd = ["npx", "tauri", "build"]
     if not bundle:
@@ -390,7 +405,13 @@ def build_tauri(bundle=False, signing_key=None):
 
     env = os.environ.copy()
     env["VITE_MKLINK_API"] = "http://127.0.0.1:8765"
-    if bundle:
+    if local_bundle:
+        if not bundle or signing_key:
+            raise ValueError("local bundle must not use a signing key")
+        for name in ("TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+                     "MKLINK_TAURI_UPDATER_KEY", "MKLINK_TAURI_UPDATER_KEY_PASSWORD"):
+            env.pop(name, None)
+    elif bundle:
         if not signing_key:
             raise RuntimeError("updater private key is required for a release bundle")
         env["TAURI_SIGNING_PRIVATE_KEY"] = signing_key
@@ -409,7 +430,7 @@ def build_tauri(bundle=False, signing_key=None):
 
     if bundle:
         outputs = collect_signed_bundle_outputs(
-            cargo_target_dir() / "release" / "bundle"
+            cargo_target_dir() / "release" / "bundle", signed=not local_bundle
         )
         for label, path in outputs.items():
             size_mb = path.stat().st_size / (1024 * 1024)
@@ -428,7 +449,9 @@ def main():
     global SKILL_DIR, GUI_DIR, TAURI_DIR
 
     parser = argparse.ArgumentParser(description="Build Mklink AI Probe Tauri GUI")
-    parser.add_argument("--bundle", action="store_true", help="Standard NSIS bundle with sidecar")
+    bundle_options = parser.add_mutually_exclusive_group()
+    bundle_options.add_argument("--bundle", action="store_true", help="Signed NSIS bundle with sidecar (requires authorization)")
+    bundle_options.add_argument("--local-bundle", action="store_true", help="Local NSIS with sidecar, without updater signing")
     parser.add_argument("--check", action="store_true", help="Check prerequisites only")
     parser.add_argument("--clean", action="store_true", help="Remove build artifacts")
     parser.add_argument("--project-dir", type=str, default=None, help="mklink-ai-probe project root directory")
@@ -481,9 +504,9 @@ def main():
         return
 
     # Build
-    if args.bundle:
+    if args.bundle or args.local_bundle:
         print("\n--- Building sidecar (PyInstaller) ---")
-        build_release_bundle()
+        build_release_bundle(signed=not args.local_bundle)
         return
 
     print("\n--- Building Tauri application ---")

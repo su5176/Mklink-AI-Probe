@@ -42,7 +42,7 @@ function streamUrl(stream: BinaryStreamName): string {
   if (API_BASE) {
     const base = new URL(API_BASE, window.location.href)
     base.protocol = base.protocol === 'https:' ? 'wss:' : 'ws:'
-    base.pathname = `/ws/streams/${stream}`
+    base.pathname = `${base.pathname.replace(/\/+$/, '')}/ws/streams/${stream}`
     base.search = ''
     base.hash = ''
     return base.toString()

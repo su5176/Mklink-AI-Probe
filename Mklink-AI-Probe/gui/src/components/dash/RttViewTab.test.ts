@@ -41,7 +41,7 @@ const mocks = vi.hoisted(() => ({
     start: vi.fn(), stop: vi.fn(), reset: vi.fn(), configure: vi.fn(),
     requestVisibleRange: vi.fn(),
   },
-  downloadTextFile: vi.fn(),
+  saveBlobFile: vi.fn(),
   dash: {
     state: null as any, error: null as any,
     start: vi.fn(), stop: vi.fn(), pause: vi.fn(), resume: vi.fn(),
@@ -62,7 +62,7 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock('../../composables/useBinaryStream', () => ({ useBinaryStream: mocks.useBinaryStream }))
 vi.mock('../../lib/downloadTextFile', () => ({
-  downloadTextFile: mocks.downloadTextFile,
+  saveBlobFile: mocks.saveBlobFile,
   timestampedLogName: (prefix: string) => `${prefix}-test.log`,
 }))
 vi.mock('../../composables/useDashboard', () => ({ useDashboard: () => mocks.dash }))
@@ -111,7 +111,7 @@ describe('RttViewTab binary migration', () => {
     mocks.useBinaryStream.mockImplementation(name => (
       name === 'rtt-terminal' ? mocks.terminalBinary : mocks.binary
     ))
-    mocks.downloadTextFile.mockReset()
+    mocks.saveBlobFile.mockReset().mockResolvedValue(true)
     mocks.checkConflict.mockResolvedValue([])
     mocks.scheduler.render = null
     mocks.dash.start.mockResolvedValue(true)
@@ -289,9 +289,11 @@ describe('RttViewTab binary migration', () => {
 
     await wrapper.get('[data-testid="rtt-save-log"]').trigger('click')
 
-    expect(mocks.downloadTextFile).toHaveBeenCalledWith(
-      'rtt-test.log', expect.stringContaining('\traw\tready'),
-    )
+    expect(wrapper.get('[data-testid="rtt-log-text"]').attributes('aria-pressed')).toBe('true')
+    expect((wrapper.get('[data-testid="rtt-log-timestamp"]').element as HTMLInputElement).checked).toBe(false)
+    expect(mocks.saveBlobFile).toHaveBeenCalledWith('rtt-test.log', expect.any(Blob))
+    const saved = mocks.saveBlobFile.mock.calls[0][1] as Blob
+    expect(new TextDecoder().decode(await saved.arrayBuffer())).toBe('ready\n')
     wrapper.unmount()
   })
 

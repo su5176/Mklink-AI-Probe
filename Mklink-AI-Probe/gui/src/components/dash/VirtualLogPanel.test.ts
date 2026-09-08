@@ -73,6 +73,27 @@ describe('VirtualLogPanel', () => {
     vi.advanceTimersByTime(100)
   })
 
+  it('keeps an accelerated 60-second 1 kHz stream bounded and virtualized', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(VirtualLogPanel)
+    const panel = wrapper.get('[role="log"]').element as HTMLElement
+    Object.defineProperty(panel, 'clientHeight', { configurable: true, value: 220 })
+    for (let index = 0; index < 60_000; index += 1) {
+      ;(wrapper.vm as any).append([{
+        time: index, level: 'raw', text: `seq=${index}`,
+        raw: new TextEncoder().encode(`seq=${index}\n`),
+      }])
+    }
+
+    expect((wrapper.vm as any).retainedCount).toBe(0)
+    vi.advanceTimersByTime(33)
+    await nextTick()
+    expect((wrapper.vm as any).retainedCount).toBe(5000)
+    expect((wrapper.vm as any).firstLineNumber).toBe(55_001)
+    expect(wrapper.findAll('.virtual-log-row').length).toBeLessThan(40)
+    wrapper.unmount()
+  })
+
   it('recomputes visible rows after a resize without rendering the full log', async () => {
     vi.useFakeTimers()
     const wrapper = mount(VirtualLogPanel)
@@ -108,6 +129,27 @@ describe('VirtualLogPanel', () => {
     expect(exported).toMatch(/\d{2}:00:00\.001\tRX\t4F4B  OK/)
     expect(exported).toMatch(/\d{2}:00:00\.002\tTX\t41  A/)
     expect((wrapper.vm as any).retainedCount).toBe(2)
+    wrapper.unmount()
+  })
+
+  it('switches presentation independently and exports only retained raw bytes', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(VirtualLogPanel, {
+      props: { displayMode: 'text', showTimestamp: false },
+    })
+    ;(wrapper.vm as any).append([{
+      time: 1_000_000n, level: 'data', label: 'RX', text: 'OK\\n',
+      raw: Uint8Array.of(0x4f, 0x4b, 0x0a),
+    }])
+    vi.advanceTimersByTime(33)
+    await nextTick()
+
+    expect(wrapper.find('.virtual-log-time').exists()).toBe(false)
+    expect(wrapper.get('.virtual-log-text').text()).toBe('OK\\n')
+    await wrapper.setProps({ displayMode: 'hex', showTimestamp: true })
+    expect(wrapper.get('.virtual-log-time').text()).toMatch(/\d{2}:00:00\.001/)
+    expect(wrapper.get('.virtual-log-text').text()).toBe('4F 4B 0A')
+    expect(Array.from((wrapper.vm as any).exportRaw())).toEqual([0x4f, 0x4b, 0x0a])
     wrapper.unmount()
   })
 })

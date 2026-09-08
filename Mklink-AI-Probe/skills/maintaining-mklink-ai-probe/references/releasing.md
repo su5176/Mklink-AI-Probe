@@ -60,7 +60,7 @@ $Nsis = $NsisFiles[0]
   '--core-zip', "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.zip",
   '--core-manifest', "$PortableWork\core\mklink-remote-site-agent-windows-x86_64.manifest.json",
   '--gui-exe', (Join-Path $BuildRoot 'cache\cargo\release\MKLink-Site-Agent.exe'),
-  '--source-root', '.'
+  '--source-root', 'site-agent-gui'
 )
 
 python _maintainer/release/prepare_release.py `

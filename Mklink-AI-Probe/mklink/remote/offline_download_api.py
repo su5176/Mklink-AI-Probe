@@ -25,6 +25,7 @@ from mklink.offline_download import (
     offline_trigger_command,
     parse_offline_config,
 )
+from mklink.offline_security import offline_security_capability
 
 
 _UPLOAD_CHUNK = 1024 * 1024
@@ -672,6 +673,10 @@ def create_offline_download_router(
         except (OfflineDownloadError, OSError, ValueError) as error:
             raise HTTPException(status_code=400, detail=str(error))
 
+    @router.get("/security")
+    async def security(model: str, part_number: str) -> object:
+        return offline_security_capability(model, part_number)
+
     @router.post("/preview")
     async def preview(payload: dict = Body(...)) -> object:
         try:
@@ -751,9 +756,25 @@ def create_offline_download_router(
                 algorithm_sources: Dict[str, Path] = {}
                 for algorithm in config.algorithms:
                     if algorithm.source_kind == "upload":
-                        if algorithm.upload_index is None or algorithm.upload_index >= len(uploaded_flms):
+                        if algorithm.source_path:
+                            source = Path(algorithm.source_path).expanduser().resolve()
+                            if source.suffix.casefold() != ".flm" or not source.is_file():
+                                raise OfflineDownloadError(
+                                    f"local FLM source is unavailable: {algorithm.file_name}"
+                                )
+                            size = source.stat().st_size
+                            if size <= 0 or size > _MAX_UPLOAD_SIZE:
+                                raise OfflineDownloadError(
+                                    f"local FLM source has an invalid size: {algorithm.file_name}"
+                                )
+                            algorithm_sources[algorithm.id] = source
+                        elif (
+                            algorithm.upload_index is None
+                            or algorithm.upload_index >= len(uploaded_flms)
+                        ):
                             raise OfflineDownloadError("missing uploaded FLM source")
-                        algorithm_sources[algorithm.id] = uploaded_flms[algorithm.upload_index]
+                        else:
+                            algorithm_sources[algorithm.id] = uploaded_flms[algorithm.upload_index]
                     elif algorithm.source_kind == "profile":
                         algorithm_sources[algorithm.id] = await asyncio.to_thread(
                             _profile_source, algorithm.source_token or "", disk_root

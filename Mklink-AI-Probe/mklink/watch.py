@@ -246,8 +246,26 @@ def read_watch_values(
     info = load_dwarf_info(
         source, backend=backend, project_root=project_root
     )
+    from mklink.symbol_catalog import SymbolCatalog, decode_descriptor
+
+    # Snapshot reads also support Flash/HPM address spaces; only the scalar
+    # type resolution is shared with the RAM-only SuperWatch write catalog.
+    catalog = SymbolCatalog.from_dwarf(
+        info, axf_path=source, ram_ranges=[(0, 1 << 32)],
+    )
     rows = []
     for name in names:
+        descriptor = catalog.by_path(name)
+        if descriptor is not None:
+            data, raw = read_memory(port, descriptor.address, descriptor.size)
+            value = decode_descriptor(descriptor, data) if data else raw.strip()
+            if descriptor.scalar_kind == "enum" and data:
+                labels = {number: label for label, number in descriptor.enum_values.items()}
+                if value in labels:
+                    value = f"{value} ({labels[value]})"
+            rows.append({"name": name, "address": f"0x{descriptor.address:08X}",
+                         "type": descriptor.type_name, "size": descriptor.size, "value": value})
+            continue
         try:
             address, type_name, size, enum_values = resolve_variable_path(info, name)
         except KeyError:

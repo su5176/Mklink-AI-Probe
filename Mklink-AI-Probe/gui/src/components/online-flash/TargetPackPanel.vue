@@ -21,7 +21,13 @@ watch(query, value => {
     suppressNextSearch = false
     return
   }
-  timer = setTimeout(() => emit('search', value), 300)
+  timer = setTimeout(() => emit('search', value), 150)
+})
+watch(() => props.targets, targets => {
+  activeSuggestion.value = targets.length ? 0 : -1
+  if (searchBox.value?.contains(document.activeElement)) {
+    suggestionsOpen.value = targets.length > 0
+  }
 })
 watch(() => props.targets, targets => {
   activeSuggestion.value = targets.length ? 0 : -1

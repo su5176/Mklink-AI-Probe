@@ -80,6 +80,54 @@ def _config(model="V4"):
     }
 
 
+def _gd32_security_config(*, unlock=True, lock=True):
+    payload = _config("V3")
+    payload.update({
+        "auto_download_count": 1,
+        "target_part": "GD32F303CET6",
+        "unlock_before_download": unlock,
+        "lock_after_download": lock,
+        "security_voltage_mv": 3300,
+    })
+    return payload
+
+
+def _stm32f103_security_config(*, unlock=True, lock=True):
+    payload = _config("V3")
+    payload.update({
+        "auto_download_count": 1,
+        "target_part": "STM32F103RE",
+        "unlock_before_download": unlock,
+        "lock_after_download": lock,
+        "security_voltage_mv": 3300,
+    })
+    return payload
+
+
+def _stm32g474_security_config(*, unlock=True, lock=True, model="V3"):
+    payload = _config(model)
+    payload.update({
+        "auto_download_count": 1,
+        "target_part": "STM32G474RET6",
+        "unlock_before_download": unlock,
+        "lock_after_download": lock,
+        "security_voltage_mv": 3300,
+    })
+    return payload
+
+
+def _py32f030_security_config(*, unlock=True, lock=True, model="V3"):
+    payload = _config(model)
+    payload.update({
+        "auto_download_count": 1,
+        "target_part": "PY32F030K28T6",
+        "unlock_before_download": unlock,
+        "lock_after_download": lock,
+        "security_voltage_mv": 3300,
+    })
+    return payload
+
+
 def _local_stm32_config(source: Path, base_address="0x08005000"):
     return {
         "model": "V4",
@@ -181,6 +229,287 @@ def test_v4_script_supports_multiple_files_addresses_algorithms_and_rounds():
     assert script.index('load.hex("rt-thread.hex"') < script.index('load.flm("FLM/External.FLM"')
 
 
+def test_chip_erase_uses_first_firmware_algorithm_before_programming():
+    payload = _config("V3")
+    payload["auto_download_count"] = 1
+    payload["erase_all_before_download"] = True
+
+    config = parse_offline_config(payload)
+    script = generate_offline_script(config)
+
+    main_flm = 'load.flm("FLM/STM32F10x_1024.FLM", 0x08000000, 0x20000000)'
+    erase = "cmd.erase_chip_flash(0x08000000)"
+    program = 'load.bin("boot.bin", 0x08000000)'
+    assert config.erase_all_before_download is True
+    assert script.count(main_flm) == 1
+    assert script.index(main_flm) < script.index(erase) < script.index(program)
+    assert 'print("chip erase failed: 0x08000000")' in script
+
+
+def test_chip_erase_flag_requires_a_boolean_and_rejects_hpm():
+    payload = _config()
+    payload["erase_all_before_download"] = "true"
+    with pytest.raises(OfflineDownloadError, match="must be a boolean"):
+        parse_offline_config(payload)
+
+    payload = {
+        "model": "V4",
+        "script_name": "hpm.py",
+        "auto_download_count": 1,
+        "wait_idcode_timeout_ms": 10000,
+        "swd_clock_hz": 10000000,
+        "target_part": "HPM5301xEGx",
+        "board": "hpm5301evklite",
+        "erase_all_before_download": True,
+        "algorithms": [],
+        "firmwares": [{
+            "id": "app",
+            "file_name": "app.bin",
+            "format": "bin",
+            "base_address": "0x80000400",
+            "algorithm_id": "",
+            "upload_index": 0,
+        }],
+    }
+    with pytest.raises(OfflineDownloadError, match="HPM ROM API.*chip erase"):
+        parse_offline_config(payload)
+
+
+def test_v3_security_script_orders_unlock_program_and_lock_and_aborts_on_failure():
+    config = parse_offline_config(_gd32_security_config())
+    script = generate_offline_script(config)
+    assert b"connect=halt\n" in config.security.unlock_config
+    assert b"connect=halt\n" in config.security.lock_config
+    assert b"under_reset" not in config.security.unlock_config
+    assert b"off_ms=3000\n" in config.security.unlock_config
+    assert b"off_max_mv=800\n" in config.security.unlock_config
+
+    unlock_flm = 'load.flm("FLM/GD32F10x_OPT.FLM", 0x1FFFF800, 0x20000000)'
+    unlock = 'cmd.unlock("CFG/GD32F303xE/unlock.cfg")'
+    program = 'load.bin("boot.bin", 0x08000000)'
+    lock = 'cmd.lock("CFG/GD32F303xE/lock.cfg")'
+    assert script.count(unlock_flm) == 2
+    assert 'cmd.unlock("CFG/__mklink_security_api_probe_missing__.cfg")' in script
+    assert 'cmd.lock("CFG/__mklink_security_api_probe_missing__.cfg")' in script
+    assert "security_unlock_api != -101 or security_lock_api != -101" in script
+    assert script.index(unlock_flm) < script.index(unlock) < script.index(program)
+    assert script.index(program) < script.rindex(unlock_flm) < script.index(lock)
+    assert 'print("security unlock failed:", security_unlock_rc)' in script
+    assert 'print("security lock failed:", security_lock_rc)' in script
+    assert script.index("cmd.set_reset()") < script.index("cmd.cpu_run()")
+
+
+def test_v3_stm32f1_security_uses_part_geometry_with_pinned_recipe():
+    config = parse_offline_config(_stm32f103_security_config())
+    script = generate_offline_script(config)
+
+    assert config.security.family == "stm32f103-rdp1"
+    assert config.security.algorithm_file_name == "STM32F10x_OPT.FLM"
+    assert b"density_expected=0xFFFF0200" in config.security.unlock_config
+    assert b"option_read=shadow_pairs_when_protected" in config.security.unlock_config
+    assert b"shadow_word0_address=0x4002201C" in config.security.unlock_config
+    assert b"shadow_value1=word0:2:0x07:0xF8" in config.security.unlock_config
+    assert b"shadow_value7=word1:24:0xFF:0x00" in config.security.unlock_config
+    assert b"connect=halt" in config.security.unlock_config
+    assert b"off_ms=3000" in config.security.unlock_config
+    assert b"off_max_mv=800" in config.security.unlock_config
+    assert b"connect=halt" in config.security.lock_config
+    assert 'load.flm("FLM/STM32F10x_OPT.FLM", 0x1FFFF800, 0x20000000)' in script
+    assert 'cmd.unlock("CFG/STM32F103xE/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/STM32F103xE/lock.cfg")' in script
+
+    payload = _stm32f103_security_config()
+    payload["target_part"] = "STM32F103RC"
+    config = parse_offline_config(payload)
+    script = generate_offline_script(config)
+    assert b"id_expected=0x00000414" in config.security.unlock_config
+    assert b"density_expected=0xFFFF0100" in config.security.unlock_config
+    assert b"flash_size=0x00040000" in config.security.unlock_config
+    assert 'cmd.unlock("CFG/STM32F103xC/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/STM32F103xC/lock.cfg")' in script
+
+
+@pytest.mark.parametrize(
+    ("part_number", "device_id", "flash_kib"),
+    [
+        ("STM32F100C8", 0x420, 64),
+        ("STM32F100ZE", 0x428, 512),
+        ("STM32F101C6", 0x412, 32),
+        ("STM32F102CB", 0x410, 128),
+        ("STM32F103RC", 0x414, 256),
+        ("STM32F103ZG", 0x430, 1024),
+        ("STM32F105R8", 0x418, 64),
+        ("STM32F105RC", 0x418, 256),
+        ("STM32F107VC", 0x418, 256),
+    ],
+)
+def test_v3_stm32f1_series_resolves_device_and_capacity(part_number, device_id, flash_kib):
+    payload = _stm32f103_security_config()
+    payload["target_part"] = part_number
+
+    config = parse_offline_config(payload)
+
+    assert f"id_expected=0x{device_id:08X}\n".encode("ascii") in config.security.unlock_config
+    assert f"density_expected=0x{0xFFFF0000 | flash_kib:08X}\n".encode("ascii") in config.security.unlock_config
+    assert f"flash_size=0x{flash_kib * 1024:08X}\n".encode("ascii") in config.security.unlock_config
+
+
+def test_v3_without_post_lock_resets_and_beeps_after_programming():
+    script = generate_offline_script(
+        parse_offline_config(_gd32_security_config(lock=False))
+    )
+
+    assert 'cmd.unlock("CFG/GD32F303xE/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/GD32F303xE/lock.cfg")' not in script
+    program = script.index('load.bin("assets.bin", 0x90000000)')
+    reset = script.index("cmd.set_reset()")
+    run = script.index("cmd.cpu_run()")
+    beep_on = script.index("cmd.set_beep_on()")
+    delay = script.index("time.sleep_ms(1000)")
+    beep_off = script.index("cmd.set_beep_off()")
+    finished = script.index('print("auto download finished")')
+    assert program < finished < reset < run < beep_on < delay < beep_off
+
+
+def test_v3_stm32g474_security_uses_generic_masked_word_recipe():
+    config = parse_offline_config(_stm32g474_security_config())
+    script = generate_offline_script(config)
+
+    assert config.security.family == "stm32g474-rdp1"
+    assert config.security.algorithm_file_name == "STM32G4xx_DB_OPT.FLM"
+    assert config.security.option_address == 0x1FFF7800
+    assert b"layout=word32_list" in config.security.unlock_config
+    assert b"option_read=word32_list" in config.security.unlock_config
+    assert b"shadow_word0_address=0x40022020" in config.security.unlock_config
+    assert b"shadow_word0_mask=0xFFFFFFFF" in config.security.unlock_config
+    assert b"shadow_word10_address=0x40022074" in config.security.unlock_config
+    assert b"shadow_word10_mask=0x000100FF" in config.security.unlock_config
+    assert b"forbidden_value=0xCC" in config.security.unlock_config
+    assert b"id_expected=0x00000469" in config.security.unlock_config
+    assert b"density_expected=0xFFFF0200" in config.security.unlock_config
+    assert b"status_protected_mask=0x00000000" in config.security.unlock_config
+    assert b"connect=halt" in config.security.unlock_config
+    assert b"flash_size=0x00080000" in config.security.unlock_config
+    assert 'load.flm("FLM/STM32G4xx_DB_OPT.FLM", 0x1FFF7800, 0x20000000)' in script
+    assert 'cmd.unlock("CFG/STM32G474xE/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/STM32G474xE/lock.cfg")' in script
+
+
+def test_stm32g474_offline_security_is_enabled_only_for_updated_v3_firmware():
+    app = create_app(auth_token=None, project_root=".")
+    with TestClient(app) as client:
+        v3 = client.get(
+            "/api/offline-download/security",
+            params={"model": "V3", "part_number": "STM32G474RET6"},
+        )
+        v4 = client.get(
+            "/api/offline-download/security",
+            params={"model": "V4", "part_number": "STM32G474RET6"},
+        )
+
+    assert v3.status_code == 200
+    assert v3.json()["supported"] is True
+    assert v3.json()["family"] == "stm32g474-rdp1"
+    assert v4.status_code == 200
+    assert v4.json()["supported"] is False
+    assert "固件尚未支持" in v4.json()["reason"]
+
+
+def test_v3_py32f030_security_uses_exact_x8_halt_recipe():
+    config = parse_offline_config(_py32f030_security_config())
+    script = generate_offline_script(config)
+
+    assert config.security.family == "py32f030x8-rdp1"
+    assert config.security.algorithm_file_name == "PY061xx_OB.FLM"
+    assert config.security.option_address == 0x1FFF0E80
+    assert b"layout=word32_inverse_pairs" in config.security.unlock_config
+    assert b"option_read=direct" in config.security.unlock_config
+    assert b"forbidden_value=0xCC" in config.security.unlock_config
+    assert b"id_address=0x40015800" in config.security.unlock_config
+    assert b"id_expected=0x60001000" in config.security.unlock_config
+    assert b"density_address=0x1FFF0E0C" in config.security.unlock_config
+    assert b"density_mask=0x000000FF" in config.security.unlock_config
+    assert b"density_expected=0x00000078" in config.security.unlock_config
+    assert b"connect=halt" in config.security.unlock_config
+    assert b"allow_program_interrupt_on_transition=1" in config.security.unlock_config
+    assert b"allow_program_interrupt_on_transition=1" in config.security.lock_config
+    assert b"flash_size=0x00010000" in config.security.unlock_config
+    assert b"off_ms=3000" in config.security.unlock_config
+    assert b"off_max_mv=800" in config.security.unlock_config
+    assert 'load.flm("FLM/PY061xx_OB.FLM", 0x1FFF0E80, 0x20000000)' in script
+    assert 'cmd.unlock("CFG/PY32F030K28T6/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/PY32F030K28T6/lock.cfg")' in script
+
+
+def test_py32f030_offline_security_is_exact_part_and_v3_only():
+    app = create_app(auth_token=None, project_root=".")
+    with TestClient(app) as client:
+        exact_v3 = client.get(
+            "/api/offline-download/security",
+            params={"model": "V3", "part_number": "PY32F030K28T6"},
+        )
+        exact_v4 = client.get(
+            "/api/offline-download/security",
+            params={"model": "V4", "part_number": "PY32F030K28T6"},
+        )
+        nearby = client.get(
+            "/api/offline-download/security",
+            params={"model": "V3", "part_number": "PY32F030K18T6"},
+        )
+
+    assert exact_v3.status_code == 200
+    assert exact_v3.json()["supported"] is True
+    assert exact_v3.json()["family"] == "py32f030x8-rdp1"
+    assert exact_v4.status_code == 200
+    assert exact_v4.json()["supported"] is False
+    assert "固件尚未支持" in exact_v4.json()["reason"]
+    assert nearby.status_code == 200
+    assert nearby.json()["supported"] is False
+
+
+@pytest.mark.parametrize("model", ["V2"])
+def test_offline_security_fails_closed_for_firmware_without_security_commands(model):
+    payload = _gd32_security_config()
+    payload["model"] = model
+    if model == "V2":
+        payload["auto_download_count"] = 1
+
+    with pytest.raises(OfflineDownloadError, match="V3/V4"):
+        parse_offline_config(payload)
+
+
+def test_v4_security_uses_the_same_pinned_recipe_and_resets_without_post_lock():
+    payload = _gd32_security_config(lock=False)
+    payload["model"] = "V4"
+    payload["script_name"] = "gd32-security.py"
+
+    script = generate_offline_script(parse_offline_config(payload))
+
+    assert 'cmd.unlock("CFG/GD32F303xE/unlock.cfg")' in script
+    assert 'cmd.lock("CFG/GD32F303xE/lock.cfg")' not in script
+    assert "security_unlock_api != -101 or security_lock_api != -101" in script
+    assert "cmd.set_reset()" in script
+    assert script.index("cmd.set_reset()") < script.index("cmd.cpu_run()")
+
+
+def test_offline_security_rejects_unvalidated_target_and_accepts_board_voltage():
+    payload = _gd32_security_config()
+    payload["target_part"] = "GD32F103RET6"
+    with pytest.raises(OfflineDownloadError, match="真机验证"):
+        parse_offline_config(payload)
+
+    for voltage in (1800, 5000):
+        payload = _gd32_security_config()
+        payload["security_voltage_mv"] = voltage
+        config = parse_offline_config(payload)
+        assert f"voltage_mv={voltage}\n".encode("ascii") in config.security.unlock_config
+        assert f"voltage_mv={voltage}\n".encode("ascii") in config.security.lock_config
+
+    payload = _gd32_security_config()
+    payload["security_voltage_mv"] = 2500
+    with pytest.raises(OfflineDownloadError, match="1.8V, 3.3V, or 5V"):
+        parse_offline_config(payload)
+
 def test_hpm_offline_script_uses_rom_api_without_flm():
     payload = {
         "model": "V4",
@@ -253,6 +582,70 @@ def test_deploy_copies_script_firmwares_and_flms_to_expected_usb_directories(tmp
     assert (disk / "keep.txt").read_text(encoding="ascii") == "keep"
 
 
+def test_v3_security_deploys_pinned_option_flm_and_configs(tmp_path):
+    config = parse_offline_config(_gd32_security_config())
+    firmware_sources = []
+    for name in ("boot.bin", "rt-thread.hex", "assets.bin"):
+        path = tmp_path / ("source-" + name)
+        path.write_bytes(name.encode("ascii"))
+        firmware_sources.append(path)
+    algorithm_sources = []
+    for name in ("internal.flm", "external.flm"):
+        path = tmp_path / name
+        path.write_bytes(name.encode("ascii"))
+        algorithm_sources.append(path)
+    disk = tmp_path / "MICROKEEN"
+    disk.mkdir()
+
+    result = deploy_offline_bundle(
+        config,
+        disk,
+        firmware_sources=firmware_sources,
+        algorithm_sources=algorithm_sources,
+    )
+
+    assert "FLM/GD32F10x_OPT.FLM" in result["files"]
+    assert "CFG/GD32F303xE/unlock.cfg" in result["files"]
+    assert "CFG/GD32F303xE/lock.cfg" in result["files"]
+    assert (disk / "FLM" / "GD32F10x_OPT.FLM").read_bytes() == config.security.algorithm_path.read_bytes()
+    assert "id_expected=0x00000414" in (disk / "CFG" / "GD32F303xE" / "unlock.cfg").read_text("ascii")
+    assert "connect=halt" in (disk / "CFG" / "GD32F303xE" / "unlock.cfg").read_text("ascii")
+    assert "density_expected=0x00400200" in (disk / "CFG" / "GD32F303xE" / "lock.cfg").read_text("ascii")
+    assert "option_read=direct" in (disk / "CFG" / "GD32F303xE" / "lock.cfg").read_text("ascii")
+    assert "connect=halt" in (disk / "CFG" / "GD32F303xE" / "lock.cfg").read_text("ascii")
+    assert "off_ms=3000" in (disk / "CFG" / "GD32F303xE" / "lock.cfg").read_text("ascii")
+    assert "off_max_mv=800" in (disk / "CFG" / "GD32F303xE" / "lock.cfg").read_text("ascii")
+
+
+def test_v3_stm32f103xe_security_deploys_separate_assets(tmp_path):
+    config = parse_offline_config(_stm32f103_security_config())
+    firmware_sources = []
+    for name in ("boot.bin", "rt-thread.hex", "assets.bin"):
+        path = tmp_path / ("source-" + name)
+        path.write_bytes(name.encode("ascii"))
+        firmware_sources.append(path)
+    algorithm_sources = []
+    for name in ("internal.flm", "external.flm"):
+        path = tmp_path / name
+        path.write_bytes(name.encode("ascii"))
+        algorithm_sources.append(path)
+    disk = tmp_path / "MICROKEEN"
+    disk.mkdir()
+
+    result = deploy_offline_bundle(
+        config,
+        disk,
+        firmware_sources=firmware_sources,
+        algorithm_sources=algorithm_sources,
+    )
+
+    assert "FLM/STM32F10x_OPT.FLM" in result["files"]
+    unlock = (disk / "CFG" / "STM32F103xE" / "unlock.cfg").read_text("ascii")
+    assert "id_expected=0x00000414" in unlock
+    assert "density_expected=0xFFFF0200" in unlock
+    assert "flash_size=0x00080000" in unlock
+
+
 def test_deploy_never_creates_a_staging_directory_on_the_probe_disk(tmp_path, monkeypatch):
     config = parse_offline_config(_config())
     disk = tmp_path / "MICROKEEN"
@@ -321,6 +714,35 @@ def test_deploy_removes_existing_probe_files_before_copying_replacements(tmp_pat
 
     assert (disk / "boot.bin").read_bytes() == b"boot.bin"
     assert (disk / "FLM" / "STM32F10x_1024.FLM").read_bytes() == b"\x00"
+
+
+def test_local_flm_selected_from_probe_usb_is_staged_before_same_path_update(tmp_path):
+    disk = tmp_path / "MICROKEEN"
+    probe_flm = disk / "FLM" / "STM32F10x_1024.FLM"
+    probe_flm.parent.mkdir(parents=True)
+    probe_flm.write_bytes(b"selected-from-probe")
+    payload = _config()
+    payload["algorithms"][0].pop("upload_index")
+    payload["algorithms"][0]["source_path"] = str(probe_flm)
+    config = parse_offline_config(payload)
+    assert config.algorithms[0].source_path == str(probe_flm)
+
+    firmware_sources = []
+    for index, name in enumerate(("boot.bin", "rt-thread.hex", "assets.bin")):
+        path = tmp_path / f"firmware-probe-source-{index}"
+        path.write_bytes(name.encode("ascii"))
+        firmware_sources.append(path)
+    external_flm = tmp_path / "external.flm"
+    external_flm.write_bytes(b"external")
+
+    deploy_offline_bundle(
+        config,
+        disk,
+        firmware_sources=firmware_sources,
+        algorithm_sources={"internal": probe_flm, "external": external_flm},
+    )
+
+    assert probe_flm.read_bytes() == b"selected-from-probe"
 
 
 def test_v4_trigger_command_selects_the_configured_script():
@@ -466,6 +888,26 @@ def test_preview_api_generates_the_resolved_script():
     assert payload["model"] == "V4"
     assert payload["script_name"] == "factory-line-a.py"
     assert 'load.hex("rt-thread.hex")' in payload["script"]
+
+
+def test_offline_security_api_reports_v3_and_v4_validated_target():
+    app = create_app(auth_token=None, project_root=".")
+    with TestClient(app) as client:
+        supported = client.get(
+            "/api/offline-download/security",
+            params={"model": "V3", "part_number": "GD32F303CET6"},
+        )
+        v4_supported = client.get(
+            "/api/offline-download/security",
+            params={"model": "V4", "part_number": "GD32F303CET6"},
+        )
+
+    assert supported.status_code == 200
+    assert supported.json()["supported"] is True
+    assert supported.json()["voltage_options_mv"] == [1800, 3300, 5000]
+    assert v4_supported.status_code == 200
+    assert v4_supported.json()["supported"] is True
+    assert v4_supported.json()["voltage_options_mv"] == [1800, 3300, 5000]
 
 
 def test_preview_accepts_local_stm32f103re_app_after_bootloader(tmp_path, monkeypatch):
@@ -975,3 +1417,42 @@ def test_deploy_revalidates_local_bin_after_preview(tmp_path, monkeypatch):
     assert deployed.status_code == 422
     assert "exceeds selected FLM coverage" in deployed.json()["detail"]
     assert list(disk.iterdir()) == []
+
+@pytest.mark.parametrize('same_source', [False, True])
+def test_deploy_reuses_unchanged_usb_files_even_when_replacement_is_locked(tmp_path, monkeypatch, same_source):
+    from mklink.offline_download import _transactional_copy
+    disk = tmp_path / 'probe'
+    destination = disk / 'FLM' / 'Device.FLM'
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b'algorithm')
+    source = destination if same_source else tmp_path / 'upload.flm'
+    if not same_source:
+        source.write_bytes(destination.read_bytes())
+    before = destination.stat().st_mtime_ns
+    def reject_remove(path):
+        pytest.fail('unchanged USB file must not be removed')
+    monkeypatch.setattr('mklink.offline_download._remove_probe_file', reject_remove)
+    result = _transactional_copy(disk, [(Path('FLM/Device.FLM'), source, None), (Path('python/test.py'), None, b'script')])
+    assert result == ['FLM/Device.FLM', 'python/test.py']
+    assert destination.read_bytes() == b'algorithm'
+    assert destination.stat().st_mtime_ns == before
+    assert (disk / 'python/test.py').read_bytes() == b'script'
+
+
+def test_locked_changed_file_reports_name_and_rolls_back_earlier_changes(tmp_path, monkeypatch):
+    from mklink.offline_download import _transactional_copy
+    disk = tmp_path / 'probe'
+    disk.mkdir()
+    (disk / 'app.hex').write_bytes(b'old-app')
+    (disk / 'Device.FLM').write_bytes(b'old-flm')
+    from mklink.offline_download import _remove_probe_file as remove
+    def locked_remove(path):
+        if path.name == 'Device.FLM':
+            raise PermissionError('file is in use')
+        remove(path)
+    monkeypatch.setattr('mklink.offline_download._remove_probe_file', locked_remove)
+    with pytest.raises(OfflineDownloadError, match='offline file operation failed: Device.FLM'):
+        _transactional_copy(disk, [(Path('app.hex'), None, b'new-app'), (Path('Device.FLM'), None, b'new-flm'), (Path('script.py'), None, b'script')])
+    assert (disk / 'app.hex').read_bytes() == b'old-app'
+    assert (disk / 'Device.FLM').read_bytes() == b'old-flm'
+    assert not (disk / 'script.py').exists()

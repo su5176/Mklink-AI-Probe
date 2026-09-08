@@ -1,6 +1,7 @@
 <template>
   <div
-    ref="viewport" class="virtual-log" role="log" tabindex="0"
+    ref="viewport" class="virtual-log" :class="{ 'with-timestamp': showTimestamp }"
+    role="log" tabindex="0"
     aria-live="off" @scroll="onScroll"
   >
     <div class="virtual-log-spacer" :style="{ height: `${entries.length * rowHeight}px` }">
@@ -10,9 +11,9 @@
           class="virtual-log-row" :class="`level-${entry.level}`"
         >
           <span class="virtual-log-number">{{ entry.number }}</span>
-          <span class="virtual-log-time">{{ formatTime(entry.time) }}</span>
+          <span v-if="showTimestamp" class="virtual-log-time">{{ formatTime(entry.time) }}</span>
           <span class="virtual-log-level">{{ entry.label || entry.level }}</span>
-          <span class="virtual-log-text">{{ entry.text }}</span>
+          <span class="virtual-log-text">{{ displayContent(entry) }}</span>
         </div>
       </div>
     </div>
@@ -27,9 +28,19 @@ export interface VirtualLogInput {
   readonly level: 'raw' | 'data' | 'warning' | 'error'
   readonly text: string
   readonly label?: string
+  /** Original application data, retained separately from display formatting. */
+  readonly raw?: Uint8Array
 }
 
 interface VirtualLogEntry extends VirtualLogInput { readonly number: number }
+
+const props = withDefaults(defineProps<{
+  displayMode?: 'text' | 'hex'
+  showTimestamp?: boolean
+}>(), {
+  displayMode: 'text',
+  showTimestamp: false,
+})
 
 const MAX_LINES = 5000
 const FOLLOW_THRESHOLD = 24
@@ -88,6 +99,26 @@ function exportText(): string {
   )).join('\n')
 }
 
+function exportRaw(): Uint8Array {
+  flush()
+  const encoder = new TextEncoder()
+  const chunks = entries.value.map(entry => entry.raw ?? encoder.encode(entry.text))
+  const length = chunks.reduce((total, chunk) => total + chunk.byteLength, 0)
+  const output = new Uint8Array(length)
+  let offset = 0
+  for (const chunk of chunks) {
+    output.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  return output
+}
+
+function displayContent(entry: VirtualLogEntry): string {
+  if (props.displayMode === 'text') return entry.text
+  const bytes = entry.raw ?? new TextEncoder().encode(entry.text)
+  return Array.from(bytes, byte => byte.toString(16).toUpperCase().padStart(2, '0')).join(' ')
+}
+
 function scrollToBottom(): void {
   const element = viewport.value
   if (!element || !following.value) return
@@ -131,14 +162,15 @@ onUnmounted(() => {
   window.removeEventListener('resize', measure)
 })
 
-defineExpose({ append, clear, exportText, retainedCount, firstLineNumber, following })
+defineExpose({ append, clear, exportText, exportRaw, retainedCount, firstLineNumber, following })
 </script>
 
 <style scoped>
 .virtual-log { position: relative; overflow: auto; min-height: 160px; background: #1e1e1e; color: #ccc; font: 12px/22px var(--font-mono); }
 .virtual-log-spacer { position: relative; min-width: max-content; width: 100%; }
 .virtual-log-window { position: absolute; inset: 0 auto auto 0; min-width: 100%; }
-.virtual-log-row { display: grid; grid-template-columns: 56px 96px 56px minmax(max-content, 1fr); gap: 8px; height: 22px; white-space: pre; }
+.virtual-log-row { display: grid; grid-template-columns: 56px 56px minmax(max-content, 1fr); gap: 8px; height: 22px; white-space: pre; }
+.with-timestamp .virtual-log-row { grid-template-columns: 56px 96px 56px minmax(max-content, 1fr); }
 .virtual-log-number, .virtual-log-time, .virtual-log-level { color: var(--dim); user-select: none; }
 .virtual-log-number { text-align: right; }
 .level-data .virtual-log-text { color: #8be9fd; }

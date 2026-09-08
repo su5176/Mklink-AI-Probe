@@ -508,7 +508,7 @@ describe('ConfigView', () => {
     expect(mocks.api.uploadFileSource).toHaveBeenCalledWith('symbol', selected)
     expect(wrapper.get<HTMLInputElement>('[data-testid="symbol-path"]').element.value)
       .toBe('browser.axf')
-    expect(wrapper.get('[data-testid="symbol-path-validation"]').text()).toContain('浏览器上传')
+    expect(wrapper.get('[data-testid="symbol-path-validation"]').text()).toContain('文件快照')
 
     mocks.api.parseAxf.mockResolvedValueOnce({
       loaded: true,

@@ -150,6 +150,21 @@ def test_extract_rejects_path_traversal(updater, tmp_path):
         updater.extract_skill_archive(archive, tmp_path / "stage")
 
 
+def test_skill_activation_check_force_bypasses_recent_cache(updater, monkeypatch, tmp_path):
+    root = make_root(tmp_path / "root", "1.2.3")
+    cache = tmp_path / "cache.json"
+    manifest = {"version": "1.2.3"}
+    monkeypatch.setattr(updater, "fetch_manifest", lambda urls:
+                        (dict(manifest), "https://example.test/latest.json"))
+    assert updater.check_for_update(root=root, cache_file=cache)["update_available"] is False
+    manifest["version"] = "1.2.4"
+    args = updater._parser().parse_args(["check", "--force", "--json"])
+    result = updater.check_for_update(root=root, cache_file=cache, force=args.force)
+    assert result["cached"] is False
+    assert result["latest_version"] == "1.2.4"
+    assert result["update_available"] is True
+
+
 def test_copy_installed_skill_is_backed_up_and_replaced(
     updater, monkeypatch, tmp_path,
 ):
@@ -344,8 +359,8 @@ def test_skill_instructions_require_proactive_check_and_user_approval():
     install = (SCRIPT_PATH.parents[1] / "references" / "install.md").read_text(
         encoding="utf-8"
     )
-    assert "skill_update.py check --json" in text
-    assert "只有用户明确同意后" in text
+    assert "skill_update.py check --force --json" in text
+    assert "安装仍须用户同意" in text
     assert "(references/install.md)" in text
     assert "install --yes --json" in install
     assert install.index("只有用户明确同意后") < install.index("install --yes --json")

@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   browseRoots: null as any,
   browseChildren: null as any,
   browseLoading: null as any,
+  generation: null as any,
 }))
 
 const symbolItems = [
@@ -34,7 +35,7 @@ vi.mock('../../composables/useSymbolCatalog', () => ({
     browseRoots: mocks.browseRoots ??= shallowRef([]),
     browseChildren: mocks.browseChildren ??= shallowRef(new Map()),
     browseLoading: mocks.browseLoading ??= shallowRef(new Set()),
-    generation: ref(1),
+    generation: mocks.generation ??= ref(1),
     stale: ref(false),
     truncatedRoots: shallowRef(['controller']),
     loading: ref(false),
@@ -61,6 +62,9 @@ import SymbolsTab from './SymbolsTab.vue'
 describe('SymbolsTab', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.generation ??= ref(1)
+    mocks.generation.value = 1
+    mocks.refreshStatus.mockResolvedValue(undefined)
     mocks.items ??= shallowRef(symbolItems)
     mocks.items.value = symbolItems
     mocks.browseRoots ??= shallowRef([])
@@ -112,6 +116,31 @@ describe('SymbolsTab', () => {
     await wrapper.get('[data-symbol="controller"]').trigger('click')
     await flushPromises()
     expect(wrapper.get('[data-symbol="controller.target"]').exists()).toBe(true)
+  })
+
+  it('refreshes a rebuilt source and cancels polling when closed', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(SymbolsTab, { props: { deviceConnected: true } })
+    try {
+      await flushPromises()
+      await wrapper.get('[data-testid="symbol-search"]').setValue('gain')
+      await flushPromises()
+      await wrapper.get('[data-symbol="gain"]').trigger('click')
+      await flushPromises()
+      mocks.searchSymbols.mockResolvedValue([{ ...symbolItems[1], address: 0x20000040 }])
+      mocks.refreshStatus.mockImplementation(async () => { mocks.generation.value = 2 })
+      await vi.advanceTimersByTimeAsync(2000)
+      await flushPromises()
+      expect(wrapper.text()).toContain('0x20000040')
+      expect(wrapper.text()).not.toContain('类型信息:')
+      wrapper.unmount()
+      const calls = mocks.refreshStatus.mock.calls.length
+      await vi.advanceTimersByTimeAsync(4000)
+      expect(mocks.refreshStatus).toHaveBeenCalledTimes(calls)
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
   })
 
   it('filters the loaded catalog locally', async () => {

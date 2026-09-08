@@ -24,6 +24,7 @@ if (!buildCommit) {
 
 // https://vite.dev/config/
 export default defineConfig({
+  base: './',
   cacheDir: process.env.MKLINK_VITE_CACHE_DIR || 'node_modules/.vite',
   plugins: [vue()],
   build: {

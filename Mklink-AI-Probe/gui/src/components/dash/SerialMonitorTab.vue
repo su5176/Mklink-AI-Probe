@@ -75,6 +75,10 @@
           :aria-pressed="viewMode === 'terminal'" @click="setViewMode('terminal')"
         ><SquareTerminal :size="14" /><span>{{ tr('终端', 'Terminal') }}</span></button>
       </div>
+      <LogDisplayControls
+        v-if="viewMode === 'log'" id-prefix="serial"
+        v-model:mode="logDisplayMode" v-model:show-timestamp="showLogTimestamp"
+      />
       <div class="serial-metrics">
         <span>RX {{ stats.rx_count }} / {{ stats.rx_bytes }} B</span>
         <span>TX {{ stats.tx_count }} / {{ stats.tx_bytes }} B</span>
@@ -126,7 +130,10 @@
       </span>
     </div>
 
-    <VirtualLogPanel v-if="viewMode === 'log'" ref="logPanel" class="serial-log" />
+    <VirtualLogPanel
+      v-if="viewMode === 'log'" ref="logPanel" class="serial-log"
+      :display-mode="logDisplayMode" :show-timestamp="showLogTimestamp"
+    />
     <div v-else class="serial-terminal-shell">
       <RttTerminalPanel
         ref="terminalPanel" :input-enabled="transmitEnabled"
@@ -150,7 +157,7 @@ import { useToast } from '../../composables/useToast'
 import { tr } from '../../composables/useLanguage'
 import type { DesktopSettings } from '../../lib/desktopSettings'
 import { toHexPayload } from '../../lib/rttTransmit'
-import { downloadTextFile, timestampedLogName } from '../../lib/downloadTextFile'
+import { saveBlobFile, timestampedLogName } from '../../lib/downloadTextFile'
 import {
   loadSerialAssistantSettings,
   saveSerialAssistantSettings,
@@ -158,6 +165,7 @@ import {
 } from '../../lib/serialAssistantSettings'
 import type { PortInfo } from '../../types/mklink'
 import RttTerminalPanel from './RttTerminalPanel.vue'
+import LogDisplayControls, { type LogDisplayMode } from './LogDisplayControls.vue'
 import RttTransmitBar from './RttTransmitBar.vue'
 import SetupHint from './SetupHint.vue'
 import VirtualLogPanel, { type VirtualLogInput } from './VirtualLogPanel.vue'
@@ -232,6 +240,8 @@ const stats = ref({ rx_count: 0, tx_count: 0, rx_bytes: 0, tx_bytes: 0, bytes_pe
 const portStatuses = ref<Record<string, string>>({})
 const runtimeError = ref('')
 const viewMode = ref<'log' | 'terminal'>('terminal')
+const logDisplayMode = ref<LogDisplayMode>('text')
+const showLogTimestamp = ref(false)
 const logPanel = ref<InstanceType<typeof VirtualLogPanel> | null>(null)
 const terminalPanel = ref<InstanceType<typeof RttTerminalPanel> | null>(null)
 const serialSettings = ref<SerialAssistantSettings>(loadSerialAssistantSettings(localStorage))
@@ -632,7 +642,8 @@ watch(() => logBinary.serialLines.value, batch => {
     time: line.timestampNs,
     level: line.direction === 'RX' ? 'data' : 'warning',
     label: line.direction,
-    text: `${line.rawHex}${line.ascii ? `  ${visibleAscii(line.ascii)}` : ''}`,
+    text: visibleAscii(line.ascii),
+    raw: hexToBytes(line.rawHex),
   } satisfies VirtualLogInput)))
 })
 
@@ -688,8 +699,22 @@ function clearVisibleOutput(): void {
 }
 
 function saveLog(): void {
-  const text = logPanel.value?.exportText() || ''
-  if (text) downloadTextFile(timestampedLogName('serial'), text)
+  const raw = logPanel.value?.exportRaw() ?? new Uint8Array()
+  if (raw.byteLength) {
+    void saveBlobFile(
+      timestampedLogName('serial'),
+      new Blob([new Uint8Array(raw)], { type: 'application/octet-stream' }),
+    )
+  }
+}
+
+function hexToBytes(value: string): Uint8Array {
+  const compact = value.replace(/\s+/g, '')
+  const bytes = new Uint8Array(compact.length / 2)
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(compact.slice(index * 2, index * 2 + 2), 16)
+  }
+  return bytes
 }
 
 function visibleAscii(value: string): string {

@@ -16,6 +16,14 @@ function symbol(path: string, parentPath: string | null = null): SymbolDescripto
 }
 
 describe('symbolTree', () => {
+  it('shows the union of comma-separated search terms', () => {
+    const rows = visibleSymbolRows(buildSymbolTree([
+      symbol('speed'), symbol('motor.current', 'motor'), symbol('temperature'), symbol('other'),
+    ]), { expanded: new Set(), selected: new Set(), query: 'speed，current;temperature', selectedOnly: false })
+    expect(rows.filter(row => row.node.kind === 'leaf').map(row => row.node.key)).toEqual([
+      'speed', 'motor.current', 'temperature',
+    ])
+  })
   it('builds nested structure and array branches while keeping scalars as leaves', () => {
     const roots = buildSymbolTree([
       symbol('gain'),

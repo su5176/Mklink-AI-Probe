@@ -35,14 +35,15 @@ class SymbolValueError(SymbolCatalogError):
 class AxfFingerprint:
     size: int
     mtime_ns: int
+    sha256: str = ""
 
     @classmethod
     def from_path(cls, path: str) -> "AxfFingerprint":
-        stat = Path(path).stat()
-        return cls(size=stat.st_size, mtime_ns=stat.st_mtime_ns)
+        from mklink.file_content import source_fingerprint
+        return cls(**source_fingerprint(path))
 
-    def to_dict(self) -> dict[str, int]:
-        return {"size": self.size, "mtime_ns": self.mtime_ns}
+    def to_dict(self) -> dict:
+        return {"size": self.size, "mtime_ns": self.mtime_ns, "sha256": self.sha256}
 
 
 @dataclass(frozen=True)
@@ -186,6 +187,8 @@ class SymbolCatalog:
         return self._resolve_descriptor(path)
 
     def require(self, path: str, generation: int) -> SymbolDescriptor:
+        if self.fingerprint.sha256 and self.is_stale():
+            raise SymbolCatalogError("AXF content changed; reparse symbols before access")
         if generation != self.generation:
             raise SymbolCatalogError(
                 f"symbol generation is stale: expected {self.generation}, got {generation}"
@@ -249,19 +252,21 @@ class SymbolCatalog:
             return True
 
     def search(self, query: str, *, limit: int = 50) -> tuple[SymbolDescriptor, ...]:
-        query_key = query.strip().casefold()
+        terms = list(dict.fromkeys(term.strip() for term in re.split(r'[,，;；\n]+', query) if term.strip()))
+        query_keys = [term.casefold() for term in terms]
         count = max(1, min(int(limit), 500))
         found: list[SymbolDescriptor] = []
         seen: set[str] = set()
 
-        exact = self.by_path(query.strip()) if query.strip() else None
-        if exact is not None:
-            found.append(exact)
-            seen.add(exact.path)
+        for term in terms[:50]:
+            exact = self.by_path(term)
+            if exact is not None and exact.path not in seen:
+                found.append(exact)
+                seen.add(exact.path)
         for item in self.items:
             if item.path in seen:
                 continue
-            if query_key and query_key not in item.path.casefold() and query_key not in item.type_name.casefold():
+            if query_keys and not any(key in item.path.casefold() or key in item.type_name.casefold() for key in query_keys):
                 continue
             found.append(item)
             seen.add(item.path)
@@ -1014,7 +1019,10 @@ def encode_descriptor(descriptor: SymbolDescriptor, value: object) -> bytes:
             raise SymbolValueError("floating-point value must be finite")
         if size not in (4, 8):
             raise SymbolValueError(f"unsupported floating-point size: {size}")
-        return struct.pack("<f" if size == 4 else "<d", number)
+        try:
+            return struct.pack("<f" if size == 4 else "<d", number)
+        except OverflowError as exc:
+            raise SymbolValueError("floating-point value does not fit the selected type") from exc
     if kind == "bool":
         if not isinstance(value, bool):
             raise SymbolValueError("boolean value must be true or false")

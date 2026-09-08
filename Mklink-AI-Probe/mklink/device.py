@@ -86,6 +86,7 @@ def _resolve_rtt_stream_parameters(
     search_size: int,
     mode: int | None,
     project_root: str,
+    source_path: str | None = None,
 ) -> tuple[str, int, int, int]:
     """Resolve and validate the shared RTT/SystemView probe parameters.
 
@@ -100,6 +101,9 @@ def _resolve_rtt_stream_parameters(
         from mklink.project_config import load_rtt_config, resolve_rtt_storage_mode
 
         rtt_cfg = load_rtt_config(project_root)
+        if missing_addr:
+            from mklink.project_config import ensure_rtt_config_updated
+            rtt_cfg = ensure_rtt_config_updated(project_root, source_path=source_path)
         if mode is None:
             mode = resolve_rtt_storage_mode(rtt_cfg)
 
@@ -295,7 +299,7 @@ class Device:
         self._systemview_parser = None
         self._dwarf_info = None
         self._symbol_catalog = None
-        self._symbol_layout_overrides: dict[tuple[str, int, int], dict[str, tuple[str, int | None]]] = {}
+        self._symbol_layout_overrides: dict[tuple[str, int, int, str], dict[str, tuple[str, int | None]]] = {}
         self._symbol_lock = threading.RLock()
         self._axf_error = None  # reason ELF/DWARF loading was skipped
         self._connected = False
@@ -556,6 +560,7 @@ class Device:
             str(Path(candidate).resolve()),
             fingerprint.size,
             fingerprint.mtime_ns,
+            fingerprint.sha256,
         )
         for variable_name, (definition, pack) in self._symbol_layout_overrides.get(
             override_key, {}
@@ -646,6 +651,7 @@ class Device:
                 str(Path(catalog.axf_path).resolve()),
                 catalog.fingerprint.size,
                 catalog.fingerprint.mtime_ns,
+                catalog.fingerprint.sha256,
             )
             overrides = dict(self._symbol_layout_overrides.get(override_key, {}))
             overrides[variable_name] = (definition, pack)
@@ -1123,6 +1129,13 @@ class Device:
             )
         self._stop_active_probe_streams()
         self._bridge.send_command(f"cmd.set_power_on({voltage_mv})", timeout=10.0)
+
+    def set_power_off(self) -> None:
+        """Disable probe VCC output without disconnecting the command interface."""
+
+        self._require_connected()
+        self._stop_active_probe_streams()
+        self._bridge.send_command("cmd.set_power_off()", timeout=10.0)
 
     def reboot(self) -> None:
         """Reboot the MKLink probe, then release serial and HIL locks.
@@ -1648,6 +1661,7 @@ class Device:
             search_size,
             mode,
             self._project_root,
+            source_path=self._axf,
         )
         if self._rtt_session and self._rtt_session._running:
             self._rtt_session.stop()
@@ -1847,6 +1861,7 @@ class Device:
             search_size,
             mode,
             self._project_root,
+            source_path=self._axf,
         )
         old_systemview_session = self._systemview_session
         if old_systemview_session is not None:
@@ -2144,6 +2159,8 @@ class Device:
     # ------------------------------------------------------------------
     def read_variable(self, name: str) -> Any:
         self._require_connected()
+        if self.symbol_catalog is not None and self.symbol_catalog.is_stale():
+            self.reparse_axf_atomically()
         if not self._dwarf_info:
             return self._read_variable_from_map(name)
         from mklink.watch import resolve_variable_path, decode_value
@@ -2181,6 +2198,8 @@ class Device:
 
     def write_variable(self, name: str, value: int) -> None:
         self._require_connected()
+        if self.symbol_catalog is not None and self.symbol_catalog.is_stale():
+            raise DeviceError("AXF content changed; reparse and confirm target firmware before writing")
         if not self._dwarf_info:
             raise DeviceError(
                 "No AXF/ELF loaded. Pass axf= to connect() for variable access."

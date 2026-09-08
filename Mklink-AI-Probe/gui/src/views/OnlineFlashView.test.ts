@@ -579,6 +579,36 @@ function viewFetch(targets = [installedTarget]) {
         ...record, default: false, source_kind: 'custom-flm', source_name: '用户 FLM',
       }))])
     }
+    if (url.includes('/targets/') && url.endsWith('/security')) {
+      const targetPart = decodeURIComponent(url.split('/targets/')[1].split('/security')[0])
+      const supported = targetPart.startsWith('STM32F103')
+        || targetPart.startsWith('STM32G474')
+        || targetPart.startsWith('STM32H743')
+        || targetPart.startsWith('STM32L010')
+        || targetPart.startsWith('GD32F303')
+        || targetPart.startsWith('PY32F030')
+      const family = targetPart.startsWith('GD32F303')
+        ? 'gd32f303xe-spc'
+        : targetPart.startsWith('PY32F030')
+          ? 'py32f030x8-rdp1'
+        : targetPart.startsWith('STM32G474')
+        ? 'stm32g474-rdp1'
+        : targetPart.startsWith('STM32H743')
+          ? 'stm32h743-rdp1'
+          : targetPart.startsWith('STM32L010')
+            ? 'stm32l010x4-rdp1'
+          : supported ? 'stm32f103-rdp1' : ''
+      return json({
+        part_number: targetPart, supported,
+        unlock_supported: supported, lock_supported: supported,
+        family,
+        reason: supported ? '' : '该器件尚未通过加锁/解锁真机验证',
+        unlock_erases_flash: supported,
+        unlock_erases_eeprom: targetPart.startsWith('STM32L010'),
+        unlock_erases_backup_registers: targetPart.startsWith('STM32L010'),
+        reversible_lock: supported,
+      })
+    }
     if (url.includes('/targets/') && url.endsWith('/memory-map')) return json([{
       name: 'flash', start: 0x08000000, length: 0x80000, sector_size: 0x800,
     }])
@@ -667,15 +697,18 @@ async function readyAndStart(wrapper: ReturnType<typeof mount>) {
   await wrapper.get('[data-testid="bin-base"]').setValue('0x80000000')
   await vi.waitFor(() => expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined())
   await wrapper.get('[data-testid="start-job"]').trigger('click')
+  if (wrapper.find('[data-testid="confirmation-accept"]').exists()) {
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+  }
   await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1))
 }
 
 describe('online flash task workspace behavior', () => {
-  it('defaults the connection mode to keeping the target running', async () => {
+  it('defaults the programming connection mode to halt', async () => {
     const wrapper = mount(await onlineFlashView())
 
     expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value)
-      .toBe('attach')
+      .toBe('halt')
     wrapper.unmount()
   })
 
@@ -952,6 +985,216 @@ describe('online flash task workspace behavior', () => {
     wrapper.unmount()
   })
 
+  it('keeps security actions off by default and greys them for unvalidated targets', async () => {
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').element.closest('label')?.title).toContain('真机验证'))
+
+    expect(wrapper.get<HTMLInputElement>('[data-testid="action-unlock"]').element.checked).toBe(false)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="action-lock"]').element.checked).toBe(false)
+    expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeDefined()
+    wrapper.unmount()
+  })
+
+  it('requires separate unlock and lock confirmations for validated STM32F103', async () => {
+    const target = { ...installedTarget, part_number: 'STM32F103RE' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32F103RE"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32F103RE"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+    await chooseFirmware(wrapper)
+    await wrapper.get('[data-testid="bin-base"]').setValue('0x80000000')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined())
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('Flash 中的全部数据都会永久删除')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="action-unlock"]').element.checked).toBe(false)
+    expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeDefined()
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    await wrapper.get('[data-testid="action-lock"]').setValue(true)
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('可逆读保护')
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    await wrapper.get('[data-testid="start-job"]').trigger('click')
+    await vi.waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/jobs'))).toBe(true))
+
+    expect(window.confirm).not.toHaveBeenCalled()
+    const call = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith('/jobs'))
+    expect(JSON.parse(String(call?.[1]?.body)).actions).toEqual([
+      'connect', 'unlock', 'erase', 'program', 'verify', 'lock', 'reset', 'disconnect',
+    ])
+    wrapper.unmount()
+  })
+
+  it('selects the safe G474 connection and reset modes when unlock is checked', async () => {
+    const target = { ...installedTarget, part_number: 'STM32G474RET6' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32G474RET6"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32G474RET6"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value).toBe('under-reset')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="reset-mode"]').element.value).toBe('power-cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('selects the safe GD32F303 connection and reset modes when unlock is checked', async () => {
+    const target = { ...installedTarget, part_number: 'GD32F303CET6' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-GD32F303CET6"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-GD32F303CET6"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value).toBe('halt')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="reset-mode"]').element.value).toBe('power-cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('selects the safe PY32F030 connection and reset modes when unlock is checked', async () => {
+    const target = { ...installedTarget, part_number: 'PY32F030K28T6' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-PY32F030K28T6"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-PY32F030K28T6"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value).toBe('halt')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="reset-mode"]').element.value).toBe('power-cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('selects the safe H743 connection and reset modes when unlock is checked', async () => {
+    const target = { ...installedTarget, part_number: 'STM32H743IIT6' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32H743IIT6"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32H743IIT6"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value).toBe('under-reset')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="reset-mode"]').element.value).toBe('power-cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('warns about all L010 data loss and selects its safe reset modes', async () => {
+    const target = { ...installedTarget, part_number: 'STM32L010F4P6' }
+    vi.stubGlobal('fetch', viewFetch([target]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32L010F4P6"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32L010F4P6"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('数据 EEPROM 和备份寄存器')
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="connect-mode"]').element.value).toBe('under-reset')
+    expect(wrapper.get<HTMLSelectElement>('[data-testid="reset-mode"]').element.value).toBe('power-cycle')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('offers power-cycle reset with 3.3V default and confirms the exact voltage per job', async () => {
+    const wrapper = mount(await onlineFlashView())
+    await wrapper.get('[data-testid="reset-mode"]').setValue('power-cycle')
+
+    expect(wrapper.get('[data-testid="reset-voltage-setting"]').text()).toContain('默认 3.3V')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-3300"]').element.checked).toBe(true)
+    await readyAndStart(wrapper)
+
+    expect(window.confirm).not.toHaveBeenCalled()
+    const call = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith('/jobs'))
+    const body = JSON.parse(String(call?.[1]?.body))
+    expect(body.reset_mode).toBe('power-cycle')
+    expect(body.reset_voltage_mv).toBe(3300)
+    wrapper.unmount()
+  })
+
+  it('warns immediately before selecting a 5V power-cycle restore voltage', async () => {
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="reset-mode"]').setValue('power-cycle')
+    await wrapper.get('[data-testid="reset-voltage-5000"]').setValue(true)
+
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('5V 可能永久损坏')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-5000"]').element.checked).toBe(false)
+    await wrapper.get('[data-testid="confirmation-accept"]').trigger('click')
+    expect(wrapper.get<HTMLInputElement>('[data-testid="reset-voltage-5000"]').element.checked).toBe(true)
+    wrapper.unmount()
+  })
+
+  it('does not submit a job when the exact power-cycle voltage is declined', async () => {
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-DEVICE_A"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    await chooseFirmware(wrapper)
+    await wrapper.get('[data-testid="bin-base"]').setValue('0x80000000')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined())
+    await wrapper.get('[data-testid="reset-mode"]').setValue('power-cycle')
+    await wrapper.get('[data-testid="start-job"]').trigger('click')
+    expect(wrapper.get('[role="alertdialog"]').text()).toContain('等待 3 秒后以 3.3V 恢复输出')
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/jobs'))).toBe(false)
+    await wrapper.get('[data-testid="confirmation-cancel"]').trigger('click')
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/jobs'))).toBe(false)
+    expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeUndefined()
+    wrapper.unmount()
+  })
+
+  it('cancels security selection without calling desktop native confirm or starting a job', async () => {
+    vi.stubGlobal('confirm', vi.fn(() => { throw new Error('native dialog unavailable') }))
+    vi.stubGlobal('fetch', viewFetch([{ ...installedTarget, part_number: 'STM32F103RE' }]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32F103RE"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32F103RE"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+    for (const action of ['unlock', 'lock']) {
+      await wrapper.get(`[data-testid="action-${action}"]`).setValue(true)
+      expect(wrapper.get('.online-flash-grid').attributes('inert')).toBeDefined()
+      expect(wrapper.get<HTMLInputElement>(`[data-testid="action-${action}"]`).element.checked).toBe(false)
+      await wrapper.get('[data-testid="confirmation-cancel"]').trigger('click')
+      expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false)
+      expect(wrapper.get<HTMLInputElement>(`[data-testid="action-${action}"]`).element.checked).toBe(false)
+    }
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    await wrapper.get('[role="alertdialog"]').trigger('keydown', { key: 'Escape' })
+    expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false)
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/jobs'))).toBe(false)
+    expect(window.confirm).not.toHaveBeenCalled()
+    wrapper.unmount()
+  })
+
+  it('invalidates an open confirmation when the selected target changes', async () => {
+    vi.stubGlobal('fetch', viewFetch([{ ...installedTarget, part_number: 'STM32F103RE' }, regularTarget]))
+    const wrapper = mount(await onlineFlashView())
+    await vi.waitFor(() => expect(wrapper.find('[data-testid="target-STM32F103RE"]').exists()).toBe(true))
+    await wrapper.get('[data-testid="target-STM32F103RE"]').trigger('click')
+    await vi.waitFor(() => expect(wrapper.get('[data-testid="action-unlock"]').attributes('disabled')).toBeUndefined())
+    await wrapper.get('[data-testid="action-unlock"]').setValue(true)
+    // Simulate an external target change while the page is inert.
+    await wrapper.get('[data-testid="target-DEVICE_A"]').trigger('click')
+    expect(wrapper.find('[role="alertdialog"]').exists()).toBe(false)
+    expect(wrapper.get<HTMLInputElement>('[data-testid="action-unlock"]').element.checked).toBe(false)
+    wrapper.unmount()
+  })
+
   it('uses an HPM board and starts ROM programming without sector geometry', async () => {
     const fallback = viewFetch([hpmTarget])
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, options?: RequestInit) => {
@@ -1124,10 +1367,14 @@ describe('online flash task workspace behavior', () => {
     const fetchMock = viewFetch()
     vi.stubGlobal('fetch', fetchMock)
     let currentFile = new File(['old'], 'firmware.hex', { lastModified: 100 })
+    let unavailable = false
     const handle = {
       kind: 'file' as const,
       name: currentFile.name,
-      getFile: vi.fn(async () => currentFile),
+      getFile: vi.fn(async () => {
+        if (unavailable) throw new Error('source temporarily unavailable')
+        return currentFile
+      }),
     }
     vi.stubGlobal('showOpenFilePicker', vi.fn(async () => [handle]))
     const wrapper = mount(await onlineFlashView())
@@ -1136,15 +1383,21 @@ describe('online flash task workspace behavior', () => {
 
     await wrapper.get('[data-testid="firmware-trigger"]').trigger('click')
     await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/images/inspect'))).toHaveLength(1))
-    currentFile = new File(['rebuilt-firmware'], 'firmware.hex', { lastModified: 200 })
+    currentFile = new File(['new'], 'firmware.hex', { lastModified: 100 })
 
     await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/images/inspect'))).toHaveLength(2), { timeout: 3000 })
     const inspectCalls = fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/images/inspect'))
     const firstFile = (inspectCalls[0][1]?.body as FormData).get('file') as File
     const rebuiltFile = (inspectCalls[1][1]?.body as FormData).get('file') as File
     expect(firstFile.size).toBe(3)
-    expect(rebuiltFile.size).toBe(16)
+    expect(rebuiltFile.size).toBe(3)
+    expect(await rebuiltFile.text()).toBe('new')
     expect(wrapper.text()).toContain('已自动加载重新编译的 firmware.hex')
+    unavailable = true
+    await vi.waitFor(() => expect(wrapper.text()).toContain('固件路径不可用'), { timeout: 3000 })
+    expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeDefined()
+    unavailable = false
+    await vi.waitFor(() => expect(fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/images/inspect'))).toHaveLength(3), { timeout: 3000 })
     wrapper.unmount()
   })
 
@@ -1383,7 +1636,7 @@ describe('online flash task workspace behavior', () => {
     expect(exactSignal).toBeUndefined()
 
     await wrapper.get('[data-testid="target-search"]').setValue('OTHER')
-    await vi.advanceTimersByTimeAsync(300)
+    await vi.advanceTimersByTimeAsync(150)
     await flushPromises()
     resolveExact(new Response(JSON.stringify([installed]), { status: 200 }))
     await flushPromises()
@@ -1440,7 +1693,7 @@ describe('online flash task workspace behavior', () => {
     const initialSearchCount = vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('/targets?')).length
 
     await wrapper.get('input[aria-label="搜索器件"]').setValue('HPM 53')
-    await vi.advanceTimersByTimeAsync(299)
+    await vi.advanceTimersByTimeAsync(149)
     expect(vi.mocked(fetch).mock.calls.filter(([url]) => String(url).includes('q=HPM+53'))).toHaveLength(0)
     await vi.advanceTimersByTimeAsync(1)
 
@@ -1466,7 +1719,7 @@ describe('online flash task workspace behavior', () => {
     }))
     const wrapper = mount(await onlineFlashView())
     await wrapper.get('input[aria-label="搜索器件"]').setValue('new')
-    await vi.advanceTimersByTimeAsync(300)
+    await vi.advanceTimersByTimeAsync(150)
     await vi.waitFor(() => expect(wrapper.text()).toContain('NEW-TARGET'))
     expect(initialSignal?.aborted).toBe(true)
     resolveInitial(new Response(JSON.stringify([{ ...installedTarget, part_number: 'OLD-TARGET' }]), { status: 200 }))
@@ -1623,10 +1876,10 @@ describe('online flash task workspace behavior', () => {
     const choices = wrapper.findAll('.action-choices label')
     expect(choices[0].get('input').attributes('disabled')).toBeDefined()
     expect(choices.at(-1)?.get('input').attributes('disabled')).toBeDefined()
-    await choices[1].get('input').setValue(false)
-    await choices[3].get('input').setValue(false)
-    await choices[1].get('input').setValue(true)
-    await choices[3].get('input').setValue(true)
+    await wrapper.get('[data-testid="action-erase"]').setValue(false)
+    await wrapper.get('[data-testid="action-verify"]').setValue(false)
+    await wrapper.get('[data-testid="action-erase"]').setValue(true)
+    await wrapper.get('[data-testid="action-verify"]').setValue(true)
     await wrapper.get('[data-testid="start-job"]').trigger('click')
     await vi.waitFor(() => expect(vi.mocked(fetch).mock.calls.some(([url]) => String(url).endsWith('/jobs'))).toBe(true))
     const call = vi.mocked(fetch).mock.calls.find(([url]) => String(url).endsWith('/jobs'))
@@ -1658,7 +1911,7 @@ describe('online flash task workspace behavior', () => {
 
     expect(wrapper.text()).toContain('扇区几何信息不可验证')
     expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeDefined()
-    await wrapper.findAll('.action-choices label')[1].get('input').setValue(false)
+    await wrapper.get('[data-testid="action-erase"]').setValue(false)
     expect(wrapper.get('[data-testid="start-job"]').attributes('disabled')).toBeDefined()
     wrapper.unmount()
   })
@@ -1966,6 +2219,22 @@ describe('online flash component quality', () => {
     })
 
     expect(wrapper.emitted('dropFiles')?.[0]).toEqual([[file]])
+  })
+
+  it.each([false, true])('uses one file picker without a separate path entry (native=%s)', async native => {
+    vi.stubGlobal('isTauri', native)
+    const wrapper = mount(FirmwareWorkspace, { props: {
+      file: null, sourcePath: '/build/firmware-with-a-long-name.hex', baseAddress: '', baseError: '', inspection: null, rows: [],
+      paddingTop: 0, paddingBottom: 0, loading: false, error: '',
+    } })
+    expect(wrapper.text()).not.toContain('文件路径')
+    expect(wrapper.find('#firmware-source-path').exists()).toBe(false)
+    expect(wrapper.get('.filename').attributes('title')).toBe('firmware-with-a-long-name.hex')
+    if (native) {
+      await wrapper.get('[data-testid="firmware-trigger"]').trigger('click')
+      expect(wrapper.emitted('browse')).toHaveLength(1)
+    } else expect(wrapper.find('[data-testid="firmware-input"]').exists()).toBe(true)
+    wrapper.unmount()
   })
 
   it('shows read data in the HEX window and emits save and clear actions', async () => {

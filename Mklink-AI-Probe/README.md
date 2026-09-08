@@ -66,6 +66,9 @@ python -m mklink gui
 
 桌面版安装完成后，从开始菜单或桌面快捷方式启动，无需开发工具。
 
+浏览器服务部署在反向代理子路径时，见 [Web GUI 代理配置](references/reverse-proxy.md)，
+包括入口尾斜杠重定向、WebSocket 和 SSE 转发。
+
 ### 生成跨平台 U 盘 Web 入口
 
 电脑首次安装完整 Mklink skill/runtime 后检查完整依赖、注册用户级协议，并自动

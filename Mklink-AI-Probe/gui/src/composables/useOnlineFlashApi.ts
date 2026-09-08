@@ -21,6 +21,7 @@ import type {
   TargetMemoryRegion,
   TargetSearchOptions,
   ReadMemoryRequest,
+  SecurityCapability,
 } from '../types/onlineFlash'
 import { tr } from './useLanguage'
 import { API_BASE } from '../lib/runtimeEndpoint'
@@ -247,6 +248,10 @@ export function useOnlineFlashApi() {
     return request(`/targets/${encoded(partNumber)}/memory-map`)
   }
 
+  function getTargetSecurity(partNumber: string): Promise<SecurityCapability> {
+    return request(`/targets/${encoded(partNumber)}/security`)
+  }
+
   function listTargetAlgorithms(partNumber: string): Promise<FlashAlgorithmRecord[]> {
     return request(`/targets/${encoded(partNumber)}/algorithms`)
   }
@@ -451,6 +456,7 @@ export function useOnlineFlashApi() {
     searchTargets,
     listTargetAlgorithms,
     getTargetMemoryMap,
+    getTargetSecurity,
     getPackStatus,
     updatePackIndex,
     installPack,

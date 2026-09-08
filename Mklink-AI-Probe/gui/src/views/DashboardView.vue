@@ -82,7 +82,7 @@
 
       <HardFaultTab v-if="tab === 'hardfault'" :device-connected="deviceStatus.connected" :symbol-loaded="deviceStatus.axf?.loaded === true" />
       <MemoryTab v-if="tab === 'memory'" :device-connected="deviceStatus.connected" />
-      <SuperWatchTab v-if="tab === 'superwatch'" :device-connected="deviceStatus.connected" :symbol-loaded="deviceStatus.axf?.loaded === true" :symbol-error="deviceStatus.axf?.error" />
+      <SuperWatchTab v-show="tab === 'superwatch'" :device-connected="deviceStatus.connected" :symbol-loaded="deviceStatus.axf?.loaded === true" :symbol-error="deviceStatus.axf?.error" />
       <SerialMonitorTab v-show="tab === 'serial'" />
       <ModbusTab v-show="tab === 'modbus'" />
       <SystemViewTab v-show="tab === 'systemview'" :device-connected="deviceStatus.connected" />
@@ -92,7 +92,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onUnmounted } from 'vue'
 import { LoaderCircle, RefreshCw, RotateCcw, Unplug, Usb, X } from '@lucide/vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useMklinkApi } from '../composables/useMklinkApi'
@@ -143,7 +143,8 @@ const bridgeOwnerLabel = computed(() => {
 
 // 周期性刷新资源状态
 refreshResource()
-setInterval(refreshResource, 3000)
+const resourceTimer = setInterval(refreshResource, 3000)
+onUnmounted(() => clearInterval(resourceTimer))
 
 function goConnect() {
   clearConnectionError()

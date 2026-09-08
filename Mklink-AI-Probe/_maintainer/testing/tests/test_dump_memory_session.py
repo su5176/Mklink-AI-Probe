@@ -9,11 +9,11 @@ import pytest
 from mklink._types import DeviceContext, DeviceState
 from mklink.bridge import MKLinkSerialBridge
 from mklink.dump_memory import (
-    FLAG_SAMPLE_DROPPED,
-    MAGIC,
     DumpMemoryBusyError,
     DumpMemoryReadError,
     DumpMemoryStreamSession,
+    FLAG_SAMPLE_DROPPED,
+    MAGIC,
     MAX_SAFE_REPL_REGIONS,
     build_dump_mem_command,
     read_dump_memory_once,
@@ -431,6 +431,58 @@ def test_dump_session_reuses_parser_and_owns_exact_stream_lifecycle():
         "firmware_flagged_frames": 0,
         "firmware_sample_drop_flags": 0,
     }
+
+
+def test_dump_stop_consumes_delayed_prompt_before_next_memory_command():
+    import queue
+    from mklink.bridge import MKLinkSerialBridge
+    from mklink._types import MKLINK_IDENTITY_COMMAND, MKLINK_IDENTITY_TOKEN
+
+    bridge = MKLinkSerialBridge("TEST_DUMP_STOP_SYNC")
+    incoming = queue.Queue()
+    timers = []
+    writes = []
+    stop = b"cmd.dump_memory(0x20000000, 4, -1.0)\n"
+    identity = (MKLINK_IDENTITY_COMMAND + "\n").encode()
+
+    class SerialPort:
+        in_waiting = 0
+
+        def write(self, data):
+            writes.append(data)
+            responses = {
+                stop: [(0.01, b"OLD_PROMPT\n>>>"), (0.08, b"STOPPED\n>>>")],
+                identity: [(0.12, (MKLINK_IDENTITY_TOKEN + "\n>>>").encode())],
+                b"next()\n": [(0.01, b"MEMORY_OK>>>")],
+            }
+            for delay, response in responses.get(data, []):
+                timer = threading.Timer(delay, incoming.put, args=(response,))
+                timers.append(timer)
+                timer.start()
+
+        def read(self, size):
+            try:
+                return incoming.get(timeout=0.01)
+            except queue.Empty:
+                return b""
+
+    bridge._serial = SerialPort()
+    bridge._ctx.state = DeviceState.READY
+    bridge._running = True
+    reader = threading.Thread(target=bridge._reader_loop)
+    reader.start()
+    session = DumpMemoryStreamSession(bridge, [(0x20000000, 4)], 0.001)
+    session.start()
+    try:
+        session.stop()
+        assert bridge.state is DeviceState.READY
+        assert bridge.send_command("next()", timeout=0.3) == "MEMORY_OK"
+        assert writes[-3:] == [stop, identity, b"next()\n"]
+    finally:
+        bridge._running = False
+        for timer in timers:
+            timer.join(timeout=0.3)
+        reader.join(timeout=1)
 
 
 def test_dump_session_reports_crc_loss_and_firmware_drop_flags_separately():

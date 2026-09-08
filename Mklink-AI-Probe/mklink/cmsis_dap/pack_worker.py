@@ -768,8 +768,13 @@ def _normalize_local_import_descriptor(pdsc_data: bytes) -> bytes:
     Some vendor Packs omit the top-level ``url`` element because they are only
     distributed as local files. cmsis-pack-manager silently skips every device
     in those descriptors, even though a download URL is irrelevant for a local
-    import. Add an empty element only to the staged descriptor copy that is fed
-    to the indexer; the original archive remains the installed artifact.
+    import. Other Packs split complementary processor attributes across multiple
+    anonymous ``processor`` elements or list releases oldest-first. The strict
+    indexer rejects the former and treats the latter's oldest release as current.
+
+    Repair only these unambiguous compatibility cases in the staged descriptor
+    copy fed to the indexer. The original archive remains the installed artifact
+    and is still used later by pyOCD to discover and extract its FLM payloads.
     """
 
     try:
@@ -786,21 +791,81 @@ def _normalize_local_import_descriptor(pdsc_data: bytes) -> bytes:
         namespace = root.tag.split("}", 1)[0] + "}"
     children = list(root)
     url_tag = namespace + "url"
-    if any(child.tag == url_tag for child in children):
-        return pdsc_data
+    changed = False
+    if not any(child.tag == url_tag for child in children):
+        url = ElementTree.Element(url_tag)
+        insert_at = len(children)
+        for anchor in ("description", "name", "vendor"):
+            anchor_tag = namespace + anchor
+            for index, child in enumerate(children):
+                if child.tag == anchor_tag:
+                    insert_at = index + 1
+                    break
+            else:
+                continue
+            break
+        root.insert(insert_at, url)
+        changed = True
 
-    url = ElementTree.Element(url_tag)
-    insert_at = len(children)
-    for anchor in ("description", "name", "vendor"):
-        anchor_tag = namespace + anchor
-        for index, child in enumerate(children):
-            if child.tag == anchor_tag:
-                insert_at = index + 1
-                break
-        else:
+    for parent in list(root.iter()):
+        processors = [
+            child
+            for child in list(parent)
+            if child.tag.rsplit("}", 1)[-1] == "processor"
+            and not str(child.attrib.get("Pname") or "").strip()
+        ]
+        if len(processors) < 2 or any(
+            list(processor) or str(processor.text or "").strip()
+            for processor in processors
+        ):
             continue
-        break
-    root.insert(insert_at, url)
+        merged = dict(processors[0].attrib)
+        if any(
+            key in merged and merged[key] != value
+            for processor in processors[1:]
+            for key, value in processor.attrib.items()
+        ):
+            continue
+        for processor in processors[1:]:
+            merged.update(processor.attrib)
+        processors[0].attrib.clear()
+        processors[0].attrib.update(merged)
+        for processor in processors[1:]:
+            parent.remove(processor)
+        changed = True
+
+    releases = next((
+        child for child in root
+        if child.tag.rsplit("}", 1)[-1] == "releases"
+    ), None)
+    if releases is not None:
+        release_nodes = list(releases)
+        numeric_versions = []
+        for release in release_nodes:
+            version = str(release.attrib.get("version") or "")
+            parts = version.split(".")
+            if (
+                release.tag.rsplit("}", 1)[-1] != "release"
+                or not parts
+                or not all(part.isdigit() for part in parts)
+            ):
+                numeric_versions = []
+                break
+            numeric_versions.append(tuple(int(part) for part in parts))
+        if numeric_versions:
+            ordered = [
+                release for _, release in sorted(
+                    zip(numeric_versions, release_nodes),
+                    key=lambda item: item[0],
+                    reverse=True,
+                )
+            ]
+            if ordered != release_nodes:
+                releases[:] = ordered
+                changed = True
+
+    if not changed:
+        return pdsc_data
     return ElementTree.tostring(root, encoding="utf-8", xml_declaration=True)
 
 

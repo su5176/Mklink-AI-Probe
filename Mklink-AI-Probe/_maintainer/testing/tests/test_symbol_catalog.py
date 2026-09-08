@@ -97,6 +97,27 @@ def test_catalog_keeps_ram_scalars_and_expands_struct_members(tmp_path):
     assert catalog.generation == 3
 
 
+@pytest.mark.parametrize(("name", "payload", "expected"), [
+    ("gain", struct.pack("<f", -12.5), -12.5),
+    ("controller.target", struct.pack("<f", -6.25), -6.25),
+    ("controller.samples[1]", struct.pack("<h", -32768), -32768),
+    ("flash_constant", struct.pack("<I", 4294967295), 4294967295),
+])
+def test_cli_watch_uses_catalog_for_typedef_fields_and_arrays(tmp_path, monkeypatch, name, payload, expected):
+    from mklink import watch
+    axf = tmp_path / "app.axf"
+    axf.write_bytes(b"axf")
+    info = _dwarf_fixture()
+    info.typedefs[50] = ("controller_t", 30)
+    info.variables["controller"].type_offset = 50
+    info.variables["controller"].type_name = "controller_t"
+    monkeypatch.setattr(watch, "load_dwarf_info", lambda *args, **kwargs: info)
+    monkeypatch.setattr(watch, "read_memory", lambda *args: (payload, ""))
+    rows = watch.read_watch_values([name], source=str(axf))
+    assert rows[0]["value"] == expected
+    assert rows[0]["size"] == len(payload)
+
+
 def test_catalog_rejects_flash_locals_unresolved_and_pointers(tmp_path):
     axf = tmp_path / "app.axf"
     axf.write_bytes(b"axf")
@@ -491,6 +512,17 @@ def test_float_encoding_rejects_non_finite_values(tmp_path, value):
     ).by_path("gain")
 
     with pytest.raises(SymbolValueError, match="finite"):
+        encode_descriptor(descriptor, value)
+
+
+@pytest.mark.parametrize("value", [1e40, -1e40])
+def test_float32_encoding_rejects_finite_overflow(tmp_path, value):
+    axf = tmp_path / "app.axf"
+    axf.write_bytes(b"axf")
+    descriptor = SymbolCatalog.from_dwarf(
+        _dwarf_fixture(), axf_path=str(axf), ram_ranges=[(0x20000000, 0x20010000)]
+    ).by_path("gain")
+    with pytest.raises(SymbolValueError, match="does not fit"):
         encode_descriptor(descriptor, value)
 
 

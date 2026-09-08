@@ -65,7 +65,7 @@ def test_project_init_preserves_hpm_cmake_ide_type(tmp_path: Path, monkeypatch):
     _cli_project_init(str(tmp_path))
 
     assert load_project_info(str(tmp_path))["ide_type"] == "HPM SDK CMake"
-    assert load_config(str(tmp_path))["ide_type"] == "HPM SDK CMake"
+    assert load_config(str(tmp_path)) == {"swd_clock": 1000000}
 
 
 def test_project_init_reuses_saved_port_without_scanning(tmp_path: Path, monkeypatch):

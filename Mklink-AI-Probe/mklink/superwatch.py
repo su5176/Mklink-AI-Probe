@@ -68,6 +68,8 @@ class CompiledDecodeField:
     offset: int
     size: int
     unpacker: struct.Struct
+    bit_offset: int = 0
+    bit_mask: int | None = None
 
 
 class CompiledFrameDecoder:
@@ -99,9 +101,10 @@ class CompiledFrameDecoder:
             for field in self.region_fields[region_index]:
                 if field.offset + field.size > len(region_data):
                     return None
-                self._values[field.channel_index] = float(
-                    field.unpacker.unpack_from(region_data, field.offset)[0]
-                )
+                value = field.unpacker.unpack_from(region_data, field.offset)[0]
+                if field.bit_mask is not None:
+                    value = (int(value) >> field.bit_offset) & field.bit_mask
+                self._values[field.channel_index] = float(value)
                 self._seen[field.channel_index] = generation
         if any(marker != generation for marker in self._seen):
             return None
@@ -170,7 +173,8 @@ def build_read_blocks(items: list[WatchItem], *, max_gap: int = 16) -> list[Read
         item_end = item.address + max(1, item.size)
         if (
             current_items
-            and item.source == current_source == "ram"
+            and item.source == current_source
+            and (item.source == "ram" or item.address == current_start)
             and item.address <= current_end + max_gap
         ):
             current_items.append(item)
@@ -228,9 +232,16 @@ def compile_frame_decoder(
             offset = item.address - block.address
             if offset < 0 or offset + size > block.size:
                 raise ValueError(f"SuperWatch item {item.name} is outside its read block")
-            fields.append(
-                CompiledDecodeField(channel_index, offset, size, struct.Struct("<" + code))
-            )
+            bit_offset = int(item.metadata.get("bit_offset", 0))
+            bit_width = item.metadata.get("bit_width")
+            if bit_width is not None:
+                bit_width = int(bit_width)
+                if scalar_kind != "unsigned" or not 0 < bit_width <= size * 8 or not 0 <= bit_offset <= size * 8 - bit_width:
+                    raise ValueError(f"Invalid peripheral bit field: {item.name}")
+            fields.append(CompiledDecodeField(
+                channel_index, offset, size, struct.Struct("<" + code),
+                bit_offset, (1 << bit_width) - 1 if bit_width is not None else None,
+            ))
         region_fields.append(tuple(fields))
     return CompiledFrameDecoder(channel_names, tuple(region_fields))
 
@@ -663,6 +674,7 @@ class SuperWatchRuntime:
         dwarf_info=None,
         symbol_catalog=None,
         svd_registers: dict[str, SvdRegister] | None = None,
+        peripheral_items: dict[str, WatchItem] | None = None,
         port: str | None = None,
         read_lock=None,
     ):
@@ -670,6 +682,7 @@ class SuperWatchRuntime:
         self.dwarf_info = dwarf_info
         self.symbol_catalog = symbol_catalog
         self.svd_registers = svd_registers or {}
+        self.peripheral_items = peripheral_items or {}
         self.port = port
         self.read_lock = read_lock or threading.Lock()
         self.blocks = build_read_blocks(
@@ -722,7 +735,9 @@ class SuperWatchRuntime:
         if existing is not None:
             return {"name": existing.name, **make_channel_metadata([existing])[existing.name]}
         descriptor = self.symbol_catalog.by_path(name) if self.symbol_catalog else None
-        if descriptor is not None:
+        if name in self.peripheral_items:
+            item = self.peripheral_items[name]
+        elif descriptor is not None:
             item = WatchItem(
                 name=descriptor.path,
                 address=descriptor.address,

@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.parse import urljoin, urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,6 +22,41 @@ from route_utils import find_route
 
 def _route_endpoint(app, path):
     return find_route(app, path).endpoint
+
+
+def test_flash_failure_is_request_scoped_and_releases_lease(tmp_path):
+    device, _ = _connected_symbol_device(tmp_path)
+    device.flash = lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("verify failed"))
+    app = create_app(auth_token=None, project_root=str(tmp_path))
+    app.state.mklink_state["device"] = device
+    with patch("mklink.remote.dashboards.stop_bridge_dashboards", return_value=[]), TestClient(app) as client:
+        result = client.post("/api/device/flash", json={"firmware": "test.hex"})
+        assert result.status_code == 500
+        assert result.json()["detail"] == "verify failed"
+        assert client.get("/api/health").status_code == 200
+        assert app.state.mklink_state["resource_manager"].get_status() == {}
+
+
+def test_source_reload_stops_dependents_before_parsing(tmp_path):
+    import os
+    from mklink.remote.dashboards import get_managers
+    device, axf = _connected_symbol_device(tmp_path)
+    device._axf = str(axf)
+    order = []
+    def parse(*args, **kwargs):
+        order.append("parse")
+        return {"loaded": True, "axf_path": str(axf)}
+    device.parse_axf = parse
+    app = create_app(auth_token=None, project_root=str(tmp_path))
+    app.state.mklink_state["device"] = device
+    stat = axf.stat()
+    axf.write_bytes(b"new")
+    os.utime(axf, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    with patch("mklink.remote.dashboards.stop_bridge_dashboards", side_effect=lambda **kw: order.append("stop") or ["rtt"]), patch.object(get_managers()["superwatch"], "_runtime", None), patch("mklink.project_config.ensure_rtt_config_updated", return_value={"rtt_addr": "0x20000020"}):
+        asyncio.run(app.state.check_file_sources())
+        asyncio.run(app.state.check_file_sources())
+    assert order == ["stop", "parse"]
+    assert app.state.mklink_state["file_source_change"]["rtt_addr"] == "0x20000020"
 
 
 def _request(client, path, responses, key):
@@ -777,6 +813,28 @@ def test_superwatch_typed_write_route_passes_path_generation_and_value(tmp_path)
     write_symbol.assert_called_once_with("gain", generation=1, value=1.5)
 
 
+@pytest.mark.parametrize("value", [1e40, -1e40])
+def test_superwatch_typed_write_invalid_value_is_422_without_device_io(tmp_path, value):
+    from mklink.remote.dashboards import get_managers
+
+    device, _axf = _connected_symbol_device(tmp_path)
+    manager = get_managers()["superwatch"]
+    app = create_app(auth_token=None, project_root=".")
+    with patch("mklink.connect", return_value=device), TestClient(app) as client:
+        assert client.post("/api/device/connect", json={}).status_code == 200
+        manager._device = device
+        with patch.object(manager, "stop") as stop, patch.object(
+            device, "write_memory", create=True
+        ) as write:
+            response = client.post("/api/dash/superwatch/write", json={
+                "path": "gain", "generation": 1, "value": value,
+            })
+            stop.assert_not_called()
+            write.assert_not_called()
+    assert response.status_code == 422
+    assert "does not fit" in response.json()["detail"]
+
+
 def test_superwatch_typed_write_reports_transaction_phase(tmp_path):
     from mklink.remote.dashboards import SuperWatchTransactionError, get_managers
 
@@ -1030,6 +1088,37 @@ def test_device_connect_forwards_explicit_elf_backend(tmp_path):
     assert connect.call_args.kwargs["elf_backend"] == "external"
 
 
+def test_device_connect_closes_stale_hotplug_session_before_reconnect(tmp_path):
+    stale_device = SimpleNamespace(
+        connected=False,
+        state=SimpleNamespace(name="ERROR"),
+        port="COM228",
+        close=lambda: None,
+    )
+    replacement, _axf = _connected_symbol_device(tmp_path)
+    replacement.port = "COM228"
+    app = create_app(auth_token=None, project_root=".")
+    state = app.state.mklink_state
+    state["device"] = stale_device
+    state["dispatcher"] = object()
+
+    with patch.object(stale_device, "close") as close, patch(
+        "mklink.connect", return_value=replacement,
+    ) as connect, TestClient(app) as client:
+        response = client.post("/api/device/connect", json={})
+        assert state["device"] is replacement
+        assert state["dispatcher"] is not None
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "connected"
+    assert response.json()["port"] == "COM228"
+    close.assert_called_once_with()
+    connect.assert_called_once()
+    assert connect.call_args.kwargs["port"] is None
+    assert connect.call_args.kwargs["preferred_port"] is None
+    assert connect.call_args.kwargs["initialize_target_now"] is False
+
+
 def test_device_parse_axf_forwards_explicit_elf_backend(tmp_path):
     from mklink.remote.dashboards import get_managers
 
@@ -1074,7 +1163,8 @@ def test_web_app_shell_is_not_cached_but_hashed_assets_are_immutable():
     with TestClient(app) as client:
         index = client.get("/")
         fallback = client.get("/config")
-        asset_path = re.search(r'src="(/assets/[^"]+\.js)"', index.text).group(1)
+        script_src = re.search(r'src="([^"]+\.js)"', index.text).group(1)
+        asset_path = urlsplit(urljoin(str(index.url), script_src)).path
         asset = client.get(asset_path)
 
     assert index.status_code == 200
@@ -1123,11 +1213,17 @@ def test_built_web_asset_graph_uses_fresh_cache_namespace():
 
     dist = Path(api.__file__).resolve().parents[2] / "gui" / "dist"
     # Include Vite's lazy preload tables and worker URLs, not only index.html.
-    paths = set(re.findall(r'(?:src|href)="(/assets/[^\"]+)"',
-                           (dist / "index.html").read_text(encoding="utf-8")))
+    paths = {
+        urlsplit(urljoin("/index.html", reference)).path
+        for reference in re.findall(r'(?:src|href)="([^\"]+\.(?:js|css))"',
+                                    (dist / "index.html").read_text(encoding="utf-8"))
+    }
     for script in (dist / "assets").rglob("*.js"):
-        paths.update("/" + path.lstrip("/") for path in re.findall(
-            r'''["'`](/?assets/[^"'`\s]+)["'`]''', script.read_text(encoding="utf-8"),
+        # Vite emits imports, lazy preload entries and worker URLs relative to
+        # the referring module when base='./'. Resolve each at its own URL.
+        script_url = "/" + script.relative_to(dist).as_posix()
+        paths.update(urlsplit(urljoin(script_url, reference)).path for reference in re.findall(
+            r'''["'`]([\w./-]+\.(?:js|css))["'`]''', script.read_text(encoding="utf-8"),
         ))
 
     assert paths

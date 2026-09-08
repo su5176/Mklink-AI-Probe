@@ -630,8 +630,11 @@ def test_sparse_hex_registry_keeps_segment_bytes_not_per_address_dict(tmp_path: 
     ).present == (False, True, True, False)
 
 
+@pytest.mark.parametrize("unchanged_metadata", [False, True])
 def test_source_change_during_copy_is_rejected_without_leaking_snapshot(
     tmp_path: Path,
+    monkeypatch,
+    unchanged_metadata,
 ):
     firmware = tmp_path / "firmware.bin"
     firmware.write_bytes(b"AAAA")
@@ -645,6 +648,9 @@ def test_source_change_during_copy_is_rejected_without_leaking_snapshot(
             source_path.write_bytes(b"BBBB")
 
     inspector = ImageInspector(snapshot_root=snapshot_root, copy_hook=change_source)
+    if unchanged_metadata:
+        # Model low-resolution/retained filesystem timestamps explicitly.
+        monkeypatch.setattr(inspector, "_same_stat", lambda before, after: True)
 
     assert_flash_error(
         FlashErrorCode.FILE_FORMAT_ERROR,

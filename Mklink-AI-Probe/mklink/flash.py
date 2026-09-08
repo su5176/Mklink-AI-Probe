@@ -275,32 +275,16 @@ class MKLinkFlash:
 
         elapsed_ms = int((time.time() - start) * 1000)
 
-        # 4. 检查返回值（设备端返回 "0" 表示成功）
-        load_success = False
-        for line in resp.strip().split("\n"):
-            line = line.strip()
-            if line == "0":
-                load_success = True
-                break
-            if "loaded" in line.lower() and "success" in line.lower():
-                load_success = True
-                break
-
-        # 5. 解析进度
-        progress_list = parse_download_progress(resp)
-
-        # 6. 更新进度回调
-        if progress_callback and progress_list:
+        # Require programming evidence, not only a REPL return value.
+        result = parse_load_result(resp)
+        load_success = result["success"]
+        progress_list = result["progress"]
+        if progress_callback:
             last_percent = 0
-            for p in progress_list:
-                if p["percent"] > last_percent:
-                    progress_callback(p["percent"])
-                    last_percent = p["percent"]
-
-        # 7. 解析最终结果（优先使用返回值检查，其次使用 parse_load_result）
-        if not load_success:
-            result = parse_load_result(resp)
-            load_success = result.get("success", False)
+            for item in progress_list:
+                if item["percent"] > last_percent:
+                    progress_callback(item["percent"])
+                    last_percent = item["percent"]
 
         return {
             "success": load_success,
@@ -430,7 +414,7 @@ class MKLinkFlash:
     def _copy_to_microkeen(
         self, local_path: str, microkeen_filename: str | None = None
     ) -> str | None:
-        """拷贝文件到 MICROKEEN 磁盘（仅当目标文件不存在或时间不同时）。
+        """按内容拷贝文件到 MICROKEEN，刷新并校验后才允许设备打开。
 
         Args:
             local_path: 本地文件路径
@@ -449,20 +433,15 @@ class MKLinkFlash:
         filename = microkeen_filename or src.name
         dest = Path(disk) / filename
 
-        # 检查目标文件是否存在且修改时间相同，避免不必要的拷贝
-        if dest.exists():
-            src_mtime = src.stat().st_mtime
-            dest_mtime = dest.stat().st_mtime
-            # 比较时间戳，允许 2 秒误差
-            if abs(src_mtime - dest_mtime) < 2:
-                print(f"[SKIP] {filename} 已存在且时间相同，跳过拷贝")
-                return filename
-
+        if (not filename or filename in {".", ".."} or "/" in filename
+                or "\\" in filename or ":" in filename):
+            return None
+        from mklink.file_content import copy_verified
         try:
-            shutil.copy2(src, dest)
-            print(f"[COPY] {src} -> {dest}")
-            return filename  # 返回纯文件名，MKLINK 设备端只需要文件名
-        except OSError:
+            changed = copy_verified(src, dest)
+            print(f"[{'COPY' if changed else 'SKIP'}] {filename} · SHA-256 verified")
+            return filename
+        except (OSError, ValueError):
             return None
 
     def beep(self) -> None:
@@ -559,7 +538,7 @@ def burn_hex_file(
     if not hpm_flash_cfg and board:
         hpm_flash_cfg = HPM_BOARD_FLASH_CFG.get(str(board).lower())
 
-    catalog_required = False
+    catalog_required = bool(target_part_from_project) and not is_hpm_project
     if mcu_key is None:
         mcu_key = config.get("mcu_key")
     if not mcu_key:
@@ -590,7 +569,7 @@ def burn_hex_file(
         # 找不到精确器件记录时才回退旧 profile 路径。
         profiles = load_mcu_profiles()
         mcu = profiles.get(mcu_key, {})
-        if not mcu:
+        if not mcu and not target_part_from_project:
             raise FlashError(f"未知 MCU 配置: {mcu_key}，请检查 .mklink/config.json")
         catalog_algorithm = None
         catalog_selections = ()
@@ -621,7 +600,7 @@ def burn_hex_file(
                     catalog_path = deploy_algorithm_to_probe(catalog_algorithm)
                     flash_base = f"0x{catalog_algorithm.flash_start:08X}"
                     selected_ram = catalog_algorithm.ram_start or int(
-                        str(mcu.get("ram_base") or "0x20000000"), 0
+                        str(project_info.get("ram_base") or mcu.get("ram_base") or "0x20000000"), 0
                     )
                     ram_base = f"0x{selected_ram:08X}"
                     print(
@@ -664,7 +643,7 @@ def burn_hex_file(
                     algorithm = selection.algorithm
                     path = deploy_algorithm_to_probe(algorithm)
                     selected_ram = algorithm.ram_start or int(
-                        str(mcu.get("ram_base") or "0x20000000"), 0
+                        str(project_info.get("ram_base") or mcu.get("ram_base") or "0x20000000"), 0
                     )
                     if not flash.load_flm(
                         path,

@@ -43,6 +43,35 @@ def _cli_test(port: str):
     print("[*] 已断开连接")
 
 
+def _cli_security(args: argparse.Namespace) -> int:
+    """Run a guarded one-shot reversible target security operation."""
+    import json
+
+    from mklink.security_operations import run_security_operation
+
+    result = run_security_operation(
+        args.security_command,
+        args.target_part,
+        voltage_mv=args.voltage_mv,
+        confirm_user=args.confirm,
+        confirm_data_loss=getattr(args, "confirm_data_loss", False),
+        firmware=getattr(args, "firmware", None),
+        base_address=getattr(args, "base_address", None),
+        probe_id=args.probe_id,
+        frequency=args.frequency,
+        timeout=args.timeout,
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        action = "解锁" if args.security_command == "unlock" else "加锁"
+        print(
+            f"[OK] {result['target_part']} {action}完成，"
+            f"已按 {result['voltage_mv']} mV 断电复位"
+        )
+    return 0
+
+
 def _cli_keil_parse(project_root: str):
     """解析 Keil .uvprojx 工程文件并显示配置。"""
     import json
@@ -220,304 +249,66 @@ def _detect_hpm_segger_project(project_root: str) -> dict | None:
 
 
 def _cli_project_init(project_root: str):
-    """初始化项目配置：自动检测 IAR/Keil → 解析工程 → 匹配 MCU → 保存配置。"""
+    """离线解析工程；连接、算法和 RTT 在使用时解析，不固化猜测的硬件信息。"""
     from pathlib import Path
     from mklink.keil_parser import find_uvprojx, parse_uvprojx
     from mklink.iar_parser import find_ewp, parse_ewp
-    from mklink.profiles import load_mcu_profiles, match_mcu_by_device
     from mklink.project_config import (
-        save_config, save_project_info, save_rtt_config, save_toolchain_config,
-        is_configured, load_config,
-    )
-    from mklink.discovery import (
-        check_flm_on_microkeen, copy_flm_to_microkeen, resolve_keil_flm_path,
+        get_mklink_dir, lint_json_file, load_project_info,
+        save_config, save_project_info,
     )
 
-    if is_configured(project_root):
-        print("[*] 项目已配置，将更新配置...")
+    # Reinitialization must not overwrite malformed or user-maintained settings.
+    for name in ("config.json", "project_info.json", "keil_project.json",
+                 "rtt_config.json", "toolchain.json"):
+        if (get_mklink_dir(project_root) / name).exists():
+            error = lint_json_file(project_root, name)
+            if error:
+                print(f"[FAIL] {error}；原配置未修改")
+                return
 
-    # 1. 自动检测工程类型（HPM SES / IAR / Keil）
     hpm = _detect_hpm_segger_project(project_root)
     uvp = find_uvprojx(project_root)
     ewp = find_ewp(project_root)
-
-    ide_type = None
-    project_info = None
-
     if hpm:
-        ide_type = hpm.get("ide_type") or "SEGGER Embedded Studio"
-        print(f"[OK] 找到 HPM 输出目录: {hpm['bin_path']}")
-        project_info = hpm
-    elif ewp and not uvp:
-        # IAR 项目
-        ide_type = "IAR"
-        print(f"[OK] 找到 IAR 工程文件: {ewp}")
-        project_info = parse_ewp(ewp)
-    elif uvp and not ewp:
-        # Keil 项目
-        ide_type = "Keil"
-        print(f"[OK] 找到 Keil 工程文件: {uvp}")
-        project_info = parse_uvprojx(uvp)
-    elif ewp and uvp:
-        # 两者都存在，优先使用 Keil
-        print("[*] 检测到同时存在 IAR 和 Keil 工程文件")
-        ide_type = "Keil"
-        print(f"[OK] 找到 Keil 工程文件: {uvp}")
-        project_info = parse_uvprojx(uvp)
-        print(f"    自动选择: Keil")
+        info = hpm
+    elif uvp:
+        info = parse_uvprojx(uvp)
+        if info:
+            info["ide_type"] = "Keil"
+        if ewp:
+            print("[INFO] 同时发现 Keil/IAR，使用 Keil 工程")
+    elif ewp:
+        info = parse_ewp(ewp)
+        if info:
+            info["ide_type"] = "IAR"
     else:
-        print("[FAIL] 未找到 .uvprojx 或 .ewp 工程文件")
+        print("[FAIL] 未找到 Keil、IAR 或 HPM SDK 工程")
+        return
+    if not info:
+        print("[FAIL] 工程解析失败；原配置未修改")
         return
 
-    if not project_info:
-        print(f"[FAIL] 解析 {ide_type} 工程文件失败")
-        return
+    # Keep only inputs needed by build/download/symbol tools. Do not infer a
+    # profile key from a shared SW-DP ID, scan serial ports or copy an FLM here.
+    fields = {
+        "ide_type", "device", "vendor", "target_name", "config_name", "compiler",
+        "uvprojx_path", "ewp_path", "hex_path", "bin_path", "map_path",
+        "axf_path", "elf_path", "out_path", "flash_base", "flash_size", "ram_base",
+        "ram_size", "scatter_file", "bin_base", "download_base", "board",
+        "hpm_flash_cfg",
+    }
+    saved = load_project_info(project_root) or {}
+    saved.update({key: value for key, value in info.items()
+                  if key in fields and value not in (None, "", 0)})
+    save_project_info(project_root, saved)
+    if not (get_mklink_dir(project_root) / "config.json").exists():
+        save_config(project_root, {"swd_clock": 1000000})
 
-    project_info["ide_type"] = ide_type
-
-    # --- MCU profile 匹配/发现。必须先于 FLM 处理，避免未知 MCU 落到 custom。 ---
-    profiles = load_mcu_profiles()
-    device_name = project_info.get("device", "")
-    mcu_key = match_mcu_by_device(device_name, profiles)
-    mcu_detect_result = None
-    configured_port = (load_config(project_root) or {}).get("com_port")
-    com_port = str(configured_port).strip() if configured_port else None
-    is_hpm_project = (
-        str(project_info.get("vendor", "")).lower() == "hpmicro"
-        or str(project_info.get("board", "")).lower().startswith("hpm")
-        or str(ide_type).lower().startswith("hpm")
-        or str(ide_type) == "SEGGER Embedded Studio"
-    )
-    if not mcu_key and not is_hpm_project:
-        from mklink.mcu_detect import detect_mcu_profile
-        from mklink.discovery import find_mklink_cdc_port
-
-        try:
-            com_port = find_mklink_cdc_port()
-        except Exception:
-            com_port = None
-
-        mcu_detect_result = detect_mcu_profile(
-            project_root=project_root,
-            device=device_name,
-            project_info=project_info,
-            port=com_port,
-            write_profile=True,
-            copy_flm=True,
-            read_idcode=bool(com_port),
-        )
-        status = mcu_detect_result.get("status")
-        if status in ("created", "matched"):
-            mcu_key = mcu_detect_result.get("profile_key")
-            profile = mcu_detect_result.get("profile") or {}
-            if mcu_key and profile:
-                profiles[mcu_key] = profile
-            project_info["mcu_detect"] = {
-                "status": status,
-                "profile_key": mcu_key,
-                "selected_algorithm": mcu_detect_result.get("selected_algorithm"),
-                "microkeen_flm": mcu_detect_result.get("microkeen_flm"),
-                "flm_copied": mcu_detect_result.get("flm_copied", False),
-            }
-            print(f"[AUTO] 已发现 MCU profile: {mcu_key}")
-        elif status == "needs_selection":
-            print("[FAIL] 发现多个内部 Flash 算法，请指定 FLM 后重试:")
-            for i, candidate in enumerate(mcu_detect_result.get("candidates", []), 1):
-                print(f"  {i}. {candidate.get('name')} (size={candidate.get('size')})")
-            print("提示: python -m mklink mcu-detect --flm <CMSIS/Flash/xxx.FLM>")
-            return
-        else:
-            print(f"[FAIL] MCU profile 发现失败: {mcu_detect_result.get('message', status)}")
-            return
-
-    mcu_profile = profiles.get(mcu_key, {}) if mcu_key else {}
-    mcu_name = mcu_profile.get("name", mcu_key) if mcu_key else "custom"
-
-    # --- FLM 处理（Keil 和 IAR 都通过 mcu_profiles 获取 FLM） ---
-    flm_name = project_info.get("flm_name", "")
-    profile_flm = (mcu_profile.get("flm_path") or "").replace("\\", "/")
-    if not flm_name and profile_flm:
-        flm_name = profile_flm.split("/")[-1]
-        project_info["flm_name"] = flm_name
-        project_info["flm_path_on_device"] = f"FLM/{flm_name}"
-    flm_on_keil = None
-    flm_on_microkeen = None
-    flm_copied = False
-
-    if ide_type == "SEGGER Embedded Studio":
-        print("[AUTO] HPM SES 工程仅保存 bin/map/elf 路径，跳过 FLM")
-        flm_name = ""
-    elif ide_type == "Keil" and flm_name:
-        # flm_name 已经是纯文件名（如 "N32G43x"），自动加上 .FLM 扩展名
-        if not flm_name.upper().endswith(".FLM"):
-            flm_name_with_ext = flm_name + ".FLM"
-        else:
-            flm_name_with_ext = flm_name
-        # 设备上的 FLM 路径格式
-        project_info["flm_path_on_device"] = f"FLM/{flm_name_with_ext}"
-
-        # 从 Keil 安装目录查找 FLM
-        flm_on_keil = resolve_keil_flm_path(flm_name)
-
-        # 检查 MICROKEEN 磁盘
-        exists_on_microkeen, path_on_microkeen = check_flm_on_microkeen(flm_name)
-        if exists_on_microkeen:
-            flm_on_microkeen = path_on_microkeen
-
-        # 如果 MICROKEEN 上没有，自动拷贝
-        if not exists_on_microkeen:
-            success, dest = copy_flm_to_microkeen(flm_name)
-            if success:
-                flm_on_microkeen = dest
-                flm_copied = True
-
-    elif ide_type == "IAR" and flm_name:
-        # IAR 也需要 FLM 文件，从 mcu_profiles.json 获取 flm_name
-        # flm_name 格式为 "FLM/STM32F10x_1024.FLM"，需要提取纯文件名
-        flm_base = flm_name.replace("FLM/", "").replace("flm/", "")
-        if not flm_base.upper().endswith(".FLM"):
-            flm_base = flm_base + ".FLM"
-
-        # 设备上的 FLM 路径格式
-        project_info["flm_path_on_device"] = f"FLM/{flm_base}"
-
-        # 从 Keil 安装目录查找 FLM（IAR 自己不带 FLM，但可能同时安装了 Keil）
-        flm_on_keil = resolve_keil_flm_path(flm_name.replace("FLM/", ""))
-
-        # 检查 MICROKEEN 磁盘
-        exists_on_microkeen, path_on_microkeen = check_flm_on_microkeen(flm_name.replace("FLM/", ""))
-        if exists_on_microkeen:
-            flm_on_microkeen = path_on_microkeen
-
-        # 如果 MICROKEEN 上没有，自动拷贝
-        if not exists_on_microkeen and flm_on_keil:
-            success, dest = copy_flm_to_microkeen(flm_name.replace("FLM/", ""))
-            if success:
-                flm_on_microkeen = dest
-                flm_copied = True
-
-    # 保存 project_info.json（排除 groups）
-    if flm_on_keil:
-        project_info["flm_path"] = flm_on_keil
-    project_save = {k: v for k, v in project_info.items() if k != "groups"}
-    save_project_info(project_root, project_save)
-
-    print()
-    print("=" * 50)
-    print("  项目初始化结果")
-    print("=" * 50)
-    print(f"  IDE:      {ide_type}")
-    print(f"  设备:     {device_name} ({project_info.get('vendor', '?')})")
-    print(f"  编译器:   {project_info.get('compiler', '?').upper()}")
-    print(f"  Flash:    {project_info.get('flash_base', '?')} ({project_info.get('flash_size', 0)} bytes)")
-    if project_info.get("bin_base"):
-        print(f"  Bin base: {project_info.get('bin_base')}")
-    print(f"  RAM:      {project_info.get('ram_base', '?')} ({project_info.get('ram_size', 0)} bytes)")
-    if project_info.get("bin_path"):
-        print(f"  BIN:      {project_info.get('bin_path')}")
-    print(f"  HEX:      {project_info.get('hex_path', '?')}")
-    print(f"  MAP:      {project_info.get('map_path', '?')}")
-
-    if ide_type == "Keil":
-        print()
-        print(f"  FLM 名称: {flm_name}")
-        if flm_on_keil:
-            print(f"  FLM (Keil安装目录):  {flm_on_keil}")
-        else:
-            print(f"  FLM (Keil安装目录):  未找到")
-        if flm_on_microkeen:
-            status = " (已拷贝)" if flm_copied else " (已存在)"
-            print(f"  FLM (MICROKEEN磁盘): {flm_on_microkeen}{status}")
-        else:
-            print(f"  FLM (MICROKEEN磁盘): 未找到")
-    elif ide_type == "IAR":
-        # IAR 也需要 FLM，显示 FLM 相关信息
-        print()
-        print(f"  FLM 名称: {flm_name}")
-        if flm_on_keil:
-            print(f"  FLM (Keil安装目录):  {flm_on_keil}")
-        else:
-            print(f"  FLM (Keil安装目录):  未找到")
-        if flm_on_microkeen:
-            status = " (已拷贝)" if flm_copied else " (已存在)"
-            print(f"  FLM (MICROKEEN磁盘): {flm_on_microkeen}{status}")
-        else:
-            print(f"  FLM (MICROKEEN磁盘): 未找到")
-        fl = project_info.get("flash_loader_path", "")
-        if fl:
-            print(f"  Flash Loader: {fl}")
-
-    print(f"  MCU:      {mcu_key or 'custom'} ({mcu_name})")
-    print(f"  RTT:      将在首次使用时检测")
-
-    # AXF/ELF 解析默认使用随包内置的 pyelftools。
-    from mklink._deps import check_elf_available
-    elf_ok, elf_info = check_elf_available(project_root=project_root)
-    if elf_ok:
-        print(f"  ELF:      {elf_info} (符号/变量/HardFault 源码行可用)")
-    else:
-        print(f"  ELF:      不可用 — {elf_info}")
-
-    print("=" * 50)
-
-    # 自动检测 COM 口
-    if com_port is None:
-        from mklink.discovery import find_mklink_cdc_port
-        com_port = find_mklink_cdc_port()
-    if com_port:
-        print(f"  COM 口:   {com_port} (自动检测)")
-    else:
-        print(f"  COM 口:   未检测到（稍后可手动配置）")
-
-    # 保存 config.json
-    save_config(project_root, {
-        "com_port": com_port or "",
-        "baudrate": DEFAULT_BAUDRATE,
-        "mcu_key": mcu_key,
-        "ide_type": ide_type,
-        "swd_clock": 1000000,
-    })
-    # 保存默认 rtt_config（RTT 地址在首次使用时再检测）
-    save_rtt_config(project_root, {
-        "integrated": False,
-        "rtt_addr": "",
-        "search_size": 1024,
-        "channel": 0,
-        "autostart": False,
-        "rtt_storage_mode": 0,
-    })
-    # 保存 toolchain.json 模板。GNU 工具只在 elf_backend=external 时使用。
-    save_toolchain_config(project_root, {
-        "elf_backend": "builtin",
-        "readelf": "",
-        "addr2line": "",
-        "_doc": "默认 builtin 使用内置 pyelftools。仅显式改为 external 时解析 GNU 工具路径；"
-                "路径本身不会启用 external。",
-    })
-
-    # 探针固件版本检查（不阻塞 init）
-    try:
-        from mklink import firmware_check
-        root = firmware_check._resolve_firmware_root()
-        check = firmware_check.check_probe_firmware(port=com_port, firmware_root=root)
-        if check.status == "upgrade_required":
-            for line in check.instructions.splitlines():
-                print(line)
-        elif check.status in {"no_firmware", "manifest_unavailable"}:
-            print(f"[WARN] {check.instructions or '没有可用的探针固件'}")
-        # ok / skipped 不打
-    except Exception as e:
-        print(f"[WARN] 探针固件版本检查异常：{e}", file=sys.stderr)
-
-    print("[OK] 项目配置已保存到 .mklink/")
-
-    # 检查内置 ELF 能力
-    from mklink._deps import check_elf_available
-    elf_ok, elf_info = check_elf_available(project_root=project_root)
-    if elf_ok:
-        print(f"  ELF:      {elf_info} (符号解析可用)")
-    else:
-        print(f"  ELF:      不可用（{elf_info}）")
+    print(f"[OK] {info.get('ide_type', 'HPM SDK')} · {info.get('device', '未指定器件')}")
+    print(f"  固件: {info.get('bin_path') or info.get('hex_path') or '未配置'}")
+    print("[OK] 已保存精简工程配置；已有连接、RTT 和工具链设置保持不变")
+    print("[INFO] 连接时自动发现端口；烧录时按精确器件/地址选择算法，缺失或不明确时停止")
 
 
 def _cli_flash(project_root: str, port: str | None, hex_path: str | None):
@@ -3906,7 +3697,7 @@ def main():
     _add_project_root_arg(iar_parser_cmd)
 
     # project-init 子命令
-    init_parser = subparsers.add_parser("project-init", help="初始化项目配置（解析 Keil 工程 + 检测 RTT）")
+    init_parser = subparsers.add_parser("project-init", help="离线初始化精简工程配置（Keil/IAR/HPM；不探测硬件）")
     _add_project_root_arg(init_parser)
 
     # mcu-detect 子命令
@@ -4484,6 +4275,63 @@ def main():
         help="启动 MCP (Model Context Protocol) server（stdio，供 Claude Code / 其他 MCP client 调用）",
     )
 
+    security_parser = subparsers.add_parser(
+        "security",
+        help="目标芯片可逆读保护（与 WebGUI/MCP 共用安全后端）",
+    )
+    security_sub = security_parser.add_subparsers(
+        dest="security_command",
+        required=True,
+    )
+
+    def _add_security_arguments(command_parser, *, unlock: bool) -> None:
+        command_parser.add_argument("--target-part", required=True, help="精确器件型号")
+        command_parser.add_argument(
+            "--voltage-mv",
+            required=True,
+            type=int,
+            choices=(1800, 3300, 5000),
+            help="安全操作后恢复的 VCC 电压",
+        )
+        command_parser.add_argument(
+            "--confirm",
+            required=True,
+            action="store_true",
+            help="确认本次安全操作及指定的 VCC 恢复电压",
+        )
+        if unlock:
+            command_parser.add_argument(
+                "--confirm-data-loss",
+                required=True,
+                action="store_true",
+                help="确认解除读保护会永久擦除受保护的非易失数据",
+            )
+        else:
+            command_parser.add_argument(
+                "--firmware",
+                required=True,
+                help="加锁前必须校验通过的 BIN/HEX 固件",
+            )
+            command_parser.add_argument(
+                "--base-address",
+                type=lambda value: int(value, 0),
+                default=None,
+                help="BIN 固件起始地址（例如 0x08000000）",
+            )
+        command_parser.add_argument("--probe-id", default=None, help="可选探针 ID")
+        command_parser.add_argument("--frequency", type=int, default=1_000_000)
+        command_parser.add_argument("--timeout", type=float, default=240.0)
+        command_parser.add_argument("--json", action="store_true")
+
+    _add_security_arguments(
+        security_sub.add_parser("lock", help="启用已验证的可逆读保护"),
+        unlock=False,
+    )
+    _add_security_arguments(
+        security_sub.add_parser("unlock", help="解除读保护并擦除受保护数据"),
+        unlock=True,
+    )
+
     # 向后兼容：--test 标志
     parser.add_argument("--port", help="COM 端口（兼容旧版）")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUDRATE)
@@ -4680,6 +4528,8 @@ def main():
         _cli_web_entry(args)
     elif args.command == "mcp":
         _cli_mcp(args)
+    elif args.command == "security":
+        return _cli_security(args)
     else:
         parser.print_help()
 

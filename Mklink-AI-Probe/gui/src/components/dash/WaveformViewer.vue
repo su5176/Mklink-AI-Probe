@@ -634,6 +634,9 @@ function loadViewerScript(el: HTMLDivElement) {
       viewers[props.mode].es = (window as any).es
     }
     if (viewers?.[props.mode]) {
+      // Device status can arrive while the classic viewer script is loading.
+      // Replay the current prop instead of retaining the initial CONFIG value.
+      viewers[props.mode].setDeviceConnected?.(props.deviceConnected)
       attachSuperwatchRequesters(viewers[props.mode])
       viewers[props.mode].configureBinaryChannels?.(vofaChannels)
       applyHiddenChannels()

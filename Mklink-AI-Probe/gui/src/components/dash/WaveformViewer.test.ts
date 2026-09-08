@@ -805,6 +805,7 @@ describe('WaveformViewer VOFA binary transport', () => {
   })
 
   it('attaches the SuperWatch viewport requester after the viewer script loads', async () => {
+    const setDeviceConnected = vi.fn()
     let requestViewport: (() => void) | undefined
     const setBinaryVisibleRangeRequester = vi.fn((requester: () => void) => {
       requestViewport = requester
@@ -812,18 +813,20 @@ describe('WaveformViewer VOFA binary transport', () => {
     const getBinaryVisibleRange = vi.fn(() => ({ start: 100, end: 200, pixelWidth: 800 }))
     const renderBinaryEnvelope = vi.fn()
     const wrapper = mount(WaveformViewer, {
-      props: { mode: 'SuperWatch', deviceConnected: true },
+      props: { mode: 'SuperWatch', deviceConnected: false },
     })
     await new Promise(resolve => setTimeout(resolve, 0))
 
     const i18nScript = wrapper.element.querySelector('script[src]') as HTMLScriptElement
+    await wrapper.setProps({ deviceConnected: true })
     i18nScript.onload?.(new Event('load'))
     ;(window as any).__waveformViewers.SuperWatch = {
-      setBinaryVisibleRangeRequester, getBinaryVisibleRange, renderBinaryEnvelope,
+      setBinaryVisibleRangeRequester, getBinaryVisibleRange, renderBinaryEnvelope, setDeviceConnected,
     }
     const scripts = wrapper.element.querySelectorAll('script[src]')
     const viewerScript = scripts[scripts.length - 1] as HTMLScriptElement
     viewerScript.onload?.(new Event('load'))
+    expect(setDeviceConnected).toHaveBeenCalledWith(true)
 
     expect(setBinaryVisibleRangeRequester).toHaveBeenCalledOnce()
     requestViewport?.()
@@ -2269,6 +2272,15 @@ describe('VOFA viewer hot path source guard', () => {
         historyOwner: 'worker', workerCapacity: 50_000, workerBufferedSamples: 1_024,
         mainRingCapacity: 2, mainRingMaxCount: 1, detailEnabled: false,
       })
+      runtime.viewer.renderBinaryEnvelope({
+        type: 'render-envelope', mode: 'min-max-v1', timestampKind: 'sample-milliseconds',
+        requestId: 1, pixelWidth: 800, channelCount: 2, pointCount: 4,
+        candidateSampleCount: 1_024, times: Float64Array.of(1_000, 2_000).buffer,
+        timeIndices: Uint32Array.of(0, 1, 0, 1).buffer,
+        values: Float32Array.of(1, 2, 10, 20).buffer,
+        channelOffsets: Uint32Array.of(0, 2, 4).buffer,
+      })
+      expect(document.getElementById('pts-count')!.textContent).toBe('1024 pts')
     } finally {
       runtime.cleanup()
     }

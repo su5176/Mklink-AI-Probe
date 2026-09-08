@@ -2,6 +2,7 @@ import { ref, onUnmounted } from 'vue'
 import {
   API_BASE,
   IS_TAURI,
+  applyReportedBackendPort,
   restartRuntimeBackend,
   runtimeBackendPort,
 } from '../lib/runtimeEndpoint'
@@ -15,7 +16,12 @@ let firstCheckDone = false
 async function checkBackendHealth(): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE}/api/health`, { signal: AbortSignal.timeout(3000) })
-    return res.ok
+    if (!res.ok) return false
+    const payload = await res.json().catch(() => null)
+    if (payload && typeof payload === 'object') {
+      applyReportedBackendPort((payload as { backend_port?: unknown }).backend_port)
+    }
+    return true
   } catch {
     return false
   }

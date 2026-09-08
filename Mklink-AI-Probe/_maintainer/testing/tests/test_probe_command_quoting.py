@@ -11,7 +11,7 @@ class _Bridge:
     def send_command(self, command, **kwargs):
         self.commands.append(command)
         self.options.append(kwargs)
-        return "0\n"
+        return "0\n" if command.startswith("load.flm") else "Download: 100% ,used 10 ms\n0\n"
 
 
 def test_probe_paths_use_single_quoted_literals():

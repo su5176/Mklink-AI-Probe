@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from mklink.file_content import is_metadata_file
 
 
 def _fmt_hex(hex_str: str) -> str:
@@ -39,21 +40,31 @@ def find_ewp(project_root: str) -> str | None:
     # 如果是绝对路径且目录存在
     if root.is_absolute() and root.is_dir():
         for f in sorted(root.glob("*.ewp")):
+            if is_metadata_file(f):
+                continue
             return str(f)
         for f in sorted(root.glob("settings/*.ewp")):
+            if is_metadata_file(f):
+                continue
             return str(f)
         return None
 
     # 相对路径：优先 settings/ 子目录
     for f in sorted(root.glob("settings/*.ewp")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     # 项目根目录
     for f in sorted(root.glob("*.ewp")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     # 一级子目录
     for f in sorted(root.glob("*/*.ewp")):
+        if is_metadata_file(f):
+            continue
         return str(f)
 
     return None
@@ -269,9 +280,12 @@ def parse_ewp(ewp_path: str, config_name: str | None = "Debug") -> dict | None:
     }
 
     # 解析绝对路径
-    result["hex_path"] = str((base_dir / exe_path / hex_file).resolve()) if hex_file and exe_path else ""
-    result["map_path"] = str((base_dir / list_path / (out_file.replace(".out", ".map") if out_file else "project.map")).resolve())
-    result["out_path"] = str((base_dir / exe_path / out_file).resolve()) if out_file and exe_path else ""
+    from mklink.keil_parser import _project_path
+    exe_dir = _project_path(base_dir, resolve_iar_path(str(path), exe_path))
+    map_dir = _project_path(base_dir, resolve_iar_path(str(path), list_path))
+    result["hex_path"] = str(exe_dir / hex_file) if hex_file and exe_path else ""
+    result["map_path"] = str(map_dir / (out_file.replace(".out", ".map") if out_file else "project.map"))
+    result["out_path"] = str(exe_dir / out_file) if out_file and exe_path else ""
 
     # 查找对应的 .xcl 文件以获取内存布局
     # IAR 使用多个 xcl 文件：driver.xcl（CPU/调试配置）和 general.xcl（flash loader）

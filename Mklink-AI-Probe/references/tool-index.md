@@ -11,6 +11,7 @@
 | 项目配置 | `detect_mcu_profile` | 新 MCU 发现、FLM 候选选择、profile 固化 |
 | 连接 | `discover_probes` · `connect` · `disconnect` · `device_status` | connect 传 `axf=` 才能读变量 |
 | Flash / 探针控制 | `flash` · `erase_chip` · `erase_sector` · `reset` · `set_power_on` · `reboot_probe` | `reset` 复位目标；VCC 任意电压均须逐次确认，5 V 另须耐压确认；`reboot_probe` 会断连 |
+| 安全保护 | `security_status` · `security_lock` · `security_unlock` | 先查精确型号能力；加锁前强制校验固件，解锁强制确认永久数据丢失，操作后按明确电压断电复位 |
 | 内存 | `read_memory` · `read_memory_regions` · `write_memory` · `flush_memory` | 快照 regions 最多 16 项/总计 4096B；flush 单批最多 12 KiB/8 项，超额由调用方串行分批 |
 | 变量/寄存器 | `read_variable` · `write_variable` · `read_register` | 需先 connect(axf=) 或 load_symbols |
 | 调试 | `halt` · `resume` · `step` · `set_breakpoint` · `clear_breakpoint` · `clear_all_breakpoints` · `read_core_registers` | FPB 硬件断点 |
@@ -36,6 +37,7 @@
 | `mcu-detect` | 发现/固化未知 MCU profile 与 FLM（多候选需选择） |
 | `project-info` | 显示项目配置状态 |
 | `flash` | 用户显式要求原生 MKLink 串口/FLM 路径时使用；自动下载先走 IDE，再走 pyOCD，最后脱机 API |
+| `security lock/unlock` | 与 MCP/WebGUI 共用安全白名单；要求精确型号、明确恢复电压和确认参数；加锁还须固件，解锁还须数据丢失确认 |
 | `rtt` | 一站式 RTT 捕获（支持 `--visualize`） |
 | `read-ram` | 读取 RAM 数据（十六进制 dump） |
 | `read-reg` | 读取内存映射寄存器 |

@@ -1642,6 +1642,12 @@ class SuperWatchStreamManager:
     def prepare(self, device) -> None:
         """Build runtime from DWARF info so search/add work before collection starts."""
         with self._read_lock:
+            if self._device is not device and self._runtime is not None:
+                for item in list(self._runtime.items):
+                    if item.source == "peripheral":
+                        self._runtime.remove(item.name)
+                self._runtime.peripheral_items = {}
+                self._peripheral_selection = None
             self._device = device
             if self._runtime is not None:
                 runtime = self._runtime
@@ -1662,6 +1668,7 @@ class SuperWatchStreamManager:
                         dwarf_info=getattr(device, "_dwarf_info", None),
                         symbol_catalog=new_catalog,
                         svd_registers=getattr(runtime, "svd_registers", {}),
+                        peripheral_items=getattr(runtime, "peripheral_items", {}),
                         port=getattr(device, "_port", None),
                         read_lock=self._read_lock,
                     )
@@ -1777,6 +1784,9 @@ class SuperWatchStreamManager:
         )
 
     def start(self, device) -> None:
+        catalog = getattr(device, "symbol_catalog", None)
+        if catalog is not None and catalog.is_stale():
+            raise RuntimeError("AXF content changed; reparse symbols before collecting")
         if self._thread is not None and self._thread.is_alive():
             if self.running:
                 return
@@ -2080,6 +2090,7 @@ class SuperWatchStreamManager:
                         dwarf_info=getattr(target_device, "_dwarf_info", None),
                         symbol_catalog=new_catalog,
                         svd_registers=getattr(old_runtime, "svd_registers", {}),
+                        peripheral_items=getattr(old_runtime, "peripheral_items", {}),
                         port=getattr(target_device, "_port", None),
                         read_lock=self._read_lock,
                     )
@@ -2112,6 +2123,32 @@ class SuperWatchStreamManager:
                             self.pause()
                     except Exception as exc:
                         raise SuperWatchTransactionError("restore", exc) from exc
+
+    def select_peripherals(self, device, target) -> dict:
+        from mklink.peripheral_watch import svd_watch_items
+
+        with self._operation_lock:
+            if self.running or (self._thread and self._thread.is_alive()):
+                raise RuntimeError("Stop SuperWatch before changing the peripheral chip")
+            items, skipped = svd_watch_items(target.read())
+            self.prepare(device)
+            with self._read_lock:
+                for item in list(self._runtime.items):
+                    if item.source == "peripheral":
+                        self._runtime.remove(item.name)
+                self._runtime.peripheral_items = items
+                self._peripheral_selection = {**target.public(), "skipped_registers": skipped}
+                self._rebuild_metadata_cache_locked(publish=True)
+            return self.peripheral_catalog()
+
+    def peripheral_catalog(self) -> dict:
+        from mklink.superwatch import make_channel_metadata
+
+        with self._read_lock:
+            items = list(getattr(self._runtime, "peripheral_items", {}).values())
+            metadata = make_channel_metadata(items)
+            return {"selection": getattr(self, "_peripheral_selection", None),
+                    "items": [{"name": item.name, **metadata[item.name]} for item in items]}
 
     def add_watch(self, name: str) -> dict:
         with self._read_lock:
@@ -2540,6 +2577,7 @@ class SerialStreamManager:
     def __init__(self, stream_hub=None):
         self._bridge = AsyncBridge()
         self._monitor = None
+        self._byte_batcher = None
         self._running = False
         self._port_config: list[dict] = []
         self._profile: dict | None = None
@@ -2618,6 +2656,18 @@ class SerialStreamManager:
         self._tx_bytes = 0
         self._start_time = time.time()
 
+        from mklink.remote.serial_stream import SerialByteBatcher
+
+        def publish_bytes(data: bytes, direction: str):
+            if self._stream_hub is not None:
+                self._stream_hub.publish(
+                    data, item_count=len(data),
+                    flags=(SERIAL_RX_BYTES if direction == "RX" else SERIAL_TX_BYTES),
+                    stream_type=StreamType.SERIAL,
+                )
+
+        self._byte_batcher = SerialByteBatcher(publish_bytes)
+
         def _event_callback(event):
             if event.direction == "RX":
                 self._rx_count += 1
@@ -2665,13 +2715,7 @@ class SerialStreamManager:
                 self._rx_bytes += len(data)
             else:
                 self._tx_bytes += len(data)
-            if self._stream_hub is not None:
-                self._stream_hub.publish(
-                    data,
-                    item_count=len(data),
-                    flags=(SERIAL_RX_BYTES if direction == "RX" else SERIAL_TX_BYTES),
-                    stream_type=StreamType.SERIAL,
-                )
+            self._byte_batcher.feed(data, direction)
             if self._bridge.client_count == 0:
                 return
             self._bridge.put({
@@ -2714,7 +2758,12 @@ class SerialStreamManager:
             chunk_callback=_chunk_callback,
             protocol_callback=_protocol_callback,
         )
-        self._monitor.start()
+        try:
+            self._monitor.start()
+            self._byte_batcher.start()
+        except Exception:
+            self._byte_batcher.close()
+            raise
         self._running = True
         self._bridge.put({"event": "status", **self.get_status()})
 
@@ -2724,6 +2773,9 @@ class SerialStreamManager:
             monitor = self._monitor
             if monitor is not None:
                 monitor.stop()
+            if self._byte_batcher is not None:
+                self._byte_batcher.close()
+                self._byte_batcher = None
             with self._ymodem_lock:
                 transfer_thread = self._ymodem_thread
             if (

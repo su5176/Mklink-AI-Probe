@@ -120,7 +120,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import { ChevronDown, ChevronRight, LoaderCircle } from '@lucide/vue'
 import { useSymbolsApi } from '../../composables/useDashboard'
 import { useSymbolCatalog } from '../../composables/useSymbolCatalog'
@@ -227,7 +227,40 @@ function formatAddr(address: unknown): string {
   return String(address)
 }
 
-onMounted(loadCatalog)
+let statusTimer: ReturnType<typeof setInterval> | undefined
+let statusBusy = false
+let disposed = false
+async function refreshSourceStatus(): Promise<void> {
+  if (disposed || statusBusy || !props.deviceConnected || !props.symbolLoaded) return
+  statusBusy = true
+  try {
+    const generation = catalog.generation.value
+    await catalog.refreshStatus()
+    if (disposed || generation === catalog.generation.value) return
+    selectedType.value = null
+    expanded.value = new Set()
+    const requestId = ++searchRequest
+    const key = query.value.trim()
+    searchItems.value = []
+    if (key) {
+      const items = await catalog.searchSymbols(key)
+      if (!disposed && requestId === searchRequest) searchItems.value = items
+    }
+  } catch {
+    // Connection/parse failures are surfaced by the dashboard and catalog.
+  } finally {
+    statusBusy = false
+  }
+}
+onMounted(() => {
+  void loadCatalog()
+  statusTimer = setInterval(() => { void refreshSourceStatus() }, 2000)
+})
+onUnmounted(() => {
+  disposed = true
+  searchRequest += 1
+  clearInterval(statusTimer)
+})
 watch(() => props.deviceConnected, connected => {
   if (connected && props.symbolLoaded) void loadCatalog()
 })

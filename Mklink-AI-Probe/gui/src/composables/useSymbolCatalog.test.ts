@@ -66,6 +66,35 @@ describe('useSymbolCatalog', () => {
     vi.restoreAllMocks()
   })
 
+  it('searches the loaded catalog beyond the backend suggestion limit and retains exact lazy paths', async () => {
+    const array = Array.from({ length: 64 }, (_, index) => ({
+      ...firstPage.items[0], path: `superwatch_array_wave[${index}]`, parent_path: 'superwatch_array_wave',
+    }))
+    const channels = Array.from({ length: 16 }, (_, index) => ({
+      ...firstPage.items[1], path: `superwatch_ch${String(index).padStart(2, '0')}`,
+    }))
+    const loaded = [...array, ...channels, ...firstPage.items]
+    const lazy = { ...array[0], path: 'superwatch_array_wave[999]' }
+    vi.stubGlobal('fetch', vi.fn().mockImplementation(async (url: string) => {
+      if (url.includes('/catalog?')) return jsonResponse({ ...firstPage, total: loaded.length, items: loaded })
+      const q = new URL(url, 'http://localhost').searchParams.get('q')!
+      const matches = q.includes('[999]') ? [lazy] : q === 'superwatch_' ? array.slice(0, 50) : []
+      return jsonResponse({ results: matches.map(descriptor => ({ descriptor })) })
+    }))
+    const symbols = await freshCatalog()
+    const loading = symbols.ensureLoaded()
+    const results = await symbols.searchSymbols('superwatch_')
+    await loading
+    expect(results).toHaveLength(80)
+    expect(results.filter(item => item.path.startsWith('superwatch_ch'))).toEqual(channels)
+    expect(new Set(results.map(item => item.path)).size).toBe(results.length)
+    expect((await symbols.searchSymbols('SUPERWATCH_CH，gain')).map(item => item.path)).toEqual([
+      ...channels.map(item => item.path), 'gain',
+    ])
+    expect(await symbols.searchSymbols('superwatch_array_wave[999]')).toEqual([lazy])
+    expect(await symbols.searchSymbols('not_present')).toEqual([])
+  })
+
   it('loads the catalog once and shares it across consumers', async () => {
     const fetchMock = vi.fn().mockResolvedValue(jsonResponse(firstPage))
     vi.stubGlobal('fetch', fetchMock)

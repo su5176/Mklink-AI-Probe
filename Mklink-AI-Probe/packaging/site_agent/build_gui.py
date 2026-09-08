@@ -1,4 +1,4 @@
-"""Build the v0.1.9 portable Site Agent GUI bundle."""
+"""Build the v0.2.0 portable Site Agent GUI bundle."""
 
 from __future__ import annotations
 
@@ -12,9 +12,9 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 
-BUNDLE_VERSION = "0.1.9"
-CORE_VERSION = "0.1.9"
-ROOT_NAME = "MKLink-Site-Agent-v0.1.9-windows-x86_64-portable"
+BUNDLE_VERSION = "0.2.0"
+CORE_VERSION = "0.2.0"
+ROOT_NAME = "MKLink-Site-Agent-v0.2.0-windows-x86_64-portable"
 ZIP_NAME = f"{ROOT_NAME}.zip"
 FIXED_ZIP_TIME = (1980, 1, 1, 0, 0, 0)
 FIXED_FILE_MODE = 0o100644

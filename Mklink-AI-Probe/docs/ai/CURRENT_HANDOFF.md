@@ -4,17 +4,17 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-02T14:36:11+08:00`
+- 更新时间：`2026-09-08T22:26:53+08:00`
 - 分支：`feature/eternal-chip-gui`
 - HEAD：`立芯分支已合入 master 的 SystemView 会话生命周期修复，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
 - 远端 HEAD：`origin/master 与 origin/feature/eternal-chip-gui 均包含经验证的 SystemView 会话修复；立芯分支生产资源由其品牌源码独立重建。`
 - 工作树：最终提交与推送后保持干净；测试、浏览器、STCP、Tauri 和 Cargo 产物只保留在忽略或外部构建目录。
-- 当前任务：master 的 SystemView 会话生命周期、首会话单次有界恢复、状态可观测性和真机证据已同步到立芯分支；立芯品牌生产资源和分支门禁已独立重建与验证。
-- 状态：`eternal-chip-v0.1.9-systemview-session-fixed`
+- 当前任务：master 已合并 PR #17（Aladdin-Wang v0.1.9→v0.2.0，141 commits：SuperWatch 外设观察、安全加解锁白名单、YMODEM、Modbus 工作台、Pack 兼容修复、V3.4.0/V4.4.0 固件），并语义合并同步进 feature/eternal-chip-gui：保留立芯品牌 GUI、主题体系与 demo 资产，接入 master 0.2.0 功能面板；gui/dist 由 vue-tsc+Vite 重建。
+- 状态：`eternal-chip-v0.2.0-synced`
 
 ## 里程碑
 
-- **0.1.9 桌面端与 WebGUI** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
+- **0.2.0 正式版** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
 - **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
 - **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
 - **SystemView 会话生命周期修复** — `complete`。分离 duration 与单调时钟 idle watchdog，容忍瞬态读取，按设备连接代次仅为第一个会话提供一次自动恢复；重试时清理解析器、历史、统计、任务与 CPU hint，并在 WebGUI 显示恢复代次、原因和停止错误。
@@ -43,15 +43,16 @@
 
 ## 真机环境
 
-- **probe**：HIL-Infra bench-01 将 MKLink V4 命令口映射为 COM5；交接不依赖端口号，使用台架 selector 与互操作锁。
-- **target**：本轮使用 ec_s100_watch_V2.6_tony 的 STM32F411CE + FreeRTOS + LVGL 既有固件，通过 RTT 控制块 0x20010d40 验证 SystemView；未重烧目标。
-- **permission**：本轮执行 SystemView 启停、读取和一次探针重启以复现冷启动问题；未执行目标烧录、OTA、供电变更或 CAN 激励。后续写入动作仍需针对目标和固件单独确认。
+- **current**：最近受测 V3 + STM32F103RE；正常 sw_write 测试程序，采集/串口已释放。此前完整 HIL 使用 V4。本次发布验收只发现探针，未写目标芯片。
+- **backup**：Flash/工程备份留 .build/reports/prerelease-hil-20260907 和 superwatch-write-20260907。F103 测试获准修改/下载及 3.3V 保护往返；无 Modbus 从站。
 
 ## 下一动作
 
-1. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
-2. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
+1. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，在立芯品牌表面与 master 新功能面板之间保持并集。
+2. 本机缺少 _maintainer/local/builtin_flm 资产导致 22 项安全白名单/打包测试失败（pr-17 原树同样失败），如需本地闭环需先安装内置 FLM bundle。
 3. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次分支同步自动推断。
+4. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
+5. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
 
 ## 已知限制
 
@@ -65,6 +66,4 @@
 
 ## 延续协议
 
-- 开始前校正 Git、台架 selector、目标固件和运行进程；硬件操作保持串行并遵守 HIL 锁。
-- 不把环境失败、旧叙述证据或未覆盖场景写成 PASS；关键证据写验证报告，交接只保留结论。
-- 结束前更新 project-memory.json、渲染 CURRENT_HANDOFF.md，并保持工作树与目标远端分支同步。
+- 开始校正 Git/设备/进程；结束渲染并验证记忆、提交推送；环境失败和未覆盖不能写 PASS。

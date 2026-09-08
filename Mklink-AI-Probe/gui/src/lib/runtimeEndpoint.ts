@@ -11,13 +11,19 @@ export function isTauriRuntime(runtime: RuntimeWindow = window as RuntimeWindow)
   return Boolean(runtime.__TAURI__ || runtime.__TAURI_INTERNALS__)
 }
 
+export function browserRuntimeBase(href = window.location.href): string {
+  return new URL('./', href).pathname.replace(/\/+$/, '')
+}
+
 export function resolveRuntimeBase(configuredBase: string, tauri = isTauriRuntime()): string {
-  return tauri ? configuredBase.trim().replace(/\/+$/, '') : ''
+  return tauri ? configuredBase.trim().replace(/\/+$/, '') : browserRuntimeBase()
 }
 
 export const IS_TAURI = isTauriRuntime()
 export let API_BASE = resolveRuntimeBase(import.meta.env.VITE_MKLINK_API || '', IS_TAURI)
-export let WS_BASE = resolveRuntimeBase(import.meta.env.VITE_MKLINK_WS || '', IS_TAURI)
+export let WS_BASE = IS_TAURI
+  ? resolveRuntimeBase(import.meta.env.VITE_MKLINK_WS || '', true)
+  : `${window.location.protocol.replace('http', 'ws')}//${window.location.host}${browserRuntimeBase()}`
 
 export function browserRuntimePort(location: Pick<Location, 'port' | 'protocol'> = window.location): number | null {
   const explicit = Number.parseInt(location.port, 10)
@@ -27,7 +33,8 @@ export function browserRuntimePort(location: Pick<Location, 'port' | 'protocol'>
   return null
 }
 
-const backendPort = ref<number | null>(IS_TAURI ? null : browserRuntimePort())
+// A reverse proxy's public port is not the backend's listening port.
+const backendPort = ref<number | null>(IS_TAURI || browserRuntimeBase() ? null : browserRuntimePort())
 export const runtimeBackendPort = readonly(backendPort)
 
 export type BackendEndpoint = {
@@ -42,6 +49,11 @@ export function applyBackendEndpoint(endpoint: BackendEndpoint): void {
   API_BASE = `http://127.0.0.1:${endpoint.port}`
   WS_BASE = `ws://127.0.0.1:${endpoint.port}`
   backendPort.value = endpoint.port
+}
+
+export function applyReportedBackendPort(port: unknown): void {
+  if (!Number.isInteger(port) || Number(port) < 1 || Number(port) > 65535) return
+  backendPort.value = Number(port)
 }
 
 function markBackendUnavailable(): void {

@@ -21,6 +21,12 @@ describe('browser session lease', () => {
     expect(() => stop()).not.toThrow()
   })
 
+  it('preserves the serving prefix for browser ownership sockets', () => {
+    expect(browserSessionSocketUrl({
+      protocol: 'https:', host: 'example.test', href: 'https://example.test/apps/probe/content/#/config',
+    }, 'tab one')).toBe('wss://example.test/apps/probe/content/ws/browser-session?client_id=tab%20one')
+  })
+
   it('releases the device and browser lease when the page is closed', () => {
     const sendBeacon = vi.fn(() => true)
     vi.stubGlobal('navigator', { sendBeacon })

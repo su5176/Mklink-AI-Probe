@@ -27,6 +27,7 @@ export interface OfflineAlgorithmConfig {
   source_kind: 'upload' | 'pack' | 'profile' | 'existing'
   source_token?: string | null
   upload_index?: number | null
+  source_path?: string | null
 }
 
 export interface OfflineFirmwareConfig {
@@ -49,8 +50,26 @@ export interface OfflineConfigPayload {
   target_part?: string | null
   board?: string | null
   hpm_flash_cfg?: [string, string, string, string] | null
+  erase_all_before_download: boolean
+  unlock_before_download: boolean
+  lock_after_download: boolean
+  security_voltage_mv: number | null
   algorithms: OfflineAlgorithmConfig[]
   firmwares: OfflineFirmwareConfig[]
+}
+
+export interface OfflineSecurityCapability {
+  model: string
+  part_number: string
+  supported: boolean
+  unlock_supported: boolean
+  lock_supported: boolean
+  family: string
+  reason: string
+  unlock_erases_flash: boolean
+  reversible_lock: boolean
+  voltage_options_mv: number[]
+  default_voltage_mv: number | null
 }
 
 export interface OfflinePreview {

@@ -22,16 +22,50 @@ let terminal: Terminal | null = null
 let fitAddon: FitAddon | null = null
 let resizeObserver: ResizeObserver | null = null
 let pasteHost: HTMLElement | null = null
+let pendingOutput = ''
+let outputFrame: number | null = null
+let outputFallback: ReturnType<typeof setTimeout> | null = null
+let writeInFlight = false
+let disposed = false
+const OUTPUT_FALLBACK_MS = 50
+
+function flushOutput(): void {
+  if (outputFrame !== null) cancelAnimationFrame(outputFrame)
+  outputFrame = null
+  if (outputFallback !== null) clearTimeout(outputFallback)
+  outputFallback = null
+  if (!pendingOutput || writeInFlight || disposed || !terminal) return
+  const output = pendingOutput
+  pendingOutput = ''
+  writeInFlight = true
+  terminal.write(output, () => {
+    writeInFlight = false
+    if (pendingOutput && !disposed) scheduleOutput()
+  })
+}
+
+function scheduleOutput(): void {
+  if (outputFrame !== null || writeInFlight || disposed) return
+  outputFrame = requestAnimationFrame(flushOutput)
+  outputFallback = setTimeout(flushOutput, OUTPUT_FALLBACK_MS)
+}
 
 function write(text: string): void {
   const normalized = normalizer.push(text)
-  if (normalized) terminal?.write(normalized)
+  if (!normalized) return
+  pendingOutput += normalized
+  scheduleOutput()
 }
 
 function clear(): void {
   normalizer.reset()
+  if (outputFrame !== null) cancelAnimationFrame(outputFrame)
+  outputFrame = null
+  if (outputFallback !== null) clearTimeout(outputFallback)
+  outputFallback = null
   terminal?.clear()
-  terminal?.write('\x1b[2J\x1b[H')
+  pendingOutput = '\x1b[2J\x1b[H'
+  scheduleOutput()
 }
 
 function fit(): void {
@@ -174,6 +208,7 @@ onMounted(() => {
   terminal.onData(data => {
     if (props.inputEnabled) emit('input', data)
   })
+  if (pendingOutput) scheduleOutput()
   if (typeof ResizeObserver !== 'undefined') {
     resizeObserver = new ResizeObserver(fit)
     resizeObserver.observe(element)
@@ -182,15 +217,25 @@ onMounted(() => {
 })
 
 onUnmounted(() => {
+  disposed = true
+  if (outputFrame !== null) cancelAnimationFrame(outputFrame)
+  outputFrame = null
+  if (outputFallback !== null) clearTimeout(outputFallback)
+  outputFallback = null
+  pendingOutput = ''
   pasteHost?.removeEventListener('paste', handleBrowserPaste, true)
   pasteHost = null
   resizeObserver?.disconnect()
-  terminal?.dispose()
+  const currentTerminal = terminal
   terminal = null
   fitAddon = null
+  if (currentTerminal) {
+    if (writeInFlight) currentTerminal.write('', () => currentTerminal.dispose())
+    else currentTerminal.dispose()
+  }
 })
 
-defineExpose({ write, clear, activate, focus })
+defineExpose({ write, clear, activate, focus, flushOutput })
 </script>
 
 <style scoped>

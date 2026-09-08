@@ -26,6 +26,19 @@ export interface TargetMemoryRegion {
   sector_size: number
 }
 
+export interface SecurityCapability {
+  part_number: string
+  supported: boolean
+  unlock_supported: boolean
+  lock_supported: boolean
+  family: string
+  reason: string
+  unlock_erases_flash: boolean
+  unlock_erases_eeprom: boolean
+  unlock_erases_backup_registers: boolean
+  reversible_lock: boolean
+}
+
 export interface PackStatus {
   last_error: string | null
   index_available: boolean
@@ -77,6 +90,7 @@ export interface FirmwareSourceStatus {
   file_name: string
   size: number
   mtime_ns: number
+  sha256?: string
 }
 
 export interface PreviewPage {
@@ -91,7 +105,7 @@ export interface SectorRecord {
   size: number
 }
 
-export type JobAction = 'connect' | 'erase' | 'program' | 'verify' | 'reset' | 'disconnect'
+export type JobAction = 'connect' | 'unlock' | 'erase' | 'program' | 'verify' | 'lock' | 'reset' | 'disconnect'
 
 export interface JobRequest {
   actions: JobAction[]
@@ -102,6 +116,7 @@ export interface JobRequest {
   frequency?: number
   connect_mode?: string
   reset_mode?: string
+  reset_voltage_mv?: 1800 | 3300 | 5000 | null
   base_address?: number | null
   sector_addresses?: number[]
   board?: string | null
@@ -125,9 +140,11 @@ export interface ReadMemoryRequest {
 export type JobState =
   | 'queued'
   | 'connecting'
+  | 'unlocking'
   | 'erasing'
   | 'programming'
   | 'verifying'
+  | 'locking'
   | 'resetting'
   | 'disconnecting'
   | 'stopping'
@@ -147,6 +164,7 @@ export interface JobSnapshot {
   frequency: number
   connect_mode: string
   reset_mode: string
+  reset_voltage_mv?: 1800 | 3300 | 5000 | null
   file_path: null
   image_format: string | null
   image_start: number | null

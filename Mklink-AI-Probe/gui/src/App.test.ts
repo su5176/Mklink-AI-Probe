@@ -55,6 +55,7 @@ function mountApp() {
   return shallowMount(App, {
     global: {
       stubs: {
+        DashboardView: true,
         StatusBar: true,
         ToastContainer: true,
         AppUpdateBanner: true,

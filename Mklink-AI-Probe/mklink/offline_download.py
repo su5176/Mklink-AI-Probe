@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import re
 import shutil
 import tempfile
 from typing import Mapping, Optional, Sequence, Union
+
+from mklink.offline_security import OfflineSecurityPlan, resolve_offline_security
 
 
 _SAFE_FILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -28,6 +31,7 @@ class OfflineAlgorithm:
     source_kind: str
     source_token: Optional[str]
     upload_index: Optional[int]
+    source_path: Optional[str]
 
 
 @dataclass(frozen=True)
@@ -51,8 +55,10 @@ class OfflineDownloadConfig:
     target_part: Optional[str]
     board: Optional[str]
     hpm_flash_cfg: Optional[tuple[str, str, str, str]]
+    erase_all_before_download: bool
     algorithms: tuple[OfflineAlgorithm, ...]
     firmwares: tuple[OfflineFirmware, ...]
+    security: Optional[OfflineSecurityPlan]
 
     @property
     def script_name(self) -> str:
@@ -84,6 +90,12 @@ def _positive_int(value: object, label: str, minimum: int, maximum: int) -> int:
             f"{label} must be between {minimum} and {maximum}"
         )
     return parsed
+
+
+def _strict_bool(value: object, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise OfflineDownloadError(f"{label} must be a boolean")
+    return value
 
 
 def _identifier(value: object, label: str) -> str:
@@ -154,6 +166,12 @@ def parse_offline_config(
     from mklink.hpm_config import is_hpm_target, normalize_hpm_configuration
 
     hpm_target = is_hpm_target(target_part)
+    erase_all_before_download = _strict_bool(
+        payload.get("erase_all_before_download", False),
+        "erase-all-before-download",
+    )
+    if hpm_target and erase_all_before_download:
+        raise OfflineDownloadError("HPM ROM API does not support FLM chip erase")
     raw_board = str(payload.get("board") or "").strip()
     raw_hpm_flash_cfg = payload.get("hpm_flash_cfg")
     if not hpm_target and (raw_board or raw_hpm_flash_cfg not in (None, "")):
@@ -198,9 +216,16 @@ def parse_offline_config(
             if upload_index is not None
             else None
         )
-        if source_kind == "upload" and parsed_upload_index is None:
-            raise OfflineDownloadError("uploaded FLM requires an upload index")
         source_token = str(raw.get("source_token") or "").strip() or None
+        source_path = str(raw.get("source_path") or "").strip() or None
+        if source_kind == "upload" and (
+            (parsed_upload_index is None) == (source_path is None)
+        ):
+            raise OfflineDownloadError(
+                "local FLM requires exactly one upload index or local source path"
+            )
+        if source_kind != "upload" and source_path is not None:
+            raise OfflineDownloadError("only local FLM may use a source path")
         if source_kind in ("pack", "profile") and not source_token:
             raise OfflineDownloadError(f"{source_kind} FLM requires a source token")
         algorithms.append(
@@ -212,6 +237,7 @@ def parse_offline_config(
                 source_kind=source_kind,
                 source_token=source_token,
                 upload_index=parsed_upload_index,
+                source_path=source_path,
             )
         )
     if hpm_target and algorithms:
@@ -274,6 +300,15 @@ def parse_offline_config(
     if not firmwares:
         raise OfflineDownloadError("at least one firmware file is required")
 
+    try:
+        security = resolve_offline_security(
+            payload,
+            model=model,
+            part_number=target_part,
+        )
+    except ValueError as error:
+        raise OfflineDownloadError(str(error)) from error
+
     return OfflineDownloadConfig(
         model=model,
         requested_script_name=str(payload.get("script_name") or "offline_download.py"),
@@ -283,8 +318,10 @@ def parse_offline_config(
         target_part=target_part,
         board=board,
         hpm_flash_cfg=hpm_flash_cfg,
+        erase_all_before_download=erase_all_before_download,
         algorithms=tuple(algorithms),
         firmwares=tuple(firmwares),
+        security=security,
     )
 
 
@@ -315,6 +352,22 @@ def _program_lines(config: OfflineDownloadConfig, indent: str) -> list[str]:
     algorithms = {algorithm.id: algorithm for algorithm in config.algorithms}
     lines = []
     active_algorithm = None
+    if config.erase_all_before_download:
+        erase_algorithm = algorithms[config.firmwares[0].algorithm_id]
+        lines.extend(
+            (
+                f'{indent}if load.flm("FLM/{erase_algorithm.file_name}", '
+                f"0x{erase_algorithm.flash_base:08X}, 0x{erase_algorithm.ram_base:08X}) != 0:",
+                f'{indent}    print("load flm failed: {erase_algorithm.file_name}")',
+                f"{indent}    abort = True",
+                f"{indent}    break",
+                f"{indent}if cmd.erase_chip_flash(0x{erase_algorithm.flash_base:08X}) != 0:",
+                f'{indent}    print("chip erase failed: 0x{erase_algorithm.flash_base:08X}")',
+                f"{indent}    abort = True",
+                f"{indent}    break",
+            )
+        )
+        active_algorithm = erase_algorithm.id
     for firmware in config.firmwares:
         algorithm = algorithms[firmware.algorithm_id]
         if active_algorithm != algorithm.id:
@@ -343,6 +396,45 @@ def _program_lines(config: OfflineDownloadConfig, indent: str) -> list[str]:
     return lines
 
 
+def _security_lines(
+    security: OfflineSecurityPlan,
+    *,
+    action: str,
+    indent: str,
+) -> list[str]:
+    config_file = f"CFG/{security.config_dir}/{action}.cfg"
+    result_name = f"security_{action}_rc"
+    return [
+        (
+            f'{indent}if load.flm("FLM/{security.algorithm_file_name}", '
+            f"0x{security.option_address:08X}, 0x{security.ram_base:08X}) != 0:"
+        ),
+        f'{indent}    print("load option flm failed: {security.algorithm_file_name}")',
+        f"{indent}    abort = True",
+        f"{indent}    break",
+        f'{indent}{result_name} = cmd.{action}("{config_file}")',
+        f"{indent}if {result_name} != 0:",
+        f'{indent}    print("security {action} failed:", {result_name})',
+        f"{indent}    abort = True",
+        f"{indent}    break",
+    ]
+
+
+def _security_api_preflight_lines(indent: str) -> list[str]:
+    missing = "CFG/__mklink_security_api_probe_missing__.cfg"
+    return [
+        f'{indent}security_unlock_api = cmd.unlock("{missing}")',
+        f'{indent}security_lock_api = cmd.lock("{missing}")',
+        f"{indent}if security_unlock_api != -101 or security_lock_api != -101:",
+        (
+            f'{indent}    print("security command ABI check failed:", '
+            "security_unlock_api, security_lock_api)"
+        ),
+        f"{indent}    abort = True",
+        f"{indent}    break",
+    ]
+
+
 def _generate_v2_script(config: OfflineDownloadConfig) -> str:
     lines = [
         "import PikaStdLib",
@@ -359,6 +451,10 @@ def _generate_v2_script(config: OfflineDownloadConfig) -> str:
         (
             "if not abort:",
             '    print("offline download finished")',
+            "    cmd.set_reset()",
+            "    cmd.set_beep_on()",
+            "    time.sleep_ms(1000)",
+            "    cmd.set_beep_off()",
             "else:",
             '    print("offline download aborted")',
             "",
@@ -400,7 +496,16 @@ def generate_offline_script(config: OfflineDownloadConfig) -> str:
         "        break",
         '    print("IDCODE: 0x%08X" % idcode)',
     ]
+    if config.security is not None:
+        # Missing-file calls stop before target access and verify that the
+        # generated Pika bindings preserve the signed security return code.
+        insert_at = lines.index("    elapsed = 0")
+        lines[insert_at:insert_at] = _security_api_preflight_lines("    ")
+    if config.security is not None and config.security.unlock_before_download:
+        lines.extend(_security_lines(config.security, action="unlock", indent="    "))
     lines.extend(_program_lines(config, "    "))
+    if config.security is not None and config.security.lock_after_download:
+        lines.extend(_security_lines(config.security, action="lock", indent="    "))
     lines.extend(
         (
             "    if abort or i + 1 >= AUTO_DOWNLOAD_COUNT:",
@@ -418,6 +523,11 @@ def generate_offline_script(config: OfflineDownloadConfig) -> str:
             "        elapsed += 500",
             "if not abort:",
             '    print("auto download finished")',
+            "    cmd.set_reset()",
+            "    cmd.cpu_run()",
+            "    cmd.set_beep_on()",
+            "    time.sleep_ms(1000)",
+            "    cmd.set_beep_off()",
             "else:",
             '    print("auto download aborted")',
             "",
@@ -465,6 +575,18 @@ def _remove_probe_file(path: Path) -> None:
         path.unlink()
 
 
+def _same_file_content(first: Path, second: Path) -> bool:
+    if first.stat().st_size != second.stat().st_size:
+        return False
+    with first.open("rb") as left, second.open("rb") as right:
+        while True:
+            chunk = left.read(1024 * 1024)
+            if chunk != right.read(1024 * 1024):
+                return False
+            if not chunk:
+                return True
+
+
 def _transactional_copy(
     disk_root: Path,
     files: Sequence[tuple[Path, Optional[Path], Optional[bytes]]],
@@ -491,18 +613,21 @@ def _transactional_copy(
                 staged = staged_root / relative
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 if destination.exists():
+                    # A browser may still hold the selected USB file open. Reuse
+                    # identical content instead of deleting or rewriting it.
+                    if _same_file_content(destination, staged):
+                        continue
                     backup = backup_root / relative
                     backup.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(destination, backup)
-                    backups.append((destination, backup))
                     _remove_probe_file(destination)
+                    backups.append((destination, backup))
                 installed.append(destination)
                 shutil.copy2(staged, destination)
             return [
-                str(path.relative_to(disk_root)).replace("\\", "/")
-                for path in installed
+                relative.as_posix() for relative, _source, _content in files
             ]
-        except BaseException:
+        except BaseException as error:
             for destination in reversed(installed):
                 try:
                     if destination.exists():
@@ -516,6 +641,10 @@ def _transactional_copy(
                         shutil.copy2(backup, destination)
                 except OSError:
                     pass
+            if isinstance(error, OSError):
+                raise OfflineDownloadError(
+                    f"offline file operation failed: {relative.as_posix()}: {error}"
+                ) from error
             raise
 
 
@@ -563,6 +692,40 @@ def deploy_offline_bundle(
             raise OfflineDownloadError("offline destination names must be unique")
         seen_destinations.add(key)
         plan.append((relative, source, None))
+
+    if config.security is not None:
+        security = config.security
+        try:
+            digest = hashlib.sha256(security.algorithm_path.read_bytes()).hexdigest()
+        except OSError as error:
+            raise OfflineDownloadError("built-in option-byte FLM is unavailable") from error
+        if digest != security.algorithm_sha256:
+            raise OfflineDownloadError("built-in option-byte FLM integrity check failed")
+        security_files = [
+            (
+                Path("FLM") / security.algorithm_file_name,
+                security.algorithm_path,
+                None,
+            ),
+        ]
+        if security.unlock_before_download:
+            security_files.append((
+                Path("CFG") / security.config_dir / "unlock.cfg",
+                None,
+                security.unlock_config,
+            ))
+        if security.lock_after_download:
+            security_files.append((
+                Path("CFG") / security.config_dir / "lock.cfg",
+                None,
+                security.lock_config,
+            ))
+        for relative, source, content in security_files:
+            key = str(relative).casefold()
+            if key in seen_destinations:
+                raise OfflineDownloadError("offline destination names must be unique")
+            seen_destinations.add(key)
+            plan.append((relative, source, content))
 
     script_relative = Path("python") / config.script_name
     plan.append((script_relative, None, generate_offline_script(config).encode("utf-8")))

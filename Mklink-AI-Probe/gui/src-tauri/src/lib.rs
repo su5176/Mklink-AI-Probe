@@ -1009,6 +1009,10 @@ pub fn run() {
                         if terminate_sidecar_tree(state.inner()).is_ok() {
                             eprintln!("[tauri] sidecar killed");
                         }
+                        // A tray icon can keep the desktop event loop alive
+                        // after the last window closes. Match the tray Exit
+                        // action so an invisible process cannot block upgrades.
+                        cleanup_handle.exit(0);
                     }
                 });
             }

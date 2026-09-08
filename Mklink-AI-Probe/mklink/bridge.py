@@ -600,7 +600,10 @@ class MKLinkSerialBridge:
         return remaining
 
     def _recover_failed_stream_start(self, stop_command: bytes) -> bool:
-        """Boundedly recover command mode after a stream start timed out.
+        return self._stop_stream_and_sync(stop_command)
+
+    def _stop_stream_and_sync(self, stop_command: bytes) -> bool:
+        """Stop a stream and verify command mode within a bounded timeout.
 
         A raw stop may return its ``>>>`` well after the write.  Returning as
         soon as that write completes lets the stale prompt satisfy the next

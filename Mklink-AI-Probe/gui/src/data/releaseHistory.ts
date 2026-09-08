@@ -9,6 +9,32 @@ export interface ReleaseHistoryEntry {
 
 export const releaseHistory: ReleaseHistoryEntry[] = [
   {
+    version: '0.2.0',
+    date: '2026-09-07',
+    summary: '完善连接、实时数据、Pack/型号兼容与安全烧录',
+    summaryEn: 'Improved connections, live data, Pack/model compatibility, and secure flashing',
+    changes: [
+      '改善 macOS/Linux 兼容，精简工程初始化，修复固件与符号文件变化后的重载。',
+      '修复下载器热插拔重连及 RTT、串口与曲线高频显示停顿，SuperWatch 支持常用变量置顶和多关键词搜索。',
+      'SuperWatch 新增芯片外设只读观察：输入型号联想选择芯片，加载 Pack 内的 SVD，勾选寄存器或 GPIO 位查看数值与波形，无需 AXF；程序变量与外设目录独立，保留手动分图。',
+      '完善浮点数、负数等变量写入及回读验证，修复采集中修改变量后的响应同步和 CLI 类型解析。',
+      '兼容更多非规范 Pack，增加常用型号并统一精确型号与通用型号解析，提升器件联想速度。',
+      '完善读取、回烧、校验和 1.8V/3.3V/5V 断电复位。',
+      '完善受支持器件的在线/脱机加锁解锁和风险确认，修复选项算法执行问题；脱机增加全片擦除、型号联想及本地 FLM 支持。',
+      '脱机下载默认按扇区擦除，增加全片擦除耗时提示；支持复用 U 盘已有文件。Skill 在每会话首次加载时检查版本更新。',
+    ],
+    changesEn: [
+      'Improve macOS/Linux compatibility, simplify project setup, and reload changed firmware and symbol files.',
+      'Fix probe hot-plug reconnects and high-rate RTT, serial, and chart display stalls; add pinned SuperWatch variables and multi-keyword search.',
+      'Add read-only peripheral watches to SuperWatch: select a chip with typeahead, load its Pack SVD, and watch register or GPIO bit values and waveforms without an AXF. Keep separate variable/peripheral catalogs and manual plot splitting.',
+      'Improve typed writes and readback for floating-point and negative values, synchronize writes during capture, and fix CLI type decoding.',
+      'Support more nonstandard Packs, add common targets, unify exact/generic model matching, and speed up typeahead.',
+      'Improve readback, reflashing, verification, and 1.8 V/3.3 V/5 V power-cycle reset.',
+      'Improve online/offline protection and confirmations for supported targets, fix option-algorithm execution, and add offline chip erase, typeahead, and local FLM support.',
+      'Use sector erase by default for offline downloads, explain the extra time required for chip erase, and reuse existing USB files. Check Skill updates on first load in each session.',
+    ],
+  },
+  {
     version: '0.1.9',
     date: '2026-08-31',
     summary: '完善在线烧录、实时采集、串口升级与 AI 安全边界',

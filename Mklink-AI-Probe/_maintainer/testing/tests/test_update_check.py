@@ -107,7 +107,7 @@ def test_mcp_ping_reports_update_state_for_ai_clients(monkeypatch):
         "update_available": True,
         "install_requires_user_approval": True,
     }
-    monkeypatch.setattr(update_check, "check_for_update", lambda: expected)
+    monkeypatch.setattr(update_check, "check_for_update", lambda **kwargs: expected)
     monkeypatch.setattr("mklink.toolchain.status", lambda: {"elf_backend": "builtin"})
     mcp_server._register_health_tools(FakeMcp())
 
@@ -115,3 +115,35 @@ def test_mcp_ping_reports_update_state_for_ai_clients(monkeypatch):
 
     assert result["ok"] is True
     assert result["update"] == expected
+
+
+def test_skill_activation_ping_sees_release_published_within_cache_window(monkeypatch, tmp_path):
+    tools = {}
+
+    class FakeMcp:
+        def tool(self):
+            def register(function):
+                tools[function.__name__] = function
+                return function
+            return register
+
+    manifest = {"version": "1.2.3"}
+    requests = []
+    monkeypatch.setattr(update_check, "default_cache_file", lambda: tmp_path / "cache.json")
+    monkeypatch.setattr(update_check, "current_version", lambda: "1.2.3")
+    monkeypatch.setattr(update_check, "fetch_manifest", lambda urls, timeout:
+                        (requests.append(1) or dict(manifest), "https://example.test/latest.json"))
+    monkeypatch.setattr("mklink.toolchain.status", lambda: {"elf_backend": "builtin"})
+    mcp_server._register_health_tools(FakeMcp())
+    ping = tools["ping"]
+
+    assert ping()["update"]["update_available"] is False
+    manifest["version"] = "1.2.4"
+    assert ping()["update"]["cached"] is True
+    fresh = ping(force_update_check=True)["update"]
+    assert fresh["cached"] is False
+    assert fresh["latest_version"] == "1.2.4"
+    assert fresh["update_available"] is True
+    assert fresh["install_requires_user_approval"] is True
+    assert ping()["update"]["latest_version"] == "1.2.4"
+    assert len(requests) == 2

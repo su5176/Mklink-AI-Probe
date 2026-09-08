@@ -280,6 +280,7 @@ export interface SymbolSearchResult {
 export interface AxfFingerprint {
   size: number
   mtime_ns: number
+  sha256?: string
 }
 
 export interface SymbolCatalogPage {

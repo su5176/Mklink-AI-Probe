@@ -4,6 +4,7 @@ import type {
   OfflineDeployResult,
   OfflineDiskStatus,
   OfflinePreview,
+  OfflineSecurityCapability,
   OfflineTriggerResult,
 } from '../types/offlineFlash'
 import { tr } from './useLanguage'
@@ -63,6 +64,10 @@ export function useOfflineFlashApi() {
 
   function listAlgorithms(partNumber: string): Promise<OfflineAlgorithmCandidate[]> {
     return request(`/algorithms?part_number=${encodeURIComponent(partNumber)}`)
+  }
+
+  function getSecurityStatus(model: string, partNumber: string): Promise<OfflineSecurityCapability> {
+    return request(`/security?model=${encodeURIComponent(model)}&part_number=${encodeURIComponent(partNumber)}`)
   }
 
   function preview(config: OfflineConfigPayload): Promise<OfflinePreview> {
@@ -148,5 +153,5 @@ export function useOfflineFlashApi() {
     return result
   }
 
-  return { getStatus, listAlgorithms, preview, deploy, trigger }
+  return { getStatus, listAlgorithms, getSecurityStatus, preview, deploy, trigger }
 }

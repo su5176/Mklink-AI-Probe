@@ -4,6 +4,8 @@ import { nextTick, ref, shallowRef } from 'vue'
 
 const mocks = vi.hoisted(() => ({
   ensureLoaded: vi.fn(),
+  refreshStatus: vi.fn(),
+  generation: null as any,
   reparse: vi.fn(),
   applyCLayout: vi.fn(),
   writeSymbol: vi.fn(),
@@ -77,7 +79,7 @@ vi.mock('../../composables/useSymbolCatalog', () => ({
   useSymbolCatalog: () => ({
     items: mocks.items ??= shallowRef(catalogItems),
     containers: mocks.containers ??= shallowRef(catalogContainers),
-    generation: ref(1),
+    generation: mocks.generation ??= ref(1),
     stale: mocks.stale,
     truncatedRoots: shallowRef(['controller']),
     browseRoots: mocks.browseRoots ??= shallowRef(defaultBrowseRoots),
@@ -88,6 +90,7 @@ vi.mock('../../composables/useSymbolCatalog', () => ({
     applyingLayout: mocks.applyingLayout,
     error: mocks.error,
     ensureLoaded: mocks.ensureLoaded,
+    refreshStatus: mocks.refreshStatus,
     reparse: mocks.reparse,
     applyCLayout: mocks.applyCLayout,
     writeSymbol: mocks.writeSymbol,
@@ -109,9 +112,36 @@ function okJson(body: unknown): Response {
   })
 }
 
+function mockPinnedWorkspace(initial: string[] = []) {
+  let pins = [...initial]
+  let revision = 1
+  let available = catalogItems
+  let watches = ['gain']
+  const payload = () => ({
+    pins, revision: String(revision), generation: mocks.generation.value,
+    entries: pins.map(path => ({ path, descriptor: available.find(item => item.path === path) ?? null })),
+  })
+  const fetch = vi.fn(async (url: string, options?: RequestInit) => {
+    if (url.endsWith('/pins')) {
+      if (options?.method === 'PUT') {
+        pins = JSON.parse(String(options.body)).pins
+        revision += 1
+      }
+      return okJson(payload())
+    }
+    if (url.endsWith('/remove')) watches = watches.filter(path => path !== JSON.parse(String(options?.body)).name)
+    if (url.endsWith('/add')) watches.push(JSON.parse(String(options?.body)).name)
+    return okJson({ items: watches.map(name => ({ name })) })
+  })
+  vi.stubGlobal('fetch', fetch)
+  return { fetch, pins: () => pins, setAvailable: (items: typeof catalogItems) => { available = items } }
+}
+
 describe('SymbolVariablePanel', () => {
   beforeEach(() => {
     vi.clearAllMocks()
+    mocks.generation ??= ref(1)
+    mocks.generation.value = 1
     mocks.stale.value = false
     mocks.items ??= shallowRef(catalogItems)
     mocks.items.value = catalogItems
@@ -161,9 +191,103 @@ describe('SymbolVariablePanel', () => {
     expect(wrapper.get('[data-testid="leaf-controller.target"]').exists()).toBe(true)
   })
 
+  it('pins selected variables separately from sampling and keeps pins while searching', async () => {
+    const server = mockPinnedWorkspace()
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: { gain: 1.25 } } })
+    await flushPromises()
+    await wrapper.get('[data-testid="pin-selected"]').trigger('click')
+    await flushPromises()
+    expect(server.pins()).toEqual(['gain'])
+    expect(wrapper.get('[data-testid="pinned-variables"] [data-testid="latest-gain"]').text()).toContain('1.25')
+    expect(wrapper.findAll('[data-testid="leaf-gain"]')).toHaveLength(1)
+    expect(server.fetch.mock.calls.some(([url]) => url.endsWith('/add'))).toBe(false)
+    await wrapper.get('[data-testid="toggle-gain"]').setValue(false)
+    await flushPromises()
+    expect(server.pins()).toEqual(['gain'])
+    await wrapper.get('[data-testid="variable-search"]').setValue('target')
+    await flushPromises()
+    expect(wrapper.get('[data-testid="pinned-variables"]').text()).toContain('gain')
+    expect(wrapper.get('[data-testid="all-variables"]').text()).toContain('target')
+    wrapper.unmount()
+    const reopened = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    expect(reopened.get('[data-testid="pinned-variables"]').text()).toContain('gain')
+    expect((reopened.get('[data-testid="toggle-gain"]').element as HTMLInputElement).checked).toBe(false)
+    reopened.unmount()
+  })
+
+  it('reorders/unpins without removing a watch and keeps missing favorites disabled', async () => {
+    const server = mockPinnedWorkspace(['gain', 'controller.target', 'removed'])
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    expect(wrapper.get('[data-testid="missing-pin-removed"] input').attributes('disabled')).toBeDefined()
+    await wrapper.get('[aria-label="上移 controller.target"]').trigger('click')
+    await flushPromises()
+    expect(server.pins()).toEqual(['controller.target', 'gain', 'removed'])
+    await wrapper.get('[data-testid="pin-gain"]').trigger('click')
+    await flushPromises()
+    expect(server.pins()).toEqual(['controller.target', 'removed'])
+    expect((wrapper.get('[data-testid="toggle-gain"]').element as HTMLInputElement).checked).toBe(true)
+    expect(server.fetch.mock.calls.some(([url]) => url.endsWith('/remove'))).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('re-resolves favorites when the symbol generation changes without auto-selecting', async () => {
+    const server = mockPinnedWorkspace(['gain'])
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    server.setAvailable([])
+    mocks.generation.value = 2
+    await flushPromises()
+    expect(wrapper.find('[data-testid="missing-pin-gain"]').exists()).toBe(true)
+    server.setAvailable(catalogItems.map(item => ({ ...item, address: item.address + 64 })))
+    mocks.generation.value = 3
+    await flushPromises()
+    expect(wrapper.find('[data-testid="missing-pin-gain"]').exists()).toBe(false)
+    expect(server.fetch.mock.calls.some(([url]) => url.endsWith('/add'))).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('shows all multi-keyword matches in the unpinned directory', async () => {
+    mockPinnedWorkspace()
+    mocks.searchSymbols.mockResolvedValue(catalogItems)
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    await wrapper.get('[data-testid="variable-search"]').setValue('gain, target')
+    await flushPromises()
+    const list = wrapper.get('[data-testid="all-variables"]')
+    expect(list.find('[data-testid="leaf-gain"]').exists()).toBe(true)
+    expect(list.find('[data-testid="leaf-controller.target"]').exists()).toBe(true)
+    expect(list.find('[data-testid="leaf-controller.enabled"]').exists()).toBe(false)
+    wrapper.unmount()
+  })
+
+  it('refreshes an automatically replaced symbol generation and stops polling on unmount', async () => {
+    vi.useFakeTimers()
+    const wrapper = mount(SymbolVariablePanel, {
+      props: { deviceConnected: true, latestValues: {} },
+    })
+    try {
+      await flushPromises()
+      mocks.refreshStatus.mockImplementationOnce(async () => { mocks.generation.value = 2 })
+      await vi.advanceTimersByTimeAsync(2000)
+      await flushPromises()
+      expect(mocks.refreshStatus).toHaveBeenCalledOnce()
+      expect(mocks.ensureLoaded).toHaveBeenCalledTimes(2)
+      expect(wrapper.text()).toContain('符号已重载，采集已停止')
+      wrapper.unmount()
+      await vi.advanceTimersByTimeAsync(4000)
+      expect(mocks.refreshStatus).toHaveBeenCalledOnce()
+    } finally {
+      wrapper.unmount()
+      vi.useRealTimers()
+    }
+  })
+
   it('adds and removes a selected variable through the SuperWatch API', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(okJson({ items: [{ name: 'gain' }] }))
+      .mockResolvedValueOnce(okJson({ pins: [], revision: '1', entries: [] }))
       .mockResolvedValueOnce(okJson({ item: { name: 'controller.target' } }))
       .mockResolvedValueOnce(okJson({ item: { name: 'gain', removed: true } }))
     vi.stubGlobal('fetch', fetchMock)
@@ -190,6 +314,7 @@ describe('SymbolVariablePanel', () => {
   it('adds a manually entered member path through the shared SuperWatch API', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(okJson({ items: [] }))
+      .mockResolvedValueOnce(okJson({ pins: [], revision: '1', entries: [] }))
       .mockResolvedValueOnce(okJson({ item: { name: 'data_save.odo', type: 'uint64_t' } }))
     vi.stubGlobal('fetch', fetchMock)
     const wrapper = mount(SymbolVariablePanel, {
@@ -247,7 +372,7 @@ describe('SymbolVariablePanel', () => {
     await wrapper.get('[data-testid="visibility-gain"]').trigger('click')
 
     expect(wrapper.emitted('visibility-change')).toEqual([['gain', false]])
-    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock.mock.calls.filter(([, options]) => options?.method === 'POST')).toHaveLength(0)
   })
 
   it('shows the hidden state without removing the selected variable', async () => {
@@ -423,6 +548,25 @@ describe('SymbolVariablePanel', () => {
     await flushPromises()
 
     expect(wrapper.get('[data-testid="leaf-values[999]"]').exists()).toBe(true)
+  })
+
+  it('allows collapsing and reopening an array while searching, then restores browsing state', async () => {
+    mocks.searchSymbols.mockResolvedValue([{ ...catalogItems[2], path: 'samples[0]', parent_path: 'samples' }])
+    const wrapper = mount(SymbolVariablePanel, { props: { deviceConnected: true, latestValues: {} } })
+    await flushPromises()
+    await wrapper.get('[data-testid="variable-search"]').setValue('samples')
+    await flushPromises()
+    const branch = wrapper.get('[data-testid="branch-samples"]')
+    expect(branch.attributes('aria-expanded')).toBe('true')
+    await branch.trigger('click')
+    expect(wrapper.find('[data-testid="leaf-samples[0]"]').exists()).toBe(false)
+    expect(branch.attributes('aria-expanded')).toBe('false')
+    await branch.trigger('click')
+    expect(wrapper.find('[data-testid="leaf-samples[0]"]').exists()).toBe(true)
+    await wrapper.get('[data-testid="variable-search"]').setValue('')
+    await flushPromises()
+    expect(wrapper.find('[data-testid="leaf-controller.target"]').exists()).toBe(false)
+    wrapper.unmount()
   })
 
   it('configures a bounded array snapshot without changing element selection', async () => {

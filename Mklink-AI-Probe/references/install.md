@@ -37,12 +37,17 @@ MCP 使用 `python -m mklink mcp`（stdio），客户端按其插件/MCP 配置�
 
 ## 更新
 
-首次实际使用时读 MCP `ping.update` 或运行检查脚本，二选一。检查缓存 24 小时，
-不占用探针，离线不阻塞调试：
+每个会话首次加载 MKLink Skill 时立即检查版本，不等待设备操作或固定时间。
+调用 MCP `ping(force_update_check=True)` 读取 `update`，或在 Skill 根目录执行：
 
 ```powershell
-python scripts/skill_update.py check --json
+python scripts/skill_update.py check --force --json
 ```
+
+两种入口均跳过之前的版本缓存，本会话后续使用不重复检查，也不创建后台定时任务。
+普通 MCP 健康检查仍可复用缓存；旧 MCP 没有该参数时使用检查脚本。
+检查不占用探针，离线继续当前任务。此行为由 AI 加载 Skill 后执行，单独在编辑器
+打开 Markdown 文件不会运行脚本。
 
 发现新版本先说明当前版本、最新版本与发布说明；只有用户明确同意后才执行：
 

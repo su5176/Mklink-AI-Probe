@@ -82,6 +82,8 @@ class PackCatalog:
         self._state_loaded = False
         self._state_signature = None  # type: Optional[Tuple[int, int]]
         self._installed_paths = {}  # type: Dict[Tuple[str, str], str]
+        self._search_snapshot_key = None  # type: Optional[Tuple[int, int, int]]
+        self._search_snapshot = []  # type: List[Tuple[TargetRecord, str]]
         self._target_count = 0
 
     def note_refresh_failure(self, error: object) -> None:
@@ -119,22 +121,92 @@ class PackCatalog:
         builtin_records = self._builtin_records
         cached_records = self._read_cached_records()
         installed_paths = self._read_installed_paths()
-        cached_records = [
-            self._apply_installed_path(record, installed_paths)
-            for record in cached_records
-        ]
-        records = self._merge_records(builtin_records, cached_records)
-        self._target_count = len(records)
-
+        snapshot_key = (id(builtin_records), id(cached_records), id(installed_paths))
+        if snapshot_key != self._search_snapshot_key:
+            installed_records = [
+                self._apply_installed_path(record, installed_paths)
+                for record in cached_records
+            ]
+            records = self._merge_records(builtin_records, installed_records)
+            self._search_snapshot = [
+                (
+                    record,
+                    "\0".join((
+                        record.part_number,
+                        record.vendor,
+                        record.family,
+                        record.series,
+                    )).casefold(),
+                )
+                for record in records
+            ]
+            self._search_snapshot_key = snapshot_key
+            self._target_count = len(records)
         needle = query.casefold().strip()
         vendor_key = vendor.casefold().strip() if vendor is not None else None
         matches = [
             record
-            for record in records
-            if self._matches_query(record, needle)
+            for record, search_text in self._search_snapshot
+            if needle in search_text
             and (vendor_key is None or record.vendor.casefold() == vendor_key)
-            and (installed is None or record.installed is installed)
         ]
+        matches.sort(key=lambda record: (record.part_number.casefold(), record.pack_id or ""))
+        # Promotion never changes display ordering. For an ordinary typeahead
+        # query, resolve only the records that can actually be returned instead
+        # of comparing thousands of remote order codes against every wildcard.
+        if installed is None:
+            matches = matches[:limit]
+        daplink_records = {
+            record.part_number.casefold(): record
+            for record in builtin_records
+            if record.source == "daplink-builtin"
+        }
+        if daplink_records:
+            from .builtin_flm_bundle import (
+                resolve_builtin_flm_part,
+                resolve_builtin_flm_parts,
+            )
+
+            requested = query.strip()
+            aliases = resolve_builtin_flm_parts([
+                record.part_number
+                for record in matches
+                if not record.installed and (bool(needle) or installed is False)
+            ])
+            promoted = []
+            for record in matches:
+                canonical = (
+                    aliases.get(record.part_number.casefold())
+                    if not record.installed
+                    else None
+                )
+                donor = daplink_records.get((canonical or "").casefold())
+                if donor is None:
+                    promoted.append(record)
+                    continue
+                promoted.append(replace(
+                    record,
+                    pack_id=None,
+                    pack_version=None,
+                    pack_path=None,
+                    installed=True,
+                    source="daplink-builtin",
+                ))
+            matches = promoted
+            if requested and not any(
+                record.part_number.casefold() == requested.casefold()
+                for record in matches
+            ):
+                canonical = aliases.get(requested.casefold()) or resolve_builtin_flm_part(
+                    requested
+                )
+                donor = daplink_records.get((canonical or "").casefold())
+                if donor is not None and (
+                    vendor_key is None or donor.vendor.casefold() == vendor_key
+                ):
+                    matches.append(replace(donor, part_number=requested))
+        if installed is not None:
+            matches = [record for record in matches if record.installed is installed]
         matches.sort(key=lambda record: (record.part_number.casefold(), record.pack_id or ""))
         return matches[:limit]
 

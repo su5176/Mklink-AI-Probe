@@ -66,6 +66,16 @@ vi.mock('../composables/useResourceStatus', () => ({
 const dashStub = { template: '<div />', props: ['deviceConnected'] }
 
 describe('DashboardView layout classes', () => {
+  it('retains the same stream components and their DOM data across tab switches', async () => {
+    const wrapper = shallowMount(DashboardView)
+    const names = ['RttViewTab', 'SuperWatchTab', 'SerialMonitorTab']
+    const instances = names.map(name => wrapper.findComponent({ name }).vm)
+    for (const label of ['SuperWatch', '串口助手', 'RTT View', 'Memory', 'SuperWatch']) {
+      await wrapper.findAll('.tab-btn').find(button => button.text() === label)!.trigger('click')
+      names.forEach((name, index) => expect(wrapper.findComponent({ name }).vm).toBe(instances[index]))
+    }
+    wrapper.unmount()
+  })
   beforeEach(() => {
     confirmMock.mockReturnValue(true)
     vi.stubGlobal('confirm', confirmMock)

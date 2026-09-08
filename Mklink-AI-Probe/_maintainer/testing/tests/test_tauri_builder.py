@@ -77,6 +77,47 @@ def test_external_bin_patch_restores_exact_config(builder, tmp_path):
     assert config.read_bytes() == original
 
 
+def test_local_bundle_disables_updater_artifacts_and_restores_config(builder, tmp_path):
+    config = tmp_path / "tauri.conf.json"
+    original = b'{"bundle":{"createUpdaterArtifacts":true}}\n'
+    config.write_bytes(original)
+    with builder.temporary_bundle_config(config, signed=False):
+        assert json.loads(config.read_text())["bundle"]["createUpdaterArtifacts"] is False
+    assert config.read_bytes() == original
+
+
+def test_local_bundle_never_reads_signing_key(builder, monkeypatch, tmp_path):
+    builder.TAURI_DIR = tmp_path
+    configure_stub_stcp(builder, tmp_path)
+    (tmp_path / "tauri.conf.json").write_text('{"bundle":{}}', encoding="utf-8")
+    monkeypatch.setattr(builder, "require_release_builtin_flm_bundle", lambda: tmp_path)
+    monkeypatch.setattr(builder, "load_updater_private_key", lambda: pytest.fail("must not read key"))
+    calls = []
+    monkeypatch.setattr(builder, "build_sidecar", lambda force=False: calls.append(force) or True)
+    monkeypatch.setattr(builder, "build_tauri", lambda **kwargs: calls.append(kwargs))
+    builder.build_release_bundle(signed=False)
+    assert calls == [True, {"bundle": True, "local_bundle": True}]
+
+
+def test_local_tauri_bundle_excludes_signing_environment(builder, monkeypatch, tmp_path):
+    builder.GUI_DIR = tmp_path
+    builder.TAURI_DIR = tmp_path / "src-tauri"
+    release = builder.TAURI_DIR / "target" / "release"
+    nsis = release / "bundle" / "nsis"
+    nsis.mkdir(parents=True)
+    (release / "mklink-ai-probe.exe").write_bytes(b"exe")
+    setup = nsis / "local-setup.exe"
+    setup.write_bytes(b"setup")
+    names = ("TAURI_SIGNING_PRIVATE_KEY", "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
+             "MKLINK_TAURI_UPDATER_KEY", "MKLINK_TAURI_UPDATER_KEY_PASSWORD")
+    for name in names:
+        monkeypatch.setenv(name, "do-not-use")
+    calls = []
+    monkeypatch.setattr(builder, "run", lambda command, **kwargs: calls.append(kwargs) or 0)
+    assert builder.build_tauri(bundle=True, local_bundle=True) == {"setup": setup}
+    assert all(name not in calls[0]["env"] for name in names)
+
+
 def test_external_bin_patch_restores_after_failure(builder, tmp_path):
     config = tmp_path / "tauri.conf.json"
     original = b'{"bundle":{"active":true,"icon":[]}}'
@@ -104,6 +145,9 @@ def test_release_bundle_forces_sidecar_rebuild(builder, monkeypatch, tmp_path):
     monkeypatch.setattr(builder, "load_updater_private_key", lambda: "private-key")
     monkeypatch.setattr(
         builder, "build_tauri", lambda bundle=False, signing_key=None: None
+    )
+    monkeypatch.setattr(
+        builder, "require_release_builtin_flm_bundle", lambda: tmp_path
     )
 
     builder.build_release_bundle()
@@ -139,6 +183,9 @@ def test_release_bundle_cleans_sidecar_when_stcp_staging_fails(builder, monkeypa
     sidecar.write_bytes(b"sidecar")
     monkeypatch.setattr(builder, "load_updater_private_key", lambda: "test-key")
     monkeypatch.setattr(builder, "build_sidecar", lambda force=False: True)
+    monkeypatch.setattr(
+        builder, "require_release_builtin_flm_bundle", lambda: tmp_path
+    )
 
     def fail_staging():
         raise RuntimeError("STCP missing")
@@ -170,7 +217,7 @@ def test_sidecar_uses_managed_pyinstaller_work_paths(builder, tmp_path, monkeypa
     builder.SKILL_DIR = tmp_path / "source"
     builder.TAURI_DIR = builder.SKILL_DIR / "gui" / "src-tauri"
     monkeypatch.setattr(builder, "builtin_pack_roots", lambda: [])
-    monkeypatch.setattr(builder, "daplinkutility_executable", lambda: None)
+    monkeypatch.setattr(builder, "builtin_flm_root", lambda: tmp_path / "missing-flm")
     calls = []
 
     def fake_run(command, **_kwargs):
@@ -206,6 +253,9 @@ def test_release_bundle_removes_stale_bundle_outputs(builder, monkeypatch, tmp_p
     monkeypatch.setattr(builder, "build_sidecar", lambda force=False: True)
     monkeypatch.setattr(builder, "load_updater_private_key", lambda: "private-key")
     monkeypatch.setattr(
+        builder, "require_release_builtin_flm_bundle", lambda: tmp_path
+    )
+    monkeypatch.setattr(
         builder,
         "build_tauri",
         lambda bundle=False, signing_key=None: observed.append(
@@ -232,6 +282,9 @@ def test_release_bundle_aborts_when_stale_outputs_cannot_be_removed(
     built = []
     monkeypatch.setattr(builder, "build_sidecar", lambda force=False: True)
     monkeypatch.setattr(builder, "load_updater_private_key", lambda: "private-key")
+    monkeypatch.setattr(
+        builder, "require_release_builtin_flm_bundle", lambda: tmp_path
+    )
     monkeypatch.setattr(builder.shutil, "rmtree", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         builder,
@@ -952,24 +1005,15 @@ def test_sidecar_collects_generated_builtin_pack_bundle(builder, monkeypatch, tm
     assert generated[0][0] == [pack_root]
 
 
-def test_sidecar_collects_generated_daplinkutility_flm_bundle(
+def test_sidecar_collects_local_builtin_flm_bundle(
     builder, monkeypatch, tmp_path
 ):
     builder.SKILL_DIR = tmp_path
     builder.TAURI_DIR = tmp_path / "gui" / "src-tauri"
-    executable = tmp_path / "DAPLinkUtility.exe"
-    executable.write_bytes(b"pinned-source")
-    monkeypatch.setenv("MKLINK_DAPLINKUTILITY_EXE", str(executable))
-    generated = []
+    bundle_root = tmp_path / "_maintainer" / "local" / "builtin_flm"
+    bundle_root.mkdir(parents=True)
+    (bundle_root / "manifest.json").write_text("{}", encoding="utf-8")
     commands = []
-
-    def fake_bundle(source, output):
-        generated.append((source, output))
-        output.mkdir(parents=True)
-        (output / "manifest.json").write_text(
-            '{"schema":1,"targets":[]}', encoding="utf-8"
-        )
-        return {"target_count": 8137, "blob_count": 1428}
 
     def fake_run(command, **_kwargs):
         commands.append(command)
@@ -978,7 +1022,16 @@ def test_sidecar_collects_generated_daplinkutility_flm_bundle(
         output.write_bytes(b"sidecar")
         return 0
 
-    monkeypatch.setattr(builder, "build_daplinkutility_flm_bundle", fake_bundle)
+    monkeypatch.setattr(builder, "builtin_flm_root", lambda: bundle_root)
+    monkeypatch.setattr(
+        builder,
+        "validate_builtin_flm_bundle",
+        lambda root=None: {
+            "target_count": 7059,
+            "blob_count": 2224,
+            "release_note": "增加了常用型号",
+        },
+    )
     monkeypatch.setattr(builder, "run", fake_run)
 
     assert builder.build_sidecar(force=True) is True
@@ -990,11 +1043,39 @@ def test_sidecar_collects_generated_daplinkutility_flm_bundle(
         if value == "--add-data"
     ]
     assert any(value.endswith(";mklink/builtin_flm") for value in add_data)
-    assert generated[0][0] == executable
+    assert any(value.startswith(str(bundle_root)) for value in add_data)
 
 
-def test_daplinkutility_executable_rejects_missing_source(builder, monkeypatch, tmp_path):
-    monkeypatch.setenv("MKLINK_DAPLINKUTILITY_EXE", str(tmp_path / "missing.exe"))
+def test_release_bundle_requires_local_builtin_flm_assets(builder, monkeypatch, tmp_path):
+    root = tmp_path / "missing"
+    monkeypatch.setattr(builder, "builtin_flm_root", lambda: root)
 
-    with pytest.raises(RuntimeError, match="does not exist"):
-        builder.daplinkutility_executable()
+    with pytest.raises(RuntimeError, match="requires the complete local"):
+        builder.require_release_builtin_flm_bundle()
+
+
+def test_release_bundle_rejects_invalid_builtin_flm_assets(
+    builder, monkeypatch, tmp_path
+):
+    root = tmp_path / "builtin-flm"
+    root.mkdir()
+    monkeypatch.setattr(builder, "builtin_flm_root", lambda: root)
+    monkeypatch.setattr(
+        builder,
+        "validate_builtin_flm_bundle",
+        lambda _root=None: (_ for _ in ()).throw(ValueError("invalid assets")),
+    )
+
+    with pytest.raises(RuntimeError, match="requires the complete local"):
+        builder.require_release_builtin_flm_bundle()
+
+
+def test_release_bundle_accepts_complete_builtin_flm_assets(
+    builder, monkeypatch, tmp_path
+):
+    root = tmp_path / "builtin-flm"
+    root.mkdir()
+    monkeypatch.setattr(builder, "builtin_flm_root", lambda: root)
+    monkeypatch.setattr(builder, "validate_builtin_flm_bundle", lambda _root=None: {})
+
+    assert builder.require_release_builtin_flm_bundle() == root

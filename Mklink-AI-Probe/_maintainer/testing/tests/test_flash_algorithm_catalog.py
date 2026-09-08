@@ -95,7 +95,7 @@ def test_daplink_bundle_precedes_installed_pack(tmp_path: Path):
         ram_size=0x1000,
         default=True,
         source_kind="daplink-builtin",
-        source_name="DAPLinkUtility",
+        source_name="常用型号内置算法",
         source_token="daplink:test",
         builtin_blob_path=str(tmp_path / "blob.flm"),
         builtin_blob_sha256="d" * 64,
@@ -367,7 +367,7 @@ def test_daplink_bundle_follows_pack_and_precedes_empty_result(tmp_path: Path):
         ram_size=0x1000,
         default=True,
         source_kind="daplink-builtin",
-        source_name="DAPLinkUtility",
+        source_name="常用型号内置算法",
         source_token="daplink:test",
         builtin_blob_path=str(tmp_path / "blob.flm"),
         builtin_blob_sha256="d" * 64,
@@ -418,7 +418,7 @@ def test_daplink_bundle_token_extracts_for_offline_deployment(
     paths = PackPaths(tmp_path / "cache")
 
     candidates = discover_algorithms(paths, "DEVICE_A", None)
-    candidate = next(item for item in candidates if item["origin"] == "DAPLinkUtility 内置算法")
+    candidate = next(item for item in candidates if item["origin"] == "常用型号内置算法")
     destination = tmp_path / "offline.flm"
 
     assert _pack_source(paths, candidate["source_token"], destination) == destination

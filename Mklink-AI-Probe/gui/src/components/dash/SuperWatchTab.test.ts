@@ -11,6 +11,7 @@ describe('SuperWatchTab', () => {
       props: { deviceConnected: true },
       global: {
         stubs: {
+          PeripheralWatchPanel: true,
           SymbolVariablePanel: {
             name: 'SymbolVariablePanel',
             emits: ['visibility-change', 'selection-removed', 'snapshot-change'],
