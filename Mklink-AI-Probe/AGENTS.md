@@ -24,6 +24,14 @@ Paths below are relative to the source root containing this file and
 
 ## Continuous Prerelease Work
 
+- Canonical development/issue repository is `MicroKeen/Mklink-AI-Probe`, default
+  `main`, remote `microkeen`. Existing release/update channels are unchanged.
+- Authorized Issue automation follows `docs/ai/issue-maintenance.md`: use an
+  isolated `codex/issue-<number>` worktree from `microkeen/main`, push only that
+  branch to `microkeen`, and submit a PR plus test report for human review.
+  This is an exception to the continuous-prerelease branch rule below, not
+  permission to merge, publish, change credentials, or operate hardware.
+
 - Use the active prerelease branch recorded in the handoff. Do not create an
   issue branch/worktree, restart fixes from `master`, or develop on `master`.
   A new release branch requires a maintainer request.

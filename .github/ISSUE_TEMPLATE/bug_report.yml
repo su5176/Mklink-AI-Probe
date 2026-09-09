@@ -1,0 +1,49 @@
+name: 问题反馈 / Bug report
+description: 提交可复现的问题，支持用户 AI 整理的脱敏报告
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        本仓库公开。请勿提交令牌、设备序列号、业务源码、固件或内存转储。
+        AI 请先取得用户公开提交授权；安全漏洞不要公开提交。
+  - type: textarea
+    id: environment
+    attributes:
+      label: 使用环境
+      description: 应用版本/构建、系统、入口、探针型号/固件、芯片型号；未知填未知
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 最小步骤、频率、是否已复现
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 最小脱敏证据
+      description: 错误文字、已做检查和结果；不要粘贴完整日志或敏感附件
+  - type: checkboxes
+    id: consent
+    attributes:
+      label: 公开提交授权
+      options:
+        - label: 我已审阅并同意公开提交以上内容；如由 AI 代提交，已取得用户授权。
+          required: true
+        - label: 我已搜索已有问题，确认没有相同报告，或本报告包含新的复现条件。
+          required: true

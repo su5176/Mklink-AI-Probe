@@ -17,6 +17,10 @@
 
 ## Features
 
+开发与反馈已转到 [MicroKeen/Mklink-AI-Probe](https://github.com/MicroKeen/Mklink-AI-Probe)。
+遇到疑似缺陷时，可让 AI 按[问题反馈](references/issue-reporting.md)整理并在授权后提交脱敏报告。
+现有安装包与自动更新仍使用原发布渠道；代码迁移不改变已安装版本的更新地址。
+
 | 功能 | 说明 |
 |------|------|
 | **固件烧录** | 一键烧录 Keil/IAR 工程产物（HEX/BIN），自动检测 MCU 与 FLM |

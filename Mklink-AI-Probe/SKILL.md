@@ -81,3 +81,4 @@ description: 使用 MKLink/MicroLink 操作目标 MCU：固件烧录、内存与
 | U 盘/桌面 HTML 快速入口 | [Web 入口](references/web-entry.md) |
 | Windows USB 端口名称 | [端口命名](references/windows-port-names.md) |
 | 复杂编排或故障排查 | [工作流](references/workflows.md) |
+| 疑似 MKLink 缺陷、授权反馈或跟进修复 | [问题反馈](references/issue-reporting.md) |

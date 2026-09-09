@@ -18,6 +18,7 @@ Read only the reference needed for the current task:
 | --- | --- |
 | Continue unfinished work | `docs/ai/CURRENT_HANDOFF.md` |
 | Source development | `docs/ai/development.md` |
+| Issue triage and repair PRs | `docs/ai/issue-maintenance.md` |
 | Build storage and commands | `docs/ai/build-storage.md` |
 | Desktop/sidecar/NSIS packaging | `skills/tauri-gui-builder/SKILL.md` |
 | Explicitly authorized official publication | [releasing.md](references/releasing.md) |

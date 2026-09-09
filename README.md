@@ -12,7 +12,9 @@
 
 [最便捷安装](#最便捷安装交给-ai) · [Web GUI](#web-gui-安装与使用) · [U 盘入口](#u-盘单-html-快速启动) · [AI / MCP](#ai-agent--mcp) · [命令速查](#命令速查) · [开发构建](#开发构建)
 
-**代码仓库：** [GitHub](https://github.com/Aladdin-Wang/Mklink-AI-Probe) · [Gitee](https://gitee.com/Aladdin-Wang/Mklink-AI-Probe)
+**开发与反馈：** [MicroKeen](https://github.com/MicroKeen/Mklink-AI-Probe) · [提交问题](https://github.com/MicroKeen/Mklink-AI-Probe/issues/new/choose)
+
+**现有正式版下载：** [GitHub Releases](https://github.com/Aladdin-Wang/Mklink-AI-Probe/releases) · [Gitee](https://gitee.com/Aladdin-Wang/Mklink-AI-Probe)
 
 </div>
 

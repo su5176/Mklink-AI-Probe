@@ -4,17 +4,17 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-08T22:26:53+08:00`
+- 更新时间：`2026-09-09T09:58:16+08:00`
 - 分支：`feature/eternal-chip-gui`
 - HEAD：`立芯分支已合入 master 的 SystemView 会话生命周期修复，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
 - 远端 HEAD：`origin/master 与 origin/feature/eternal-chip-gui 均包含经验证的 SystemView 会话修复；立芯分支生产资源由其品牌源码独立重建。`
 - 工作树：最终提交与推送后保持干净；测试、浏览器、STCP、Tauri 和 Cargo 产物只保留在忽略或外部构建目录。
-- 当前任务：master 已合并 PR #17（Aladdin-Wang v0.1.9→v0.2.0，141 commits：SuperWatch 外设观察、安全加解锁白名单、YMODEM、Modbus 工作台、Pack 兼容修复、V3.4.0/V4.4.0 固件），并语义合并同步进 feature/eternal-chip-gui：保留立芯品牌 GUI、主题体系与 demo 资产，接入 master 0.2.0 功能面板；gui/dist 由 vue-tsc+Vite 重建。
-- 状态：`eternal-chip-v0.2.0-synced`
+- 当前任务：master 已合入上游 microkeen/main f4d3a1eb（issue 反馈工作流、.github 模板与 feedback-checks CI、维护文档），并语义合并同步进 feature/eternal-chip-gui；立芯品牌 GUI、主题与 demo 资产保持不变，GUI 源码本轮零变更、dist 未重建。
+- 状态：`eternal-chip-v0.2.0-microkeen-synced`
 
 ## 里程碑
 
-- **0.2.0 正式版** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
+- **已交付** — `complete`。采用 PR #15 的 UF2 固件与 AGENTS.md；修复构建包装器退出码和锁定临时目录清理，稳定 Windows GUI 全量门禁，并同步生产 Web 资源。
 - **隐私安全的内存可观测性** — `complete`。从两个备份分支一次性迁移 MCP 私有流、统一观测事件、内存 dump/RTT/SystemView 发布和测试；保留 0.1.9 的 32 位地址、4 KiB 直读、8 区域批写、12 KiB flush 与写后校验边界。
 - **PR #15 本地集成门禁** — `complete`。Python、GUI、Go/STCP、Web、Tauri 和 HIL-Infra 只读门禁全部通过；PR #15 已以 merge commit 方式合并到 master。
 - **SystemView 会话生命周期修复** — `complete`。分离 duration 与单调时钟 idle watchdog，容忍瞬态读取，按设备连接代次仅为第一个会话提供一次自动恢复；重试时清理解析器、历史、统计、任务与 CPU hint，并在 WebGUI 显示恢复代次、原因和停止错误。
@@ -43,16 +43,15 @@
 
 ## 真机环境
 
-- **current**：最近受测 V3 + STM32F103RE；正常 sw_write 测试程序，采集/串口已释放。此前完整 HIL 使用 V4。本次发布验收只发现探针，未写目标芯片。
-- **backup**：Flash/工程备份留 .build/reports/prerelease-hil-20260907 和 superwatch-write-20260907。F103 测试获准修改/下载及 3.3V 保护往返；无 Modbus 从站。
+- **state**：本轮仅清理与交接，不操作硬件；以重新发现设备为准，旧测试的写入/供电授权不自动延续。
+- **backups**：.build/reports/prerelease-hil-20260907、superwatch-write-20260907；保留其他芯片唯一备份。
+- **installer**：.build/artifacts/release-0.2.0-20260908/Mklink-AI-Probe-v0.2.0-x64-Setup.exe
 
 ## 下一动作
 
-1. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，在立芯品牌表面与 master 新功能面板之间保持并集。
+1. 两仓版本对齐的收尾：microkeen/main 可 fast-forward 到本仓 master 头（04f1f7be 的后代），推送前需用户单独授权。
 2. 本机缺少 _maintainer/local/builtin_flm 资产导致 22 项安全白名单/打包测试失败（pr-17 原树同样失败），如需本地闭环需先安装内置 FLM bundle。
-3. 正式发布另行处理 NSIS、安装验证、Authenticode/更新签名、标签和 Release 资产；不要从本次分支同步自动推断。
-4. 另行定位探针冷启动后连续复位或停流问题；保持主机侧单次有界恢复，避免用无限重试掩盖探针固件故障。
-5. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui，并在立芯品牌表面与 master 新功能上重跑完整门禁。
+3. 后续 master 再推进时，继续以语义 merge 同步 feature/eternal-chip-gui。
 
 ## 已知限制
 
@@ -66,4 +65,4 @@
 
 ## 延续协议
 
-- 开始校正 Git/设备/进程；结束渲染并验证记忆、提交推送；环境失败和未覆盖不能写 PASS。
+- 先核对 Git、任务和设备状态；仅按需读相关验证报告，不加载历史流水账。
