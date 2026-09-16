@@ -4,13 +4,13 @@
 
 ## 当前断点
 
-- 更新时间：`2026-09-09T09:58:16+08:00`
+- 更新时间：`2026-09-16T17:18:05+08:00`
 - 分支：`feature/eternal-chip-gui`
-- HEAD：`立芯分支已合入 master 的 SystemView 会话生命周期修复，并保留立芯品牌 GUI、主题、About 对话框和演示入口。`
-- 远端 HEAD：`origin/master 与 origin/feature/eternal-chip-gui 均包含经验证的 SystemView 会话修复；立芯分支生产资源由其品牌源码独立重建。`
-- 工作树：最终提交与推送后保持干净；测试、浏览器、STCP、Tauri 和 Cargo 产物只保留在忽略或外部构建目录。
-- 当前任务：master 已合入上游 microkeen/main f4d3a1eb（issue 反馈工作流、.github 模板与 feedback-checks CI、维护文档），并语义合并同步进 feature/eternal-chip-gui；立芯品牌 GUI、主题与 demo 资产保持不变，GUI 源码本轮零变更、dist 未重建。
-- 状态：`eternal-chip-v0.2.0-microkeen-synced`
+- HEAD：`在现有立芯 prerelease 分支修复原生内存回读的表头与数据碰撞。`
+- 远端 HEAD：`本轮基于已抓取的 origin/feature/eternal-chip-gui，完成后推送同分支；未修改 master 或发布渠道。`
+- 工作树：隔离同分支工作树；其他工作树和未跟踪产物保持原样。
+- 当前任务：原生回读曾将固件中真实的 00..0F 数据行误当作列标题而少读16字节；仅跳过数据前首次列标题，保留后续相同行。远程与本地共享同一解析逻辑。
+- 状态：`native-readback-header-collision-fixed`
 
 ## 里程碑
 
@@ -22,7 +22,7 @@
 
 ## 验证证据
 
-- **Python**：立芯合并提交全量运行 1804 passed, 1 skipped；唯一失败为隔离环境 pip install .[mcp] 达到固定 600 秒超时，定向复跑 1 passed / 198.90 秒。缺失 STCP 构建联接导致的 3 个 setup error 在挂接同源已验证 DLL 后定向 3/3 通过，并在后续全量中通过。SystemView 状态机 15 项均通过。
+- **Python**：62项解析、烧录校验、远程客户端和能力测试通过；真实响应修复前1008字节、修复后1024字节，与预期固件分块一致。授权测试环境原生远程烧录及独立全量回读通过，Bootloader 保持，运行计数增长，锁释放；插件复评11/11、run-verify 10/10通过。 既有记录：立芯合并提交全量运行 1804 passed, 1 skipped；唯一失败为隔离环境 pip install .[mcp] 达到固定 600 秒超时，定向复跑 1 passed / 198.90 秒。缺失 STCP 构建联接导致的 3 个 setup error 在挂接同源已验证 DLL 后定向 3/3 通过，并在后续全量中通过。SystemView 状态机 15 项均通过。
 - **GUI 与 Web**：立芯 Vitest 61 files / 631 tests 全部通过；生产构建转换 1952 modules，品牌资源仍引用 eternal-chip logo。SystemView 后端与 master 逐字一致；master 的真实 Chromium 会话持续约 70 秒达到 260744 events、Sync Ready，浏览器零 error/零 warning。
 - **Go/STCP**：master 集成证据中官方 Go 1.25.12 的 go test ./... 已通过；立芯分支复用与当前 go.mod/go.sum/main.go/main_test.go 逐文件同哈希的 x64 DLL，SHA-256=758E428FE9ED6BCBD9489D6DB1990FCE5A18680887137EA3CA6D348C27A77C07。
 - **Tauri Release 可执行文件**：立芯分支 Rust 1.95.0、Node 24.15.0 与 Python 依赖检查通过；npx tauri build --no-bundle 成功，19,225,600-byte EXE SHA-256=891CE8ADB5A88406E597C161C3B4F8963EC34B7C49FC9E43356612A931DDB4CE。
